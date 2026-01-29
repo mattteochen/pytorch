@@ -988,6 +988,11 @@ _fuse_ddp_communication_passes: list[Union[Callable[..., None], str]] = [
 
 _micro_pipeline_tp: bool = False
 
+# Enable fused all_reduce + RMSNorm pass. When enabled, detects patterns of
+# all_reduce -> wait_tensor -> [add] -> RMSNorm and replaces them with a
+# single fused kernel using symmetric memory.
+_fused_all_reduce_rmsnorm: bool = False
+
 
 # Enable/disable partitioned scatter optimization for atomic add kernels
 # this will improve kernel performance at cost of memory usage.
