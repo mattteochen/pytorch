@@ -106,6 +106,16 @@ class GroupBatchFusionBase:
     def fuse(self, graph, subset):
         raise NotImplementedError("fuse called on base")
 
+    def get_all_fusion_candidates(
+        self,
+        graph: torch.fx.GraphModule,
+        fused_set: OrderedSet[torch.fx.Node],
+    ) -> collections.defaultdict[Any, list[torch.fx.Node]] | None:
+        """
+        Collect all fusion candidates at once.
+        """
+        return None
+
 
 PRE_GRAD_FUSIONS: dict[str, GroupBatchFusionBase] = {}
 POST_GRAD_FUSIONS: dict[str, GroupBatchFusionBase] = {}
@@ -1195,6 +1205,121 @@ class BatchMulPostGradFusion(BatchPointwiseMathOpsPostGradFusion):
         super().__init__(aten.mul.Tensor, **kwargs)
 
 
+@register_fusion("batch_foreach_copy", pre_grad=False)
+class BatchForeachCopyPostGradFusion(GroupFusion):
+    """
+    Fuse multiple copy_ operations into _foreach_copy_ calls.
+
+    Groups copy_ operations by (device, src_dtype, dst_dtype, shape, strides)
+    so each group can use the fast CUDA multi_tensor_apply kernel.
+
+    The fast path for _foreach_copy_ requires:
+    - All tensors on same device
+    - All src tensors have same dtype
+    - All dst tensors have same dtype
+    - Corresponding tensors have same sizes and strides
+    - All tensors are strided, non-overlapping, and dense
+    """
+
+    def get_all_fusion_candidates(
+        self,
+        graph: torch.fx.GraphModule,
+        fused_set: OrderedSet[torch.fx.Node],
+    ) -> collections.defaultdict[Any, list[torch.fx.Node]]:
+        """
+        Collect candidates by checking ALL nodes in the graph.
+
+        copy_ operations are independent siblings (not in a producer-consumer
+        chain), so the default BFS approach won't find them. Instead, we
+        iterate through all nodes and group matching ones by key.
+        """
+        candidate_dict: collections.defaultdict[Any, list[torch.fx.Node]] = (
+            collections.defaultdict(list)
+        )
+
+        for node in graph.nodes:
+            if node in fused_set:
+                continue
+
+            key = self.match(node)
+            if key is not None:
+                candidate_dict[key].append(node)
+
+        return candidate_dict
+
+    def match(self, node: torch.fx.Node) -> tuple[str, ...] | None:
+        if node.target != aten.copy_.default:
+            return None
+
+        # copy_(dst, src, non_blocking=False)
+        if len(node.args) < 2:
+            return None
+
+        dst, src = node.args[0], node.args[1]
+
+        if not isinstance(dst, torch.fx.Node) or not isinstance(src, torch.fx.Node):
+            return None
+
+        if not is_node_meta_valid(dst) or not is_node_meta_valid(src):
+            return None
+
+        dst_val = dst.meta.get("val")
+        src_val = src.meta.get("val")
+
+        if dst_val is None or src_val is None:
+            return None
+
+        if not isinstance(dst_val, torch.Tensor) or not isinstance(
+            src_val, torch.Tensor
+        ):
+            return None
+
+        # Skip if tensors are not on CUDA (CPU foreach has less benefit)
+        if not dst_val.is_cuda:
+            return None
+
+        # Group by: device, src dtype, dst dtype, shape, strides
+        # This ensures the fast path requirements are met within each group
+        device = str(dst_val.device)
+        src_dtype = str(src_val.dtype)
+        dst_dtype = str(dst_val.dtype)
+        shape = str(tuple(dst_val.shape))
+        strides = str(tuple(dst_val.stride()))
+
+        return ("batch_foreach_copy", device, src_dtype, dst_dtype, shape, strides)
+
+    def fuse(self, graph: torch.fx.GraphModule, subset: list[torch.fx.Node]) -> None:
+        if len(subset) < 2:
+            return
+
+        # Collect dst and src nodes
+        dst_nodes: list[torch.fx.Node] = []
+        src_nodes: list[torch.fx.Node] = []
+        for node in subset:
+            dst, src = node.args[0], node.args[1]
+            dst_nodes.append(dst)  # type: ignore[arg-type]
+            src_nodes.append(src)  # type: ignore[arg-type]
+
+        # Insert the fused _foreach_copy_ before the first copy_ node
+        # (to maintain correct ordering with respect to other mutations)
+        with graph.inserting_before(subset[0]):
+            # Call _foreach_copy_ directly with lists of nodes
+            # FX handles list arguments correctly - at runtime these become tensor lists
+            graph.call_function(
+                aten._foreach_copy_.default,
+                args=(dst_nodes, src_nodes),
+            )
+
+        # Erase original copy_ nodes
+        for node in subset:
+            # copy_ returns the dst, so replace uses with the original dst
+            dst = node.args[0]
+            node.replace_all_uses_with(dst)  # type: ignore[arg-type]
+            graph.erase_node(node)
+
+        counters["inductor"]["batch_foreach_copy"] += 1
+
+
 class _OrderedSet:
     def __init__(self, param=None) -> None:
         if param:
@@ -1347,9 +1472,8 @@ def apply_group_batch_fusion(graph: torch.fx.GraphModule, rule: GroupBatchFusion
     fused_set = OrderedSet[torch.fx.Node]()
     log_to_scuba = False
 
-    for node in reversed(graph.nodes):  # type: ignore[arg-type]
-        candidates = get_fusion_candidates(rule, node, fused_set)
-
+    def process_candidates(candidates):
+        nonlocal log_to_scuba
         for key, candidate_nodes in candidates.items():
             if len(candidate_nodes) < rule.graph_search_options["min_fuse_set_size"]:
                 continue
@@ -1363,6 +1487,16 @@ def apply_group_batch_fusion(graph: torch.fx.GraphModule, rule: GroupBatchFusion
                     f"{rule.__class__.__name__}: key = {key}; subset size = {len(list(subset))}"  # noqa: G004
                 )
                 log_to_scuba = True
+
+    # Check if rule provides custom candidate collection
+    custom_candidates = rule.get_all_fusion_candidates(graph, fused_set)
+    if custom_candidates is not None:
+        process_candidates(custom_candidates)
+    else:
+        # Original per-root BFS approach
+        for node in reversed(graph.nodes):  # type: ignore[arg-type]
+            candidates = get_fusion_candidates(rule, node, fused_set)
+            process_candidates(candidates)
     if log_to_scuba:
         from torch.fx._lazy_graph_module import _LazyGraphModule
 
@@ -1412,21 +1546,31 @@ def group_batch_fusion_passes(graph: torch.fx.Graph, pre_grad=True):
             config.pre_grad_fusion_options, pre_grad=True
         )
     else:
+        # Build post_grad_fusion_options, including auto-enabled fusions
+        effective_post_grad_options = dict(config.post_grad_fusion_options)
+
+        # Auto-enable batch_foreach_copy if config flag is set
+        if (
+            config.batch_foreach_copy_fusion
+            and "batch_foreach_copy" not in effective_post_grad_options
+        ):
+            effective_post_grad_options["batch_foreach_copy"] = {"min_fuse_set_size": 2}
+
         fbgemm_fusion_keys = [
             x
-            for x in config.post_grad_fusion_options
+            for x in effective_post_grad_options
             if (
                 x not in OPTIMUS_EXCLUDE_POST_GRAD
-                and config.post_grad_fusion_options[x].get("require_fbgemm", False)
+                and effective_post_grad_options[x].get("require_fbgemm", False)
             )
         ]
         fbgemm_fusions = {
-            fusion: config.post_grad_fusion_options[fusion]
+            fusion: effective_post_grad_options[fusion]
             for fusion in fbgemm_fusion_keys
         }
         non_fbgemm_fusions = {
-            fusion: config.post_grad_fusion_options[fusion]
-            for fusion in config.post_grad_fusion_options
+            fusion: effective_post_grad_options[fusion]
+            for fusion in effective_post_grad_options
             if fusion not in fbgemm_fusion_keys
         }
         fusions += generate_fusion_from_config(non_fbgemm_fusions, pre_grad=False)

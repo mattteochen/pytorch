@@ -354,6 +354,14 @@ pre_grad_fusion_options: dict[str, dict[str, Any]] = {}
 # Call `torch._inductor.fx_passes.group_batch_fusion.list_group_batch_fusions(False)` to see available fusions.
 post_grad_fusion_options: dict[str, dict[str, Any]] = {}
 
+# Enable batch foreach copy fusion: fuses multiple copy_ ops into _foreach_copy_
+# for better kernel launch efficiency on CUDA. Groups by (device, dtype, shape, strides)
+# so each group can use the fast multi_tensor_apply CUDA kernel.
+# Set to True to enable, or configure via post_grad_fusion_options["batch_foreach_copy"]
+batch_foreach_copy_fusion = (
+    os.environ.get("TORCHINDUCTOR_BATCH_FOREACH_COPY_FUSION", "0") == "1"
+)
+
 # enable reordering pass for improving memory locality
 reorder_for_locality = True
 

@@ -1293,5 +1293,269 @@ class TestFindIndependentSubsetGreedy(TestCase):
         self.assertRaises(StopIteration, lambda: next(i))
 
 
+class TestBatchForeachCopy(TestCase):
+    """Tests for batch_foreach_copy fusion pass."""
+
+    @requires_gpu()
+    @torch._inductor.config.patch(batch_foreach_copy_fusion=True)
+    def test_batch_foreach_copy_same_dtype(self):
+        """Test that multiple copy_ ops with same dtype are fused."""
+        counters.clear()
+
+        device = GPU_TYPE
+        n = 256
+
+        # Pre-allocated buffers
+        buf0 = torch.zeros(n, dtype=torch.float32, device=device)
+        buf1 = torch.zeros(n, dtype=torch.float32, device=device)
+        buf2 = torch.zeros(n, dtype=torch.float32, device=device)
+
+        # Source tensors
+        src0 = torch.randn(n, dtype=torch.float32, device=device)
+        src1 = torch.randn(n, dtype=torch.float32, device=device)
+        src2 = torch.randn(n, dtype=torch.float32, device=device)
+
+        def fn(buf0, buf1, buf2, src0, src1, src2):
+            buf0.copy_(src0)
+            buf1.copy_(src1)
+            buf2.copy_(src2)
+
+        compiled_fn = torch.compile(fn)
+
+        # Run eager
+        fn(buf0.clone(), buf1.clone(), buf2.clone(), src0, src1, src2)
+
+        # Run compiled
+        compiled_fn(buf0, buf1, buf2, src0, src1, src2)
+
+        # Verify correctness
+        self.assertTrue(torch.equal(buf0, src0))
+        self.assertTrue(torch.equal(buf1, src1))
+        self.assertTrue(torch.equal(buf2, src2))
+
+        # Verify fusion occurred (3 copies -> 1 group)
+        self.assertEqual(counters["inductor"]["batch_foreach_copy"], 1)
+        counters.clear()
+
+    @requires_gpu()
+    @torch._inductor.config.patch(batch_foreach_copy_fusion=True)
+    def test_batch_foreach_copy_mixed_dtype(self):
+        """
+        Test that copies with different dtypes are grouped correctly.
+
+        int64 -> int64 copies should be in one group.
+        int64 -> int32 copies should be in another group.
+        """
+        counters.clear()
+
+        device = GPU_TYPE
+        n = 128
+
+        # Group 1: int64 -> int64
+        buf_int64_0 = torch.zeros(n, dtype=torch.int64, device=device)
+        buf_int64_1 = torch.zeros(n, dtype=torch.int64, device=device)
+        buf_int64_2 = torch.zeros(n, dtype=torch.int64, device=device)
+
+        # Group 2: int64 -> int32 (dtype conversion)
+        buf_int32_0 = torch.zeros(n, dtype=torch.int32, device=device)
+        buf_int32_1 = torch.zeros(n, dtype=torch.int32, device=device)
+
+        # Sources (all int64)
+        src0 = torch.randint(0, 1000, (n,), dtype=torch.int64, device=device)
+        src1 = torch.randint(0, 1000, (n,), dtype=torch.int64, device=device)
+        src2 = torch.randint(0, 1000, (n,), dtype=torch.int64, device=device)
+        src3 = torch.randint(0, 100, (n,), dtype=torch.int64, device=device)
+        src4 = torch.randint(0, 100, (n,), dtype=torch.int64, device=device)
+
+        def fn(buf_int64_0, buf_int64_1, buf_int64_2, buf_int32_0, buf_int32_1,
+               src0, src1, src2, src3, src4):
+            # Group 1: int64 -> int64
+            # Group 2: int64 -> int32
+            buf_int64_0.copy_(src0)
+            buf_int32_0.copy_(src3)
+            buf_int64_1.copy_(src1)
+            buf_int32_1.copy_(src4)
+            buf_int64_2.copy_(src2)
+
+        compiled_fn = torch.compile(fn)
+        compiled_fn(
+            buf_int64_0, buf_int64_1, buf_int64_2, buf_int32_0, buf_int32_1,
+            src0, src1, src2, src3, src4
+        )
+
+        # Verify correctness
+        self.assertTrue(torch.equal(buf_int64_0, src0))
+        self.assertTrue(torch.equal(buf_int64_1, src1))
+        self.assertTrue(torch.equal(buf_int64_2, src2))
+        self.assertTrue(torch.equal(buf_int32_0, src3.to(torch.int32)))
+        self.assertTrue(torch.equal(buf_int32_1, src4.to(torch.int32)))
+
+        # Verify fusion: 5 copies -> 2 groups (by dtype)
+        self.assertEqual(counters["inductor"]["batch_foreach_copy"], 2)
+        counters.clear()
+
+    @requires_gpu()
+    @torch._inductor.config.patch(batch_foreach_copy_fusion=True)
+    def test_batch_foreach_copy_different_shapes_not_fused(self):
+        """Test that copies with different shapes are NOT fused together."""
+        counters.clear()
+
+        device = GPU_TYPE
+
+        # Different shapes
+        buf0 = torch.zeros(100, dtype=torch.float32, device=device)
+        buf1 = torch.zeros(200, dtype=torch.float32, device=device)
+
+        src0 = torch.randn(100, dtype=torch.float32, device=device)
+        src1 = torch.randn(200, dtype=torch.float32, device=device)
+
+        def fn(buf0, buf1, src0, src1):
+            buf0.copy_(src0)
+            buf1.copy_(src1)
+
+        compiled_fn = torch.compile(fn)
+        compiled_fn(buf0, buf1, src0, src1)
+
+        # Verify correctness
+        self.assertTrue(torch.equal(buf0, src0))
+        self.assertTrue(torch.equal(buf1, src1))
+
+        # Different shapes means no fusion (each is its own group, but min_fuse_set_size=2)
+        # So no fusion should occur
+        self.assertEqual(counters["inductor"]["batch_foreach_copy"], 0)
+        counters.clear()
+
+    @requires_gpu()
+    @torch._inductor.config.patch(batch_foreach_copy_fusion=True)
+    def test_batch_foreach_copy_slices_different_sizes(self):
+        """
+        Test slices with different sizes are grouped separately.
+
+        Group 1: 3 copies with shape (size_a,) -> 1 fusion
+        Group 2: 2 copies with shape (size_b,) -> 1 fusion
+
+        Total: 5 copies -> 2 fused groups
+        """
+        counters.clear()
+
+        device = GPU_TYPE
+        size_a = 128
+        size_b = 32
+
+        # Pre-allocated buffers (larger than slice sizes)
+        buf0 = torch.zeros(1024, dtype=torch.int64, device=device)
+        buf1 = torch.zeros(1024, dtype=torch.int64, device=device)
+        buf2 = torch.zeros(1024, dtype=torch.int64, device=device)
+        buf3 = torch.zeros(256, dtype=torch.int64, device=device)
+        buf4 = torch.zeros(256, dtype=torch.int64, device=device)
+
+        # Source tensors
+        src0 = torch.randint(0, 1000, (size_a,), dtype=torch.int64, device=device)
+        src1 = torch.randint(0, 1000, (size_a,), dtype=torch.int64, device=device)
+        src2 = torch.randint(0, 1000, (size_a,), dtype=torch.int64, device=device)
+        src3 = torch.randint(0, 100, (size_b,), dtype=torch.int64, device=device)
+        src4 = torch.randint(0, 100, (size_b,), dtype=torch.int64, device=device)
+
+        def fn(buf0, buf1, buf2, buf3, buf4, src0, src1, src2, src3, src4, size_a, size_b):
+            # Group 1: shape (size_a,) - 3 copies
+            buf0[:size_a].copy_(src0)
+            buf1[:size_a].copy_(src1)
+            buf2[:size_a].copy_(src2)
+            # Group 2: shape (size_b,) - 2 copies
+            buf3[:size_b].copy_(src3)
+            buf4[:size_b].copy_(src4)
+
+        compiled_fn = torch.compile(fn, dynamic=False)
+        compiled_fn(buf0, buf1, buf2, buf3, buf4, src0, src1, src2, src3, src4, size_a, size_b)
+
+        # Verify correctness
+        self.assertTrue(torch.equal(buf0[:size_a], src0))
+        self.assertTrue(torch.equal(buf1[:size_a], src1))
+        self.assertTrue(torch.equal(buf2[:size_a], src2))
+        self.assertTrue(torch.equal(buf3[:size_b], src3))
+        self.assertTrue(torch.equal(buf4[:size_b], src4))
+
+        # Group 1 (3 copies with shape size_a) -> 1 fusion
+        # Group 2 (2 copies with shape size_b) -> 1 fusion
+        self.assertEqual(counters["inductor"]["batch_foreach_copy"], 2)
+        counters.clear()
+
+    @requires_gpu()
+    @torch._inductor.config.patch(batch_foreach_copy_fusion=True)
+    def test_batch_foreach_copy_with_dependency(self):
+        """
+        Test that dependent copies are correctly partitioned.
+
+        buf0.copy_(src0)           # node0
+        buf1.copy_(src1)           # node1 - independent of node0
+        buf2.copy_(buf0)           # node2 - depends on node0
+
+        node0 and node1 can fuse (independent).
+        node2 cannot fuse with node0 (dependency), and alone doesn't meet min_fuse_set_size.
+        """
+        counters.clear()
+
+        device = GPU_TYPE
+        n = 128
+
+        buf0 = torch.zeros(n, dtype=torch.int64, device=device)
+        buf1 = torch.zeros(n, dtype=torch.int64, device=device)
+        buf2 = torch.zeros(n, dtype=torch.int64, device=device)
+
+        src0 = torch.randint(0, 1000, (n,), dtype=torch.int64, device=device)
+        src1 = torch.randint(0, 1000, (n,), dtype=torch.int64, device=device)
+
+        def fn(buf0, buf1, buf2, src0, src1):
+            buf0.copy_(src0)
+            buf1.copy_(src1)
+            buf2.copy_(buf0)  # depends on first copy
+
+        compiled_fn = torch.compile(fn, dynamic=False)
+        compiled_fn(buf0, buf1, buf2, src0, src1)
+
+        # Verify correctness
+        self.assertTrue(torch.equal(buf0, src0))
+        self.assertTrue(torch.equal(buf1, src1))
+        self.assertTrue(torch.equal(buf2, src0))  # buf2 got buf0's value (which is src0)
+
+        # Only 1 fusion: [buf0.copy_, buf1.copy_]
+        # buf2.copy_ is alone after dependency split, doesn't meet min_fuse_set_size=2
+        self.assertEqual(counters["inductor"]["batch_foreach_copy"], 1)
+        counters.clear()
+
+    @requires_gpu()
+    def test_batch_foreach_copy_disabled_by_default(self):
+        """Test that fusion is disabled when config flag is False."""
+        counters.clear()
+
+        # Ensure disabled
+        with torch._inductor.config.patch(batch_foreach_copy_fusion=False):
+            device = GPU_TYPE
+            n = 256
+
+            buf0 = torch.zeros(n, dtype=torch.float32, device=device)
+            buf1 = torch.zeros(n, dtype=torch.float32, device=device)
+
+            src0 = torch.randn(n, dtype=torch.float32, device=device)
+            src1 = torch.randn(n, dtype=torch.float32, device=device)
+
+            def fn(buf0, buf1, src0, src1):
+                buf0.copy_(src0)
+                buf1.copy_(src1)
+
+            torch._dynamo.reset()
+            compiled_fn = torch.compile(fn)
+            compiled_fn(buf0, buf1, src0, src1)
+
+            # Verify correctness still works
+            self.assertTrue(torch.equal(buf0, src0))
+            self.assertTrue(torch.equal(buf1, src1))
+
+            # No fusion when disabled
+            self.assertEqual(counters["inductor"]["batch_foreach_copy"], 0)
+
+        counters.clear()
+
+
 if __name__ == "__main__":
     run_tests()
