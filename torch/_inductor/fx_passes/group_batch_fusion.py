@@ -1210,15 +1210,10 @@ class BatchForeachCopyPostGradFusion(GroupFusion):
     """
     Fuse multiple copy_ operations into _foreach_copy_ calls.
 
-    Groups copy_ operations by (device, src_dtype, dst_dtype, shape, strides)
-    so each group can use the fast CUDA multi_tensor_apply kernel.
-
-    The fast path for _foreach_copy_ requires:
-    - All tensors on same device
-    - All src tensors have same dtype
-    - All dst tensors have same dtype
-    - Corresponding tensors have same sizes and strides
-    - All tensors are strided, non-overlapping, and dense
+    Groups copy_ operations by (device, src_dtype, dst_dtype). Only fuses
+    copies where dst and src have matching strides (for non-singleton dims),
+    which is required by the _foreach_copy_ fast path. Different shapes
+    across pairs are allowed by the foreach API.
     """
 
     def get_all_fusion_candidates(
@@ -1278,15 +1273,22 @@ class BatchForeachCopyPostGradFusion(GroupFusion):
         if not dst_val.is_cuda:
             return None
 
-        # Group by: device, src dtype, dst dtype, shape, strides
-        # This ensures the fast path requirements are met within each group
+        # The _foreach_copy_ fast path requires each (dst[i], src[i]) pair to have
+        # matching strides (for non-singleton dimensions). Skip if strides don't match.
+        dst_strides = dst_val.stride()
+        src_strides = src_val.stride()
+        dst_shape = dst_val.shape
+        for dim, size in enumerate(dst_shape):
+            if size != 1 and dst_strides[dim] != src_strides[dim]:
+                return None
+
+        # Group by: device, src dtype, dst dtype
+        # Different shapes across pairs are allowed by the foreach API.
         device = str(dst_val.device)
         src_dtype = str(src_val.dtype)
         dst_dtype = str(dst_val.dtype)
-        shape = str(tuple(dst_val.shape))
-        strides = str(tuple(dst_val.stride()))
 
-        return ("batch_foreach_copy", device, src_dtype, dst_dtype, shape, strides)
+        return ("batch_foreach_copy", device, src_dtype, dst_dtype)
 
     def fuse(self, graph: torch.fx.GraphModule, subset: list[torch.fx.Node]) -> None:
         if len(subset) < 2:
