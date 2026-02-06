@@ -1210,7 +1210,8 @@ class BatchForeachCopyPostGradFusion(GroupFusion):
     """
     Fuse multiple copy_ operations into _foreach_copy_ calls.
 
-    Groups copy_ operations by (device, src_dtype, dst_dtype). Only fuses
+    Groups copy_ operations by device only; mixed dtypes are allowed (native
+    uses slow path; Inductor lowering does per-pair to_dtype). Only fuses
     copies where dst and src have matching strides (for non-singleton dims),
     which is required by the _foreach_copy_ fast path. Different shapes
     across pairs are allowed by the foreach API.
@@ -1282,13 +1283,9 @@ class BatchForeachCopyPostGradFusion(GroupFusion):
             if size != 1 and dst_strides[dim] != src_strides[dim]:
                 return None
 
-        # Group by: device, src dtype, dst dtype
-        # Different shapes across pairs are allowed by the foreach API.
+        # Group by device only; mixed dtypes allowed (native slow path / Inductor to_dtype).
         device = str(dst_val.device)
-        src_dtype = str(src_val.dtype)
-        dst_dtype = str(dst_val.dtype)
-
-        return ("batch_foreach_copy", device, src_dtype, dst_dtype)
+        return ("batch_foreach_copy", device)
 
     def fuse(self, graph: torch.fx.GraphModule, subset: list[torch.fx.Node]) -> None:
         if len(subset) < 2:

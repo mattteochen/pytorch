@@ -355,8 +355,8 @@ pre_grad_fusion_options: dict[str, dict[str, Any]] = {}
 post_grad_fusion_options: dict[str, dict[str, Any]] = {}
 
 # Enable batch foreach copy fusion: fuses multiple copy_ ops into _foreach_copy_
-# for better kernel launch efficiency on CUDA. Groups by (device, dtype, shape, strides)
-# so each group can use the fast multi_tensor_apply CUDA kernel.
+# for better kernel launch efficiency on CUDA. Groups by device (mixed dtypes allowed).
+# Per-pair stride matching still required for the native fast path.
 # Set to True to enable, or configure via post_grad_fusion_options["batch_foreach_copy"]
 batch_foreach_copy_fusion = (
     os.environ.get("TORCHINDUCTOR_BATCH_FOREACH_COPY_FUSION", "0") == "1"
