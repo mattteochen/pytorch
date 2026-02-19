@@ -124,12 +124,13 @@ def _trace_back_to_wait_tensor(
     visited.add(node)
     if _is_wait_tensor(node):
         return node
+    found = None
     for arg in node.args:
         if isinstance(arg, fx.Node):
             result = _trace_back_to_wait_tensor(arg, visited)
             if result is not None:
-                return result
-    return None
+                found = result
+    return found
 
 
 def _find_residual_add_pattern(
