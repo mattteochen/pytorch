@@ -3,7 +3,7 @@
 Tests for the fused all_reduce + rmsnorm pass.
 """
 
-import unittest
+import operator
 
 import torch
 import torch.distributed as dist
@@ -14,6 +14,7 @@ from torch._inductor.fx_passes.fused_allreduce_rmsnorm import (
     _find_all_reduce_rmsnorm_patterns,
     _is_all_reduce,
     _is_wait_tensor,
+    fused_all_reduce_rmsnorm_pass,
 )
 from torch._inductor.fx_passes.post_grad import remove_noop_ops, view_to_reshape
 from torch.distributed._functional_collectives import all_reduce
@@ -62,8 +63,6 @@ class TestFusedAllReduceRMSNormPatternMatching(TestCase):
         weight = torch.randn(hidden_dim)
 
         gm = _make_post_grad_fx(func, x, weight)
-        print("Graph for simple pattern:")
-        gm.graph.print_tabular()
 
         matches = _find_all_reduce_rmsnorm_patterns(gm.graph)
 
@@ -74,6 +73,7 @@ class TestFusedAllReduceRMSNormPatternMatching(TestCase):
         self.assertIsNone(match.residual_node, "Should not have residual")
         self.assertEqual(match.reduce_op, "sum")
         self.assertEqual(match.group_name, group.group_name)
+        self.assertGreater(len(match.intermediate_nodes), 0)
 
     def test_find_all_reduce_add_rmsnorm_pattern(self):
         """Test: all_reduce -> wait -> add -> rmsnorm (with residual)."""
@@ -92,8 +92,6 @@ class TestFusedAllReduceRMSNormPatternMatching(TestCase):
         weight = torch.randn(hidden_dim)
 
         gm = _make_post_grad_fx(func, x, residual, weight)
-        print("\nGraph for residual pattern:")
-        gm.graph.print_tabular()
 
         matches = _find_all_reduce_rmsnorm_patterns(gm.graph)
 
@@ -113,7 +111,6 @@ class TestFusedAllReduceRMSNormPatternMatching(TestCase):
             x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor
         ) -> torch.Tensor:
             reduced = all_reduce(x, "sum", group=group.group_name)
-            # Note: residual + reduced (reversed order)
             added = residual + reduced
             return F.rms_norm(added, (hidden_dim,), weight, eps=1e-6)
 
@@ -122,8 +119,6 @@ class TestFusedAllReduceRMSNormPatternMatching(TestCase):
         weight = torch.randn(hidden_dim)
 
         gm = _make_post_grad_fx(func, x, residual, weight)
-        print("\nGraph for reversed residual pattern:")
-        gm.graph.print_tabular()
 
         matches = _find_all_reduce_rmsnorm_patterns(gm.graph)
 
@@ -151,7 +146,7 @@ class TestFusedAllReduceRMSNormPatternMatching(TestCase):
 
         def func(x: torch.Tensor) -> torch.Tensor:
             reduced = all_reduce(x, "sum", group=group.group_name)
-            return reduced * 2  # Some other op, not rmsnorm
+            return reduced * 2
 
         x = torch.randn(4, 64)
 
@@ -181,8 +176,6 @@ class TestFusedAllReduceRMSNormPatternMatching(TestCase):
         weight = torch.randn(hidden_dim)
 
         gm = _make_post_grad_fx(func, x1, x2, weight)
-        print("\nGraph for multiple patterns:")
-        gm.graph.print_tabular()
 
         matches = _find_all_reduce_rmsnorm_patterns(gm.graph)
 
@@ -207,6 +200,121 @@ class TestFusedAllReduceRMSNormPatternMatching(TestCase):
         self.assertEqual(matches[0].reduce_op, "avg")
 
 
+class TestFusedOpReturnType(TestCase):
+    """Test the fused op's (Tensor, Tensor?) return semantics."""
+
+    def setUp(self):
+        super().setUp()
+        store = FakeStore()
+        dist.init_process_group(backend="fake", world_size=2, rank=0, store=store)
+
+    def tearDown(self):
+        dist.destroy_process_group()
+        super().tearDown()
+
+    def test_fallback_no_residual(self):
+        """Fallback returns (normed, None) when no residual is given."""
+        x = torch.randn(4, 64)
+        weight = torch.randn(64)
+        group_name = dist.group.WORLD.group_name
+
+        normed, pre_norm = torch.ops.symm_mem.fused_all_reduce_rmsnorm(
+            x, weight, "sum", group_name, eps=1e-6,
+        )
+        self.assertEqual(normed.shape, x.shape)
+        self.assertIsNone(pre_norm)
+
+    def test_fallback_with_residual(self):
+        """Fallback returns (normed, pre_norm) when residual is given."""
+        x = torch.randn(4, 64)
+        residual = torch.randn(4, 64)
+        weight = torch.randn(64)
+        group_name = dist.group.WORLD.group_name
+
+        normed, pre_norm = torch.ops.symm_mem.fused_all_reduce_rmsnorm(
+            x, weight, "sum", group_name, residual=residual, eps=1e-6,
+        )
+        self.assertEqual(normed.shape, x.shape)
+        self.assertIsNotNone(pre_norm)
+        self.assertEqual(pre_norm.shape, x.shape)
+
+    def test_fallback_correctness_with_residual(self):
+        """pre_norm output matches manual all_reduce + residual."""
+        x = torch.randn(4, 64)
+        residual = torch.randn(4, 64)
+        weight = torch.randn(64)
+        group_name = dist.group.WORLD.group_name
+
+        normed, pre_norm = torch.ops.symm_mem.fused_all_reduce_rmsnorm(
+            x, weight, "sum", group_name, residual=residual, eps=1e-6,
+        )
+
+        reduced = torch.ops._c10d_functional.all_reduce(x, "sum", group_name)
+        reduced = torch.ops._c10d_functional.wait_tensor(reduced)
+        expected_pre_norm = reduced + residual
+        expected_normed = F.rms_norm(expected_pre_norm, weight.shape, weight, 1e-6)
+
+        self.assertEqual(pre_norm, expected_pre_norm)
+        self.assertEqual(normed, expected_normed)
+
+    def test_fallback_correctness_no_residual(self):
+        """Normed output matches manual all_reduce + rms_norm."""
+        x = torch.randn(4, 64)
+        weight = torch.randn(64)
+        group_name = dist.group.WORLD.group_name
+
+        normed, pre_norm = torch.ops.symm_mem.fused_all_reduce_rmsnorm(
+            x, weight, "sum", group_name, eps=1e-6,
+        )
+
+        reduced = torch.ops._c10d_functional.all_reduce(x, "sum", group_name)
+        reduced = torch.ops._c10d_functional.wait_tensor(reduced)
+        expected_normed = F.rms_norm(reduced, weight.shape, weight, 1e-6)
+
+        self.assertIsNone(pre_norm)
+        self.assertEqual(normed, expected_normed)
+
+
+class TestFXPassGraphRewrite(TestCase):
+    """Test that the pass correctly rewrites the FX graph with getitem nodes."""
+
+    def setUp(self):
+        super().setUp()
+        store = FakeStore()
+        dist.init_process_group(backend="fake", world_size=2, rank=0, store=store)
+
+    def tearDown(self):
+        dist.destroy_process_group()
+        super().tearDown()
+
+    def _count_fused_ops(self, graph):
+        return sum(
+            1
+            for n in graph.nodes
+            if n.target is torch.ops.symm_mem.fused_all_reduce_rmsnorm.default
+        )
+
+    def _count_getitems(self, graph):
+        return sum(
+            1 for n in graph.nodes if n.target is operator.getitem
+        )
+
+    def test_pass_inserts_getitem_nodes(self):
+        """After the pass, the fused op should be followed by getitem(0) and getitem(1)."""
+        group = dist.group.WORLD
+        hidden_dim = 64
+
+        def func(x, weight):
+            reduced = all_reduce(x, "sum", group=group.group_name)
+            return F.rms_norm(reduced, (hidden_dim,), weight, eps=1e-6)
+
+        gm = _make_post_grad_fx(func, torch.randn(4, hidden_dim), torch.randn(hidden_dim))
+        fused_all_reduce_rmsnorm_pass(gm.graph)
+
+        self.assertEqual(self._count_fused_ops(gm.graph), 1)
+        self.assertEqual(self._count_getitems(gm.graph), 2)
+
+
 class TestHelperFunctions(TestCase):
     """Test helper functions without distributed setup."""
 
@@ -225,7 +333,6 @@ class TestHelperFunctions(TestCase):
         super().tearDown()
 
     def test_is_all_reduce(self):
-        """Test _is_all_reduce helper."""
         group = dist.group.WORLD
 
         def func(x):
@@ -237,7 +344,6 @@ class TestHelperFunctions(TestCase):
         self.assertEqual(len(all_reduce_nodes), 1)
 
     def test_is_wait_tensor(self):
-        """Test _is_wait_tensor helper."""
         group = dist.group.WORLD
 
         def func(x):
