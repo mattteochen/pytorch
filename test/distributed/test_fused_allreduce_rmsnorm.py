@@ -16,6 +16,8 @@ from torch._inductor.fx_passes.fused_allreduce_rmsnorm import (
     _is_wait_tensor,
     fused_all_reduce_rmsnorm_pass,
 )
+import torch.distributed._symmetric_memory  # registers symm_mem custom ops
+from torch.distributed._symmetric_memory import _test_mode
 from torch._inductor.fx_passes.post_grad import remove_noop_ops, view_to_reshape
 from torch.distributed._functional_collectives import all_reduce
 from torch.testing._internal.common_utils import run_tests, TestCase
@@ -309,7 +311,8 @@ class TestFXPassGraphRewrite(TestCase):
             return F.rms_norm(reduced, (hidden_dim,), weight, eps=1e-6)
 
         gm = _make_post_grad_fx(func, torch.randn(4, hidden_dim), torch.randn(hidden_dim))
-        fused_all_reduce_rmsnorm_pass(gm.graph)
+        with _test_mode():
+            fused_all_reduce_rmsnorm_pass(gm.graph)
 
         self.assertEqual(self._count_fused_ops(gm.graph), 1)
         self.assertEqual(self._count_getitems(gm.graph), 2)
