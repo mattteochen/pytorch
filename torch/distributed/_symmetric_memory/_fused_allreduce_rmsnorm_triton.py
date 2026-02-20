@@ -82,38 +82,21 @@ def _fused_allreduce_rmsnorm_kernel(
     )
 
 
-def fused_allreduce_rmsnorm_symm_mem(
-    input: torch.Tensor,
+def _launch_fused_kernel(
+    sm,
+    peer_bufs: list[torch.Tensor],
+    input_2d: torch.Tensor,
     weight: torch.Tensor,
-    reduce_op: str,
-    group_name: str,
     *,
     residual: torch.Tensor | None = None,
     eps: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    if reduce_op != "sum":
-        raise ValueError(f"Only 'sum' reduce_op is supported, got '{reduce_op}'")
-    if not input.is_contiguous():
-        raise ValueError("input must be contiguous")
+    """barrier → Triton kernel → barrier.
 
-    input_2d = input.reshape(-1, input.shape[-1])
+    ``peer_bufs`` must already contain each rank's data (either via explicit
+    copy or because the tensors were allocated in symmetric memory).
+    """
     M, N = input_2d.shape
-    workspace_bytes = input_2d.numel() * input_2d.element_size()
-
-    sm = get_symm_mem_workspace(group_name, min_size=workspace_bytes)
-    if sm.world_size > _MAX_WORLD_SIZE:
-        raise ValueError(
-            f"world_size {sm.world_size} exceeds maximum {_MAX_WORLD_SIZE}"
-        )
-
-    shape = tuple(input_2d.shape)
-    peer_bufs = [sm.get_buffer(r, shape, input_2d.dtype) for r in range(sm.world_size)]
-    while len(peer_bufs) < _MAX_WORLD_SIZE:
-        peer_bufs.append(peer_bufs[0])
-    peer_bufs[sm.rank].copy_(input_2d)
-
-    sm.barrier(channel=0)
-
     output = torch.empty_like(input_2d)
     has_residual = residual is not None
 
@@ -125,6 +108,8 @@ def fused_allreduce_rmsnorm_symm_mem(
         residual_out = torch.empty_like(input_2d)
 
     BLOCK_N = triton.next_power_of_2(N)
+
+    sm.barrier(channel=0)
 
     _fused_allreduce_rmsnorm_kernel[(M,)](
         peer_bufs[0],
@@ -148,6 +133,46 @@ def fused_allreduce_rmsnorm_symm_mem(
     )
 
     sm.barrier(channel=0)
+    return output, residual_out
+
+
+def _make_peer_bufs(sm, shape: tuple[int, ...], dtype: torch.dtype) -> list[torch.Tensor]:
+    """Build the padded peer buffer list from a SymmetricMemory handle."""
+    peer_bufs = [sm.get_buffer(r, shape, dtype) for r in range(sm.world_size)]
+    while len(peer_bufs) < _MAX_WORLD_SIZE:
+        peer_bufs.append(peer_bufs[0])
+    return peer_bufs
+
+
+def fused_allreduce_rmsnorm_symm_mem(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    reduce_op: str,
+    group_name: str,
+    *,
+    residual: torch.Tensor | None = None,
+    eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    if reduce_op != "sum":
+        raise ValueError(f"Only 'sum' reduce_op is supported, got '{reduce_op}'")
+    if not input.is_contiguous():
+        raise ValueError("input must be contiguous")
+
+    input_2d = input.reshape(-1, input.shape[-1])
+    workspace_bytes = input_2d.numel() * input_2d.element_size()
+
+    sm = get_symm_mem_workspace(group_name, min_size=workspace_bytes)
+    if sm.world_size > _MAX_WORLD_SIZE:
+        raise ValueError(
+            f"world_size {sm.world_size} exceeds maximum {_MAX_WORLD_SIZE}"
+        )
+
+    peer_bufs = _make_peer_bufs(sm, tuple(input_2d.shape), input_2d.dtype)
+    peer_bufs[sm.rank].copy_(input_2d)
+
+    output, residual_out = _launch_fused_kernel(
+        sm, peer_bufs, input_2d, weight, residual=residual, eps=eps,
+    )
 
     output = output.view(input.shape)
     if residual_out is not None:

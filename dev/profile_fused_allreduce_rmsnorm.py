@@ -3,10 +3,12 @@ Profile fused allreduce + RMSNorm: end-to-end SGLang-style repro.
 
 Simulates a decoder layer: linear (MoE stand-in) → allreduce → residual add → RMSNorm.
 
-Profiles three variants:
+Profiles four variants:
   1. baseline  – NCCL all_reduce + eager F.rms_norm
-  2. fused_op  – torch.ops.symm_mem.fused_all_reduce_rmsnorm (direct)
+  2. fused_op  – torch.ops.symm_mem.fused_all_reduce_rmsnorm (direct, workspace copy)
   3. compiled  – torch.compile with FX pass fusion
+  4. mempool   – mem pool zero-copy: matmul output lands in symmetric memory,
+                 eliminating the DtoD workspace copy
 
 Launch:
     torchrun --nproc_per_node=NUM_GPUS dev/profile_fused_allreduce_rmsnorm.py
@@ -22,6 +24,10 @@ import torch.distributed._functional_collectives as funcol
 import torch.distributed._symmetric_memory as symm_mem
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributed._symmetric_memory._fused_allreduce_rmsnorm_triton import (
+    _launch_fused_kernel,
+    _make_peer_bufs,
+)
 
 HIDDEN = 4096
 SEQ_LEN = 2048
@@ -174,6 +180,26 @@ def main():
         return ar_norm_compiled(h, residual, weight, group_name)
 
     _profile("compiled", compiled_call, rank, warmup=WARMUP_ITERS + 5, cuda_graph=True)
+
+    # --- Variant 4: mem pool (zero-copy, no DtoD workspace copy) ---
+    # Pre-allocate output in symmetric memory and rendezvous BEFORE capture
+    # so the CUDA graph only sees GPU ops with fixed addresses.
+    mempool = symm_mem.get_mem_pool(device)
+    M_total = BATCH * SEQ_LEN
+    with torch.cuda.use_mem_pool(mempool):
+        h_symm = torch.empty(M_total, HIDDEN, device=device, dtype=torch.bfloat16)
+    sm_hdl = symm_mem.rendezvous(h_symm, dist.group.WORLD)
+    peer_bufs = _make_peer_bufs(sm_hdl, tuple(h_symm.shape), h_symm.dtype)
+
+    def mempool_call():
+        intermediate = F.silu(layer.moe_proj(x))
+        torch.mm(intermediate.view(-1, INTER), layer.down_proj.weight.t(), out=h_symm)
+        output, residual_out = _launch_fused_kernel(
+            sm_hdl, peer_bufs, h_symm, weight, residual=residual, eps=EPS,
+        )
+        return output.view(x.shape), residual_out.view(x.shape)
+
+    _profile("mempool", mempool_call, rank, cuda_graph=True)
 
     dist.destroy_process_group()
     if rank == 0:
