@@ -3,11 +3,11 @@
 Fused all_reduce + RMSNorm operation using symmetric memory.
 
 This module defines the fused_all_reduce_rmsnorm op which performs:
-1. All-reduce across ranks
+1. All-reduce across ranks (via P2P loads from symmetric memory)
 2. Optional residual addition
 3. RMS normalization
 
-All in a single kernel to avoid intermediate memory round-trips.
+All in a single Triton kernel to avoid intermediate memory round-trips.
 
 Returns (normed_output, pre_norm_output) where pre_norm_output is the
 reduced + residual value (useful as the next layer's residual input).
@@ -18,6 +18,7 @@ import logging
 
 import torch
 import torch.nn.functional as F
+from torch.distributed._symmetric_memory import is_symm_mem_enabled_for_group
 
 
 log = logging.getLogger(__name__)
@@ -64,11 +65,7 @@ def _fused_all_reduce_rmsnorm_fallback(
     residual: torch.Tensor | None = None,
     eps: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """
-    Fallback implementation using existing ops.
-
-    Used for eager execution, tracing, and correctness testing.
-    """
+    """Fallback: NCCL all_reduce + F.rms_norm (for eager, tracing, CPU)."""
     reduced = torch.ops._c10d_functional.all_reduce(input, reduce_op, group_name)
     reduced = torch.ops._c10d_functional.wait_tensor(reduced)
 
@@ -81,18 +78,6 @@ def _fused_all_reduce_rmsnorm_fallback(
     return normed, pre_norm
 
 
-def _is_nvshmem_available() -> bool:
-    try:
-        from torch.distributed._symmetric_memory._nvshmem_triton import (
-            NvshmemLibFinder,
-        )
-
-        NvshmemLibFinder.find_device_library()
-        return True
-    except (ImportError, RuntimeError):
-        return False
-
-
 @torch.library.impl(lib, "fused_all_reduce_rmsnorm", "CUDA")
 def _fused_all_reduce_rmsnorm_cuda(
     input: torch.Tensor,
@@ -103,18 +88,19 @@ def _fused_all_reduce_rmsnorm_cuda(
     residual: torch.Tensor | None = None,
     eps: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    if _is_nvshmem_available():
+    if is_symm_mem_enabled_for_group(group_name):
         try:
             from ._fused_allreduce_rmsnorm_triton import (
-                fused_allreduce_rmsnorm_nvshmem,
+                fused_allreduce_rmsnorm_symm_mem,
             )
 
-            return fused_allreduce_rmsnorm_nvshmem(
+            return fused_allreduce_rmsnorm_symm_mem(
                 input, weight, reduce_op, group_name, residual=residual, eps=eps
             )
         except (ImportError, RuntimeError, ValueError):
             log.debug(
-                "NVSHMEM Triton kernel failed, falling back to decomposed impl",
+                "Symmetric memory Triton kernel failed, falling back to "
+                "decomposed impl",
                 exc_info=True,
             )
 

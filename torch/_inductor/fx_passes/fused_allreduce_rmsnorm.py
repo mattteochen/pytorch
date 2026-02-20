@@ -28,6 +28,7 @@ from torch.utils._ordered_set import OrderedSet
 
 log = logging.getLogger(__name__)
 aten = torch.ops.aten
+prims = torch.ops.prims
 c10d = torch.ops._c10d_functional
 
 
@@ -325,12 +326,47 @@ def _erase_old_nodes(match: _AllReduceRMSNormMatch) -> None:
                 changed = True
 
 
-def fused_all_reduce_rmsnorm_pass(graph: fx.Graph) -> None:
+def _absorb_trailing_converts(
+    normed_node: fx.Node, input_node: fx.Node
+) -> None:
+    """
+    The fused op outputs in the input's dtype (e.g. bf16), but the old
+    ``mul(normalised, fp32_weight)`` produced fp32.  The decomposed RMSNorm
+    therefore had a trailing ``convert_element_type(result, bf16)`` that is
+    now redundant.  Absorb it so Inductor doesn't emit a pointwise kernel.
+    """
+    input_meta_val = input_node.meta.get("val")
+    if input_meta_val is None:
+        return
+    input_dtype = input_meta_val.dtype
+
+    for user in list(normed_node.users.keys()):
+        if (
+            user.target == prims.convert_element_type.default
+            and len(user.args) >= 2
+            and user.args[1] == input_dtype
+        ):
+            user.replace_all_uses_with(normed_node)
+            user.graph.erase_node(user)
+
+    # Fix metadata: the fused op's Meta impl returns empty_like(input),
+    # so the actual dtype is the input dtype, not the old fp32 mul dtype.
+    old_val = normed_node.meta.get("val")
+    if old_val is not None and hasattr(old_val, "dtype") and old_val.dtype != input_dtype:
+        normed_node.meta["val"] = old_val.to(input_dtype)
+
+
+def fused_all_reduce_rmsnorm_pass(graph: fx.Graph, is_inference: bool = True) -> None:
     """
     Main pass entry point.
 
     Finds ``all_reduce + rmsnorm`` patterns and replaces them with fused ops.
+    Only runs during inference because the fused op does not produce the
+    intermediate tensors (e.g. rsqrt) that autograd saves for backward.
     """
+    if not is_inference:
+        log.debug("fused_all_reduce_rmsnorm_pass: skipped (training mode)")
+        return
     matches = _find_all_reduce_rmsnorm_patterns(graph)
     if not matches:
         log.debug("fused_all_reduce_rmsnorm_pass: no patterns found")
@@ -353,6 +389,7 @@ def fused_all_reduce_rmsnorm_pass(graph: fx.Graph) -> None:
             match.add_node.replace_all_uses_with(pre_norm_node)
 
         _erase_old_nodes(match)
+        _absorb_trailing_converts(normed_node, match.input_node)
         fused_count += 1
 
     if fused_count > 0:
