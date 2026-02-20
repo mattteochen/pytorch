@@ -1,102 +1,118 @@
 # Owner(s): ["oncall: distributed"]
 """
-Triton kernel for fused all_reduce + RMSNorm using P2P symmetric memory.
+Fused all_reduce + RMSNorm Triton kernel using symmetric memory P2P.
 
-The kernel reads directly from all ranks' P2P-mapped symmetric memory buffers,
-reduces in-register, optionally adds a residual, and computes RMS normalization
--- all in a single kernel launch. This avoids materializing the allreduce
-intermediate in global memory.
-
-The host wrapper handles symmetric memory allocation, local data staging, and
-cross-rank barrier synchronization. A future version can move the barriers
-into the kernel using NVSHMEM cooperative primitives when Triton adds
-cooperative launch support.
+Single kernel performs: P2P loads from all peers → sum reduce → optional
+residual add → RMSNorm.  Host-side ``symm_mem.barrier()`` provides
+synchronization before and after the kernel.  No NVSHMEM dependency.
 """
 
 import torch
 import triton
 import triton.language as tl
-
-from torch.distributed._symmetric_memory import (
-    _get_backend_stream,
-    get_symm_mem_workspace,
-)
+from torch.distributed._symmetric_memory import get_symm_mem_workspace
 
 _MAX_WORLD_SIZE = 8
+
+# Cache peer buffer tensor views across calls. The views point into the
+# persistent symmetric memory workspace so they remain valid until the
+# workspace is reallocated (which only happens when a larger size is needed).
+# Key: (group_name, shape, dtype) → (workspace_id, [peer_buf_views...])
+_peer_buf_cache: dict[
+    tuple[str, tuple[int, ...], torch.dtype],
+    tuple[int, list[torch.Tensor]],
+] = {}
 
 
 @triton.jit
 def _fused_allreduce_rmsnorm_kernel(
-    buf0_ptr,
-    buf1_ptr,
-    buf2_ptr,
-    buf3_ptr,
-    buf4_ptr,
-    buf5_ptr,
-    buf6_ptr,
-    buf7_ptr,
+    # P2P buffer pointers (one per rank, unused ranks are ignored)
+    buf0,
+    buf1,
+    buf2,
+    buf3,
+    buf4,
+    buf5,
+    buf6,
+    buf7,
     output_ptr,
     weight_ptr,
     residual_ptr,
     residual_out_ptr,
     N,
-    stride_buf_row,
-    stride_out_row,
-    stride_res_row,
+    stride_row,
     eps,
-    HAS_RESIDUAL: tl.constexpr,
     WORLD_SIZE: tl.constexpr,
+    HAS_RESIDUAL: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
     row_idx = tl.program_id(0)
     cols = tl.arange(0, BLOCK_N)
     mask = cols < N
+    row_off = row_idx * stride_row + cols
 
-    buf_offset = row_idx * stride_buf_row + cols
-
-    acc = tl.load(buf0_ptr + buf_offset, mask=mask, other=0.0).to(tl.float32)
+    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    if WORLD_SIZE >= 1:
+        acc += tl.load(buf0 + row_off, mask=mask, other=0.0).to(tl.float32)
     if WORLD_SIZE >= 2:
-        acc += tl.load(buf1_ptr + buf_offset, mask=mask, other=0.0).to(tl.float32)
+        acc += tl.load(buf1 + row_off, mask=mask, other=0.0).to(tl.float32)
     if WORLD_SIZE >= 3:
-        acc += tl.load(buf2_ptr + buf_offset, mask=mask, other=0.0).to(tl.float32)
+        acc += tl.load(buf2 + row_off, mask=mask, other=0.0).to(tl.float32)
     if WORLD_SIZE >= 4:
-        acc += tl.load(buf3_ptr + buf_offset, mask=mask, other=0.0).to(tl.float32)
+        acc += tl.load(buf3 + row_off, mask=mask, other=0.0).to(tl.float32)
     if WORLD_SIZE >= 5:
-        acc += tl.load(buf4_ptr + buf_offset, mask=mask, other=0.0).to(tl.float32)
+        acc += tl.load(buf4 + row_off, mask=mask, other=0.0).to(tl.float32)
     if WORLD_SIZE >= 6:
-        acc += tl.load(buf5_ptr + buf_offset, mask=mask, other=0.0).to(tl.float32)
+        acc += tl.load(buf5 + row_off, mask=mask, other=0.0).to(tl.float32)
     if WORLD_SIZE >= 7:
-        acc += tl.load(buf6_ptr + buf_offset, mask=mask, other=0.0).to(tl.float32)
+        acc += tl.load(buf6 + row_off, mask=mask, other=0.0).to(tl.float32)
     if WORLD_SIZE >= 8:
-        acc += tl.load(buf7_ptr + buf_offset, mask=mask, other=0.0).to(tl.float32)
+        acc += tl.load(buf7 + row_off, mask=mask, other=0.0).to(tl.float32)
 
     if HAS_RESIDUAL:
-        res = tl.load(
-            residual_ptr + row_idx * stride_res_row + cols, mask=mask, other=0.0
-        )
-        pre_norm = acc + res.to(tl.float32)
+        res = tl.load(residual_ptr + row_off, mask=mask, other=0.0).to(tl.float32)
+        acc = acc + res
         tl.store(
-            residual_out_ptr + row_idx * stride_out_row + cols,
-            pre_norm.to(output_ptr.dtype.element_ty),
+            residual_out_ptr + row_off,
+            acc.to(output_ptr.dtype.element_ty),
             mask=mask,
         )
-    else:
-        pre_norm = acc
 
-    mean_sq = tl.sum(pre_norm * pre_norm, axis=0) / N
+    mean_sq = tl.sum(acc * acc, axis=0) / N
     rnorm = tl.math.rsqrt(mean_sq + eps)
 
-    wt = tl.load(weight_ptr + cols, mask=mask, other=0.0)
-    out = pre_norm * rnorm * wt.to(tl.float32)
+    wt = tl.load(weight_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    out = acc * rnorm * wt
 
     tl.store(
-        output_ptr + row_idx * stride_out_row + cols,
+        output_ptr + row_off,
         out.to(output_ptr.dtype.element_ty),
         mask=mask,
     )
 
 
-def fused_allreduce_rmsnorm_nvshmem(
+def _get_peer_bufs(
+    sm: object,
+    group_name: str,
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+) -> list[torch.Tensor]:
+    """Return cached P2P buffer views, creating them on first call."""
+    cache_key = (group_name, shape, dtype)
+    workspace_id = id(sm)
+    cached = _peer_buf_cache.get(cache_key)
+    if cached is not None and cached[0] == workspace_id:
+        return cached[1]
+
+    world_size = sm.world_size  # type: ignore[attr-defined]
+    bufs = [sm.get_buffer(r, shape, dtype) for r in range(world_size)]  # type: ignore[attr-defined]
+    while len(bufs) < _MAX_WORLD_SIZE:
+        bufs.append(bufs[0])
+    _peer_buf_cache[cache_key] = (workspace_id, bufs)
+    return bufs
+
+
+def fused_allreduce_rmsnorm_symm_mem(
     input: torch.Tensor,
     weight: torch.Tensor,
     reduce_op: str,
@@ -112,30 +128,18 @@ def fused_allreduce_rmsnorm_nvshmem(
 
     input_2d = input.reshape(-1, input.shape[-1])
     M, N = input_2d.shape
-
     workspace_bytes = input_2d.numel() * input_2d.element_size()
-    symm_mem = get_symm_mem_workspace(group_name, min_size=workspace_bytes)
-    world_size = symm_mem.world_size
-    rank = symm_mem.rank
 
-    if world_size > _MAX_WORLD_SIZE:
+    sm = get_symm_mem_workspace(group_name, min_size=workspace_bytes)
+    if sm.world_size > _MAX_WORLD_SIZE:
         raise ValueError(
-            f"world_size {world_size} exceeds maximum {_MAX_WORLD_SIZE}"
+            f"world_size {sm.world_size} exceeds maximum {_MAX_WORLD_SIZE}"
         )
 
-    local_buf = symm_mem.get_buffer(rank, input_2d.shape, input_2d.dtype)
+    peer_bufs = _get_peer_bufs(sm, group_name, tuple(input_2d.shape), input_2d.dtype)
+    peer_bufs[sm.rank].copy_(input_2d)
 
-    backend_stream = _get_backend_stream()
-    backend_stream.wait_stream(torch.cuda.current_stream())
-    with backend_stream:
-        local_buf.copy_(input_2d)
-
-    symm_mem.barrier(channel=0)
-    torch.cuda.current_stream().wait_stream(backend_stream)
-
-    bufs = [symm_mem.get_buffer(r, input_2d.shape, input_2d.dtype) for r in range(world_size)]
-    while len(bufs) < _MAX_WORLD_SIZE:
-        bufs.append(bufs[0])
+    sm.barrier(channel=0)
 
     output = torch.empty_like(input_2d)
     has_residual = residual is not None
@@ -148,26 +152,29 @@ def fused_allreduce_rmsnorm_nvshmem(
         residual_out = torch.empty_like(input_2d)
 
     BLOCK_N = triton.next_power_of_2(N)
-    grid = (M,)
 
-    _fused_allreduce_rmsnorm_kernel[grid](
-        bufs[0], bufs[1], bufs[2], bufs[3],
-        bufs[4], bufs[5], bufs[6], bufs[7],
+    _fused_allreduce_rmsnorm_kernel[(M,)](
+        peer_bufs[0],
+        peer_bufs[1],
+        peer_bufs[2],
+        peer_bufs[3],
+        peer_bufs[4],
+        peer_bufs[5],
+        peer_bufs[6],
+        peer_bufs[7],
         output,
         weight,
         residual_2d if has_residual else output,
         residual_out if has_residual else output,
         N,
-        N,  # stride_buf_row (contiguous)
-        N,  # stride_out_row (contiguous)
-        residual_2d.stride(0) if residual_2d is not None else N,
+        N,
         eps,
+        WORLD_SIZE=sm.world_size,
         HAS_RESIDUAL=has_residual,
-        WORLD_SIZE=world_size,
         BLOCK_N=BLOCK_N,
     )
 
-    symm_mem.barrier(channel=0)
+    sm.barrier(channel=0)
 
     output = output.view(input.shape)
     if residual_out is not None:
