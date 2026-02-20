@@ -200,7 +200,8 @@ Tests across 5 test classes:
 | `torch/distributed/_symmetric_memory/_fused_allreduce_rmsnorm_triton.py` | Triton kernel (P2P loads, reduce, RMSNorm) |
 | `torch/distributed/_symmetric_memory/__init__.py` | Op registration import |
 | `test/distributed/test_fused_allreduce_rmsnorm.py` | Tests |
-| `dev/profile_fused_allreduce_rmsnorm.py` | Profiling script (4 variants: baseline, fused_op, compiled, mempool) |
+| `dev/profile_fused_allreduce_rmsnorm.py` | Profiling script (5 variants: baseline, fused_op, compiled, mempool, kraken) |
+| `third_party/kraken/` | Submodule: Triton-based symmetric memory operators ([github](https://github.com/meta-pytorch/kraken)) |
 
 ## torch.compile Integration (SGLang-style)
 
@@ -228,9 +229,9 @@ because the FX pass matches `c10d_functional.all_reduce` nodes specifically.
 
 A profiling script (`dev/profile_fused_allreduce_rmsnorm.py`) demonstrates the
 full integration with a dummy decoder layer (linear → allreduce → add residual
-→ RMSNorm), comparing four variants under CUDA graph capture: NCCL baseline,
-direct fused op (workspace copy), torch.compile (FX pass fusion), and memory
-pool zero-copy (matmul output in symmetric memory).
+→ RMSNorm), comparing five variants under CUDA graph capture: NCCL baseline,
+direct fused op (workspace copy), torch.compile (FX pass fusion), memory pool
+zero-copy, and kraken (device-side sync, single kernel).
 
 ## Profiling Results (4× GPU, H100, hidden=4096, seq=2048)
 
@@ -298,14 +299,73 @@ allocation). For this tensor size (16 MB) the copy is only ~5.7us — the
 optimization becomes more relevant for larger tensors or when composing with
 upstream kernels that can also write directly to the pool.
 
+## Kraken Variant (Device-Side Sync, Single Kernel)
+
+[Kraken](https://github.com/meta-pytorch/kraken) (`third_party/kraken/`)
+provides a Triton-based `one_shot_all_reduce_bias_rms_norm` that performs
+the entire allreduce + add + RMSNorm in a **single kernel launch** using
+device-side synchronization via inline PTX.
+
+**How it differs from our kernel:**
+
+| | Our kernel | Kraken |
+|---|---|---|
+| Kernel launches | 3 (barrier → kernel → barrier) | **1** (all fused) |
+| Synchronization | Host-side `symm_mem.barrier()` | Device-side `ptx_utils.symm_mem_sync()` (inline PTX atomics) |
+| Copy to symm mem | Host-side `peer_bufs[rank].copy_()` | Inside the kernel (`tl.load` + `tl.store`) |
+| Residual output | Returns `(normed, pre_norm)` | Only returns `normed` |
+| Reduction | Unrolled `if WORLD_SIZE >= N` | `for i in range(world_size)` loop |
+
+**Device-side sync (`ptx_utils.symm_mem_sync`):**
+
+Kraken's sync primitive uses PTX `atom.global.sys.cas` (system-scope
+compare-and-swap) with `release`/`acquire` memory ordering. Thread 0 of
+each block sends a signal to all peers and waits for all peers' signals.
+`tl.debug_barrier()` ensures intra-block memory consistency. The signal pad
+auto-resets to zero after each sync, making it CUDA graph friendly.
+
+**Single-kernel flow:**
+```
+1. tl.load(input_ptr)              — load row from regular CUDA memory
+2. tl.store(buffer_ptr[rank])      — copy row into symmetric memory
+3. symm_mem_sync(release, acquire) — flush store, wait for all peers
+4. for i in range(world_size):     — P2P loads + reduce + bias add
+5. RMSNorm(reduced)                — normalize and store output
+6. symm_mem_sync(release)          — signal reads complete
+```
+
+**Usage (profiling script variant 5):**
+```python
+import torch.distributed._symmetric_memory as symm_mem
+from kraken.fused.one_shot_all_reduce_bias_rms_norm import (
+    one_shot_all_reduce_bias_rms_norm,
+)
+
+# One-time setup:
+symm_buf = symm_mem.empty((num_tokens, hidden), dtype=torch.bfloat16, device=device)
+symm_mem.rendezvous(symm_buf, group=tp_group)
+output = torch.empty_like(x)
+
+# Per-iteration (CUDA-graph capturable):
+one_shot_all_reduce_bias_rms_norm(
+    symm_buf, hidden_states, residual, norm_weight, output, eps=eps,
+)
+```
+
+Note: kraken's kernel passes the residual/bias tensor as an additive term
+(`all_reduce(x) + bias`), which is mathematically identical to the residual
+add. However, it does not return the pre-norm value (`reduced + residual`),
+so the caller must handle residual propagation separately if needed for
+Pre-LN architectures.
+
 ## Open Questions / Future Work
 
-1. **Device-side synchronization.** The current implementation uses host-side
-   `symm_mem.barrier()` before and after the kernel launch. Moving to
-   device-side synchronization (porting `sync_remote_blocks` signal pad
-   protocol to Triton, or using kraken's `ptx_utils.symm_mem_sync`) would
-   eliminate the two barrier kernel launches (~10us total). Blocked on Triton
-   exposing memory ordering semantics for system-scope atomics.
+1. **Device-side synchronization in our kernel.** Our kernel uses host-side
+   `symm_mem.barrier()`. Kraken demonstrates that device-side sync via inline
+   PTX is viable and eliminates two barrier kernel launches. Porting
+   `ptx_utils.symm_mem_sync` into our kernel would reduce from 3 launches to
+   1, matching kraken's performance. The copy-into-workspace step can also be
+   folded into the kernel (as kraken does).
 
 2. **LayerNorm variant.** The same pattern applies to `all_reduce + LayerNorm`.
    The kernel would need an additional mean-subtraction step. The FX pass

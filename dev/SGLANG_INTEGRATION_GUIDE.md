@@ -21,6 +21,8 @@ and normalizes — all in one pass without materializing intermediates.
 - PyTorch with symmetric memory support (NVLink-connected GPUs, single node)
 - The feature lives in `torch.distributed._symmetric_memory` and
   `torch._inductor.fx_passes.fused_allreduce_rmsnorm`
+- For the kraken path: [kraken](https://github.com/meta-pytorch/kraken)
+  (available as `third_party/kraken/` submodule or `pip install`)
 
 ## Integration Path: torch.compile (Recommended)
 
@@ -216,6 +218,74 @@ torch.testing.assert_close(fused_h, ref_h, atol=1e-2, rtol=1e-2)
 
 Tolerances are slightly relaxed because the fused kernel accumulates in fp32
 from bf16 inputs in a different order than the unfused path.
+
+## Integration Path: Kraken (Lowest Latency, Single Kernel)
+
+[Kraken](https://github.com/meta-pytorch/kraken) provides the highest-
+performance variant: a single Triton kernel that fuses the copy, device-side
+synchronization, allreduce, residual add, and RMSNorm — with zero separate
+barrier kernel launches.
+
+### Setup
+
+```python
+import torch.distributed._symmetric_memory as symm_mem
+
+# Add kraken to path (shipped as third_party/kraken in PyTorch repo,
+# or pip install from https://github.com/meta-pytorch/kraken)
+from kraken.fused.one_shot_all_reduce_bias_rms_norm import (
+    one_shot_all_reduce_bias_rms_norm,
+)
+
+# One-time setup: allocate symmetric memory buffer + output tensor
+symm_buf = symm_mem.empty(
+    (max_tokens, hidden_dim), dtype=torch.bfloat16, device=device,
+)
+symm_mem.rendezvous(symm_buf, group=tp_group)
+output = torch.empty(max_tokens, hidden_dim, dtype=torch.bfloat16, device=device)
+```
+
+### Per-iteration call
+
+```python
+# hidden_states: output of down_proj (regular CUDA memory)
+# residual: passed as 'bias' — mathematically identical (all_reduce(x) + bias)
+one_shot_all_reduce_bias_rms_norm(
+    symm_buf,           # pre-allocated symmetric memory buffer
+    hidden_states,      # input (regular CUDA memory)
+    residual,           # added after reduction (passed as bias)
+    norm_weight,        # RMSNorm weight
+    output,             # pre-allocated output tensor
+    eps=eps,
+)
+# output now contains the normalized result
+```
+
+### Key differences from other paths
+
+- **Single kernel launch**: no separate barrier kernels. Device-side sync
+  via inline PTX (`atom.global.sys.cas` with release/acquire semantics).
+- **Copy fused into kernel**: the kernel loads from regular memory and stores
+  to symmetric memory internally, then syncs and reduces.
+- **No pre_norm output**: kraken only returns the normalized result. If you
+  need the pre-norm value (`all_reduce(x) + residual`) for the next layer's
+  residual, you must compute it separately or modify the kernel.
+- **CUDA graph safe**: kraken's sync primitive uses auto-resetting signal
+  pads (atomic CAS that resets to zero), compatible with graph replay.
+
+### When to use kraken vs torch.compile
+
+| | torch.compile | Kraken |
+|---|---|---|
+| Integration effort | Minimal (wrap existing code) | Moderate (explicit buffer management) |
+| Kernel launches | 3 (barrier + kernel + barrier) | **1** |
+| Residual output | Yes (`pre_norm` returned) | No (only `normed`) |
+| torch.compile required | Yes | No |
+| Best for | Clean integration, existing models | Maximum latency, custom pipelines |
+
+For SGLang decode (1 token, small tensors), the barrier overhead is a
+significant fraction of total time. Kraken's single-kernel approach
+eliminates this entirely.
 
 ## Performance Expectations (Decode, 4× GPU)
 

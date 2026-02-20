@@ -3,12 +3,12 @@ Profile fused allreduce + RMSNorm: end-to-end SGLang-style repro.
 
 Simulates a decoder layer: linear (MoE stand-in) → allreduce → residual add → RMSNorm.
 
-Profiles four variants:
+Profiles five variants:
   1. baseline  – NCCL all_reduce + eager F.rms_norm
   2. fused_op  – torch.ops.symm_mem.fused_all_reduce_rmsnorm (direct, workspace copy)
   3. compiled  – torch.compile with FX pass fusion
-  4. mempool   – mem pool zero-copy: matmul output lands in symmetric memory,
-                 eliminating the DtoD workspace copy
+  4. mempool   – mem pool zero-copy: matmul output lands in symmetric memory
+  5. kraken    – single kernel with device-side sync (no barrier kernel launches)
 
 Launch:
     torchrun --nproc_per_node=NUM_GPUS dev/profile_fused_allreduce_rmsnorm.py
@@ -17,6 +17,8 @@ Trace output: /tmp/fused_ar_rmsnorm_*.json
 """
 
 import logging
+import os
+import sys
 
 import torch
 import torch.distributed as dist
@@ -27,6 +29,14 @@ import torch.nn.functional as F
 from torch.distributed._symmetric_memory._fused_allreduce_rmsnorm_triton import (
     _launch_fused_kernel,
     _make_peer_bufs,
+)
+
+# Add kraken (third_party submodule) to import path
+sys.path.insert(
+    0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "third_party", "kraken")
+)
+from kraken.fused.one_shot_all_reduce_bias_rms_norm import (
+    one_shot_all_reduce_bias_rms_norm,
 )
 
 HIDDEN = 2880
@@ -199,6 +209,23 @@ def main():
         return output.view(x.shape), residual_out.view(x.shape)
 
     _profile("mempool", mempool_call, rank, cuda_graph=True)
+
+    # --- Variant 5: kraken (device-side sync, single kernel launch) ---
+    # Kraken needs a pre-allocated symmetric memory buffer + pre-allocated output.
+    kraken_symm_buf = symm_mem.empty(
+        (NUM_TOKENS, HIDDEN), dtype=torch.bfloat16, device=device,
+    )
+    symm_mem.rendezvous(kraken_symm_buf, group=dist.group.WORLD)
+    kraken_output = torch.empty_like(x)
+
+    def kraken_call():
+        h = layer.down_proj(F.silu(layer.moe_proj(x)))
+        one_shot_all_reduce_bias_rms_norm(
+            kraken_symm_buf, h, residual, weight, kraken_output, eps=EPS,
+        )
+        return kraken_output
+
+    _profile("kraken", kraken_call, rank, cuda_graph=True)
 
     dist.destroy_process_group()
     if rank == 0:
