@@ -31,13 +31,18 @@ from torch.distributed._symmetric_memory._fused_allreduce_rmsnorm_triton import 
     _make_peer_bufs,
 )
 
+
 # Add kraken (third_party submodule) to import path
 sys.path.insert(
-    0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "third_party", "kraken")
+    0,
+    os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", "third_party", "kraken"
+    ),
 )
 from kraken.fused.one_shot_all_reduce_bias_rms_norm import (
     one_shot_all_reduce_bias_rms_norm,
 )
+
 
 HIDDEN = 2880
 NUM_TOKENS = 1  # decode tokens (flattened, no batch dim in SGLang)
@@ -52,12 +57,20 @@ class DummyDecoderLayer(nn.Module):
 
     def __init__(self, hidden: int, inter: int, eps: float, device: torch.device):
         super().__init__()
-        self.moe_proj = nn.Linear(hidden, inter, bias=False, device=device, dtype=torch.bfloat16)
-        self.down_proj = nn.Linear(inter, hidden, bias=False, device=device, dtype=torch.bfloat16)
-        self.norm_weight = nn.Parameter(torch.ones(hidden, device=device, dtype=torch.float32))
+        self.moe_proj = nn.Linear(
+            hidden, inter, bias=False, device=device, dtype=torch.bfloat16
+        )
+        self.down_proj = nn.Linear(
+            inter, hidden, bias=False, device=device, dtype=torch.bfloat16
+        )
+        self.norm_weight = nn.Parameter(
+            torch.ones(hidden, device=device, dtype=torch.float32)
+        )
         self.eps = eps
 
-    def forward_baseline(self, x: torch.Tensor, residual: torch.Tensor, group_name: str):
+    def forward_baseline(
+        self, x: torch.Tensor, residual: torch.Tensor, group_name: str
+    ):
         """NCCL all_reduce + eager RMSNorm (unfused baseline)."""
         h = self.down_proj(F.silu(self.moe_proj(x)))
         h = funcol.all_reduce(h, "sum", group_name)
@@ -82,7 +95,9 @@ def _make_compiled_ar_norm(eps: float):
     return _ar_norm
 
 
-def _profile(name, fn, rank, warmup=WARMUP_ITERS, iters=PROFILE_ITERS, cuda_graph=False):
+def _profile(
+    name, fn, rank, warmup=WARMUP_ITERS, iters=PROFILE_ITERS, cuda_graph=False
+):
     # Eager warmup: Triton compilation, NCCL init, buffer allocation, etc.
     for _ in range(warmup):
         fn()
@@ -127,9 +142,9 @@ def _profile(name, fn, rank, warmup=WARMUP_ITERS, iters=PROFILE_ITERS, cuda_grap
 
     if rank == 0:
         prof.export_chrome_trace(trace_path)
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"  {name}  (trace: {trace_path})")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
         print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=15))
 
 
@@ -176,7 +191,12 @@ def main():
     def fused_op_call():
         h = layer.down_proj(F.silu(layer.moe_proj(x)))
         return torch.ops.symm_mem.fused_all_reduce_rmsnorm(
-            h, weight, "sum", group_name, residual=residual, eps=EPS,
+            h,
+            weight,
+            "sum",
+            group_name,
+            residual=residual,
+            eps=EPS,
         )
 
     _profile("fused_op", fused_op_call, rank, cuda_graph=True)
@@ -204,7 +224,12 @@ def main():
         intermediate = F.silu(layer.moe_proj(x))
         torch.mm(intermediate.view(-1, INTER), layer.down_proj.weight.t(), out=h_symm)
         output, residual_out = _launch_fused_kernel(
-            sm_hdl, peer_bufs, h_symm, weight, residual=residual, eps=EPS,
+            sm_hdl,
+            peer_bufs,
+            h_symm,
+            weight,
+            residual=residual,
+            eps=EPS,
         )
         return output.view(x.shape), residual_out.view(x.shape)
 
@@ -213,7 +238,9 @@ def main():
     # --- Variant 5: kraken (device-side sync, single kernel launch) ---
     # Kraken needs a pre-allocated symmetric memory buffer + pre-allocated output.
     kraken_symm_buf = symm_mem.empty(
-        (NUM_TOKENS, HIDDEN), dtype=torch.bfloat16, device=device,
+        (NUM_TOKENS, HIDDEN),
+        dtype=torch.bfloat16,
+        device=device,
     )
     symm_mem.rendezvous(kraken_symm_buf, group=dist.group.WORLD)
     kraken_output = torch.empty_like(x)
@@ -221,7 +248,12 @@ def main():
     def kraken_call():
         h = layer.down_proj(F.silu(layer.moe_proj(x)))
         one_shot_all_reduce_bias_rms_norm(
-            kraken_symm_buf, h, residual, weight, kraken_output, eps=EPS,
+            kraken_symm_buf,
+            h,
+            residual,
+            weight,
+            kraken_output,
+            eps=EPS,
         )
         return kraken_output
 

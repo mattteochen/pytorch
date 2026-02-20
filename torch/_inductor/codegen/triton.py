@@ -2569,6 +2569,12 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         # We track the store name since a store can be canceled later
         self.stores_with_contiguous_rdim: list[str] = []
 
+        # Symmetric memory P2P allreduce state
+        self.has_symm_mem_p2p = False
+        self.symm_mem_world_size: int | None = None
+        self.symm_mem_input_name: str | None = None
+        self._symm_group_name: str = ""
+
     @staticmethod
     def _has_stride1_on_rdim(index) -> bool:
         # These analysis is only needed in deterministic mode so far
@@ -3647,6 +3653,69 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 )
 
         if not self.inside_reduction or (not indexing.has_rmask() and not has_rindex):
+            self.outside_loop_vars.add(result_var)
+
+        return result_var
+
+    def symm_mem_p2p_reduce_load(
+        self,
+        name: str,
+        index: sympy.Expr,
+        world_size: int,
+        group_name: str = "",
+    ) -> TritonCSEVariable:
+        """
+        Generate a P2P reduce load: sum values from all peer symmetric memory
+        buffers.  Uses the pointer-to-pointer pattern matching kraken: the
+        kernel receives ``symm_buf_ptrs`` (a tensor of uint64 peer addresses)
+        and dereferences each entry to perform a P2P load.
+        """
+        self.has_symm_mem_p2p = True
+        self.symm_mem_world_size = world_size
+        self.symm_mem_input_name = name
+        self._symm_group_name = group_name
+
+        # Ensure the original input buffer is a kernel arg (the prologue
+        # copies it into symmetric memory before the P2P loads).
+        self.args.input(name)
+
+        indexing = self.indexing(index, block_ptr=False)
+        load_buffer = self.get_load_buffer(indexing)
+
+        if not isinstance(indexing, IndexingOptions):
+            raise NotImplementedError(
+                "symm_mem_p2p_reduce_load only supports IndexingOptions"
+            )
+
+        shape = indexing.expand_shape or TritonSymbols.get_block_shape(indexing.index)
+        shape_str = ", ".join(str(s) for s in shape) if shape else "1"
+
+        acc_var = self.cse.newvar(dtype=torch.float32, shape=shape)
+        load_buffer.writeline(f"{acc_var} = tl.zeros([{shape_str}], dtype=tl.float32)")
+        peer_var = self.cse.newvar(dtype=torch.int64, shape=())
+        load_buffer.writeline(
+            "_symm_buf_ptrs_u64 = symm_buf_ptrs.to(tl.pointer_type(tl.uint64))"
+        )
+        load_buffer.writeline("for _symm_i in tl.static_range(SYMM_WORLD_SIZE):")
+        with load_buffer.indent():
+            load_buffer.writeline(
+                f"{peer_var} = tl.load(_symm_buf_ptrs_u64 + _symm_i)"
+                f".to(tl.pointer_type(tl.bfloat16))"
+            )
+            load_buffer.writeline(
+                f"{acc_var} = {acc_var} + tl.load("
+                f"{peer_var} + ({indexing.index_str}), "
+                f"{indexing.mask_str}, other=0.0).to(tl.float32)"
+            )
+
+        result_var = self.cse.generate(
+            load_buffer,
+            str(acc_var),
+            dtype=torch.float32,
+            shape=shape,
+        )
+
+        if not self.inside_reduction or not indexing.has_rmask():
             self.outside_loop_vars.add(result_var)
 
         return result_var
@@ -5314,6 +5383,43 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             )
         return inductor_meta
 
+    def _codegen_symm_mem_prologue(self, code: IndentedBuffer) -> None:
+        """
+        Emit the symmetric memory P2P prologue:
+        1. Copy the local input into this rank's symmetric buffer.
+        2. Device-side sync so all peers' data is visible.
+
+        Uses the same indexing as the kernel's X dimension (one program
+        per row), matching kraken's one-block-per-row convention.
+        """
+        assert self.symm_mem_input_name is not None
+        in_var = self.args.input(self.symm_mem_input_name)
+        # Prologue matches kraken's pattern: load local buffer ptr from the
+        # buffer_ptrs array, copy input row, then device-side sync.
+        code.splice(
+            f"""
+            # --- symm mem prologue: copy local input -> symm buffer ---
+            _symm_bptrs = symm_buf_ptrs.to(tl.pointer_type(tl.uint64))
+            _symm_local_buf = tl.load(_symm_bptrs + SYMM_RANK).to(tl.pointer_type(tl.bfloat16))
+            _symm_row_off = tl.program_id(0).to(tl.int64)
+            _symm_cols = tl.arange(0, R0_BLOCK)
+            _symm_mask = _symm_cols < r0_numel
+            _symm_idx = _symm_row_off * r0_numel + _symm_cols
+            _symm_local = tl.load({in_var} + _symm_idx, _symm_mask, other=0.0)
+            tl.store(_symm_local_buf + _symm_idx, _symm_local, _symm_mask)
+            _symm_mem_sync(symm_signal_pad_ptrs, None, SYMM_RANK, SYMM_WORLD_SIZE, hasPreviousMemAccess=True, hasSubsequentMemAccess=True)
+            """
+        )
+
+    def _codegen_symm_mem_epilogue(self, code: IndentedBuffer) -> None:
+        """Emit the final device-side sync after all stores."""
+        code.splice(
+            """
+            # --- symm mem epilogue: signal reads complete ---
+            _symm_mem_sync(symm_signal_pad_ptrs, None, SYMM_RANK, SYMM_WORLD_SIZE, hasPreviousMemAccess=True)
+            """
+        )
+
     def codegen_kernel(self, name=None) -> str:
         """
         Convert the TritonKernel from Inductor SIMD IR to triton code, including inductor triton heuristics, imports,
@@ -5352,6 +5458,23 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 code.splice("triton_helpers.set_driver_to_cpu()")
             else:
                 code.splice("triton_helpers.set_driver_to_gpu()")
+
+            if self.has_symm_mem_p2p:
+                import pathlib
+
+                kraken_dir = str(
+                    pathlib.Path(__file__).resolve().parents[3]
+                    / "third_party"
+                    / "kraken"
+                )
+                code.splice(
+                    f"""
+                    import sys as _sys
+                    if {kraken_dir!r} not in _sys.path:
+                        _sys.path.insert(0, {kraken_dir!r})
+                    from kraken._ptx_utils.symm_mem_barrier import symm_mem_sync as _symm_mem_sync
+                    """
+                )
 
             if config.benchmark_kernel:
                 code.splice(self.imports_for_benchmark_kernel())
@@ -5438,6 +5561,18 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         if self.mix_order_reduction:
             add_constexpr_arg("RSPLIT_SIZE")
             add_constexpr_arg("NUM_STAGES")
+
+        if self.has_symm_mem_p2p:
+            # Symmetric memory P2P allreduce pointer args.  These are
+            # int64 CUDA tensors wrapping the SymmetricMemory device
+            # pointers.  The wrapper creates them via symm_mem_setup.
+            for _symm_arg in ("symm_buf_ptrs", "symm_signal_pad_ptrs"):
+                signature.append(
+                    TensorArg(name=_symm_arg, buffer=_symm_arg, dtype=torch.int64)
+                )
+                argdefs.append(ArgName(_symm_arg))
+            add_constexpr_arg("SYMM_RANK")
+            add_constexpr_arg("SYMM_WORLD_SIZE")
 
         triton_meta_signature = signature_to_meta(
             signature, size_dtype=self.index_dtype, argdefs=argdefs
@@ -5565,6 +5700,16 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         for arg_num in equal_1_arg_indices(signature):  # type: ignore[index]
             triton_meta["constants"][signature[arg_num].name] = 1  # type: ignore[index,union-attr]
 
+        if self.has_symm_mem_p2p:
+            import torch.distributed as _dist
+
+            triton_meta["constants"]["SYMM_RANK"] = _dist.get_rank()
+            triton_meta["constants"]["SYMM_WORLD_SIZE"] = self.symm_mem_world_size
+            # Force XBLOCK=1 so grid = xnumel (one program per row).
+            # This is required for kraken's per-block sync to work --
+            # all ranks must launch the same number of blocks.
+            triton_meta["constants"]["XBLOCK"] = 1
+
         self.triton_meta = triton_meta
         self.inductor_meta = inductor_meta
 
@@ -5628,7 +5773,11 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             self.codegen_static_numels(code)
             for old, new in self.args.aliases():
                 code.writeline(f"{old} = {new}")
+            if self.has_symm_mem_p2p:
+                self._codegen_symm_mem_prologue(code)
             code.splice(self.body)
+            if self.has_symm_mem_p2p:
+                self._codegen_symm_mem_epilogue(code)
             if config.triton.proton_profiling:
                 code.writeline(f'pl.exit_scope("{kernel_name}")')
 
@@ -5744,6 +5893,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         _, call_args, _, arg_types = self.args.python_argdefs()
         self.add_numel_to_call_args(name, call_args, arg_types)
 
+        if self.has_symm_mem_p2p:
+            self._emit_symm_mem_setup(wrapper, call_args)
+
         for ws in self.args.workspace_args:
             wrapper.generate_workspace_allocation(ws)
 
@@ -5758,6 +5910,32 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
         if deallocate_ws:
             self.deallocate_workspaces()
+
+    def _emit_symm_mem_setup(self, wrapper, call_args: list) -> None:
+        """
+        Emit wrapper code that sets up symmetric memory pointers and
+        appends them to *call_args*.
+        """
+        assert self.symm_mem_input_name is not None
+        # Resolve the input buffer's call-site variable name.
+        in_var = self.symm_mem_input_name
+        for outer, inner in self.args.input_buffers.items():
+            if outer == self.symm_mem_input_name:
+                in_var = outer
+                break
+
+        wrapper.writeline(
+            "from torch._inductor.runtime.symm_mem_helpers import symm_mem_setup"
+        )
+        wrapper.writeline(
+            f"_symm_buf_ptrs, _symm_signal_pad_ptrs, _symm_rank, _symm_world_size = "
+            f'symm_mem_setup({in_var}, "{self._symm_group_name}")'
+        )
+
+        # Append the symm mem pointer tensors (matching the order in the
+        # kernel signature added by codegen_kernel).
+        call_args.append("_symm_buf_ptrs")
+        call_args.append("_symm_signal_pad_ptrs")
 
     def codegen_nan_check(self) -> None:
         wrapper = V.graph.wrapper_code

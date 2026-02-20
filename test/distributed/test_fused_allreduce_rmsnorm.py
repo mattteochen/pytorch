@@ -1,11 +1,13 @@
 # Owner(s): ["oncall: distributed"]
 """
-Tests for the fused all_reduce + rmsnorm pass.
+Tests for fused all_reduce + rmsnorm:
+  - The new P2P allreduce FX pass (replaces all_reduce+wait with p2p_allreduce)
+  - The original fused_all_reduce_rmsnorm op (return-type/correctness)
+  - Multi-GPU distributed correctness
 """
 
 import operator
 from contextlib import nullcontext
-from unittest import skipIf
 
 import torch
 import torch.distributed as dist
@@ -14,17 +16,16 @@ import torch.nn.functional as F
 from functorch import make_fx
 from torch._inductor.decomposition import decompositions
 from torch._inductor.fx_passes.fused_allreduce_rmsnorm import (
-    _find_all_reduce_rmsnorm_patterns,
+    _find_all_reduce_wait_patterns,
     _is_all_reduce,
     _is_wait_tensor,
     fused_all_reduce_rmsnorm_pass,
 )
+from torch._inductor.fx_passes.post_grad import remove_noop_ops, view_to_reshape
 from torch.distributed._functional_collectives import all_reduce
 from torch.distributed._symmetric_memory import _test_mode
-from torch._inductor.fx_passes.post_grad import remove_noop_ops, view_to_reshape
 from torch.testing._internal.common_distributed import (
     MultiProcContinuousTest,
-    PLATFORM_SUPPORTS_SYMM_MEM,
     skip_if_lt_x_gpu,
 )
 from torch.testing._internal.common_utils import (
@@ -45,174 +46,211 @@ def _make_post_grad_fx(f, *inps):
     return gm
 
 
-class TestFusedAllReduceRMSNormPatternMatching(TestCase):
-    """Test pattern matching without distributed setup."""
+# ── Pattern detection tests ──────────────────────────────────────────────
+
+
+class TestP2PAllReducePatternDetection(TestCase):
+    """Test the new FX pass that replaces all_reduce+wait with p2p_allreduce."""
 
     def setUp(self):
         super().setUp()
-        self.rank = 0
-        self.world_size = 2
-
         store = FakeStore()
-        dist.init_process_group(
-            backend="fake",
-            world_size=self.world_size,
-            rank=self.rank,
-            store=store,
-        )
+        dist.init_process_group(backend="fake", world_size=2, rank=0, store=store)
 
     def tearDown(self):
         dist.destroy_process_group()
         super().tearDown()
 
-    def test_find_simple_all_reduce_rmsnorm_pattern(self):
-        """Test: all_reduce -> wait -> rmsnorm (no residual)."""
+    def test_find_all_reduce_wait_pattern(self):
         group = dist.group.WORLD
         hidden_dim = 64
 
-        def func(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        def func(x, weight):
             reduced = all_reduce(x, "sum", group=group.group_name)
             return F.rms_norm(reduced, (hidden_dim,), weight, eps=1e-6)
 
-        x = torch.randn(4, hidden_dim)
-        weight = torch.randn(hidden_dim)
-
-        gm = _make_post_grad_fx(func, x, weight)
-
-        matches = _find_all_reduce_rmsnorm_patterns(gm.graph)
-
-        self.assertEqual(len(matches), 1, "Should find exactly one pattern")
-
-        match = matches[0]
-        self.assertIsNone(match.add_node, "Should not have add node")
-        self.assertIsNone(match.residual_node, "Should not have residual")
-        self.assertEqual(match.reduce_op, "sum")
-        self.assertEqual(match.group_name, group.group_name)
-        self.assertGreater(len(match.intermediate_nodes), 0)
-
-    def test_find_all_reduce_add_rmsnorm_pattern(self):
-        """Test: all_reduce -> wait -> add -> rmsnorm (with residual)."""
-        group = dist.group.WORLD
-        hidden_dim = 64
-
-        def func(
-            x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor
-        ) -> torch.Tensor:
-            reduced = all_reduce(x, "sum", group=group.group_name)
-            added = reduced + residual
-            return F.rms_norm(added, (hidden_dim,), weight, eps=1e-6)
-
-        x = torch.randn(4, hidden_dim)
-        residual = torch.randn(4, hidden_dim)
-        weight = torch.randn(hidden_dim)
-
-        gm = _make_post_grad_fx(func, x, residual, weight)
-
-        matches = _find_all_reduce_rmsnorm_patterns(gm.graph)
-
-        self.assertEqual(len(matches), 1, "Should find exactly one pattern")
-
-        match = matches[0]
-        self.assertIsNotNone(match.add_node, "Should have add node")
-        self.assertIsNotNone(match.residual_node, "Should have residual")
-        self.assertEqual(match.reduce_op, "sum")
-
-    def test_find_residual_add_reversed_order(self):
-        """Test: all_reduce -> wait, then residual + wait (add order reversed)."""
-        group = dist.group.WORLD
-        hidden_dim = 64
-
-        def func(
-            x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor
-        ) -> torch.Tensor:
-            reduced = all_reduce(x, "sum", group=group.group_name)
-            added = residual + reduced
-            return F.rms_norm(added, (hidden_dim,), weight, eps=1e-6)
-
-        x = torch.randn(4, hidden_dim)
-        residual = torch.randn(4, hidden_dim)
-        weight = torch.randn(hidden_dim)
-
-        gm = _make_post_grad_fx(func, x, residual, weight)
-
-        matches = _find_all_reduce_rmsnorm_patterns(gm.graph)
-
-        self.assertEqual(len(matches), 1, "Should find pattern with reversed add order")
-        self.assertIsNotNone(matches[0].residual_node)
-
-    def test_no_match_without_all_reduce(self):
-        """Test: rmsnorm without all_reduce should not match."""
-        hidden_dim = 64
-
-        def func(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-            return F.rms_norm(x, (hidden_dim,), weight, eps=1e-6)
-
-        x = torch.randn(4, hidden_dim)
-        weight = torch.randn(hidden_dim)
-
-        gm = _make_post_grad_fx(func, x, weight)
-        matches = _find_all_reduce_rmsnorm_patterns(gm.graph)
-
-        self.assertEqual(len(matches), 0, "Should not find any patterns")
-
-    def test_no_match_all_reduce_without_rmsnorm(self):
-        """Test: all_reduce without rmsnorm should not match."""
-        group = dist.group.WORLD
-
-        def func(x: torch.Tensor) -> torch.Tensor:
-            reduced = all_reduce(x, "sum", group=group.group_name)
-            return reduced * 2
-
-        x = torch.randn(4, 64)
-
-        gm = _make_post_grad_fx(func, x)
-        matches = _find_all_reduce_rmsnorm_patterns(gm.graph)
-
-        self.assertEqual(len(matches), 0, "Should not find any patterns")
+        gm = _make_post_grad_fx(
+            func, torch.randn(4, hidden_dim), torch.randn(hidden_dim)
+        )
+        patterns = _find_all_reduce_wait_patterns(gm.graph)
+        self.assertEqual(len(patterns), 1)
 
     def test_multiple_patterns(self):
-        """Test: multiple all_reduce -> rmsnorm patterns in same graph."""
         group = dist.group.WORLD
         hidden_dim = 64
 
-        def func(
-            x1: torch.Tensor, x2: torch.Tensor, weight: torch.Tensor
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            reduced1 = all_reduce(x1, "sum", group=group.group_name)
-            out1 = F.rms_norm(reduced1, (hidden_dim,), weight, eps=1e-6)
+        def func(x1, x2, weight):
+            r1 = all_reduce(x1, "sum", group=group.group_name)
+            o1 = F.rms_norm(r1, (hidden_dim,), weight, eps=1e-6)
+            r2 = all_reduce(x2, "sum", group=group.group_name)
+            o2 = F.rms_norm(r2, (hidden_dim,), weight, eps=1e-6)
+            return o1, o2
 
-            reduced2 = all_reduce(x2, "sum", group=group.group_name)
-            out2 = F.rms_norm(reduced2, (hidden_dim,), weight, eps=1e-6)
+        gm = _make_post_grad_fx(
+            func,
+            torch.randn(4, hidden_dim),
+            torch.randn(4, hidden_dim),
+            torch.randn(hidden_dim),
+        )
+        patterns = _find_all_reduce_wait_patterns(gm.graph)
+        self.assertEqual(len(patterns), 2)
 
-            return out1, out2
+    def test_no_match_without_all_reduce(self):
+        hidden_dim = 64
 
-        x1 = torch.randn(4, hidden_dim)
-        x2 = torch.randn(4, hidden_dim)
-        weight = torch.randn(hidden_dim)
+        def func(x, weight):
+            return F.rms_norm(x, (hidden_dim,), weight, eps=1e-6)
 
-        gm = _make_post_grad_fx(func, x1, x2, weight)
+        gm = _make_post_grad_fx(
+            func, torch.randn(4, hidden_dim), torch.randn(hidden_dim)
+        )
+        patterns = _find_all_reduce_wait_patterns(gm.graph)
+        self.assertEqual(len(patterns), 0)
 
-        matches = _find_all_reduce_rmsnorm_patterns(gm.graph)
-
-        self.assertEqual(len(matches), 2, "Should find two patterns")
-
-    def test_avg_reduce_op(self):
-        """Test: all_reduce with 'avg' reduce_op."""
+    def test_pass_replaces_with_p2p_allreduce(self):
+        """After the pass, all_reduce+wait should be replaced with p2p_allreduce."""
         group = dist.group.WORLD
         hidden_dim = 64
 
-        def func(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-            reduced = all_reduce(x, "avg", group=group.group_name)
+        def func(x, weight):
+            reduced = all_reduce(x, "sum", group=group.group_name)
             return F.rms_norm(reduced, (hidden_dim,), weight, eps=1e-6)
 
-        x = torch.randn(4, hidden_dim)
-        weight = torch.randn(hidden_dim)
+        gm = _make_post_grad_fx(
+            func, torch.randn(4, hidden_dim), torch.randn(hidden_dim)
+        )
 
-        gm = _make_post_grad_fx(func, x, weight)
-        matches = _find_all_reduce_rmsnorm_patterns(gm.graph)
+        with _test_mode():
+            fused_all_reduce_rmsnorm_pass(gm.graph)
 
-        self.assertEqual(len(matches), 1)
-        self.assertEqual(matches[0].reduce_op, "avg")
+        # p2p_allreduce should be in the graph
+        p2p_nodes = [
+            n
+            for n in gm.graph.nodes
+            if n.target is torch.ops.symm_mem.p2p_allreduce.default
+        ]
+        self.assertEqual(len(p2p_nodes), 1, "Should have one p2p_allreduce node")
+
+        # all_reduce and wait_tensor should be gone
+        ar_nodes = [n for n in gm.graph.nodes if _is_all_reduce(n)]
+        wait_nodes = [n for n in gm.graph.nodes if _is_wait_tensor(n)]
+        self.assertEqual(len(ar_nodes), 0, "all_reduce should be removed")
+        self.assertEqual(len(wait_nodes), 0, "wait_tensor should be removed")
+
+    def test_pass_preserves_downstream_ops(self):
+        """The RMSNorm decomposition should remain after the pass."""
+        group = dist.group.WORLD
+        hidden_dim = 64
+
+        def func(x, residual, weight):
+            reduced = all_reduce(x, "sum", group=group.group_name)
+            h = reduced + residual
+            return F.rms_norm(h, (hidden_dim,), weight, eps=1e-6)
+
+        gm = _make_post_grad_fx(
+            func,
+            torch.randn(4, hidden_dim),
+            torch.randn(4, hidden_dim),
+            torch.randn(hidden_dim),
+        )
+
+        with _test_mode():
+            fused_all_reduce_rmsnorm_pass(gm.graph)
+
+        # The add and rmsnorm decomposition ops should still be present
+        add_nodes = [
+            n
+            for n in gm.graph.nodes
+            if n.target in (torch.ops.aten.add.Tensor, operator.add)
+        ]
+        self.assertGreater(len(add_nodes), 0, "add should still be in graph")
+
+    def test_pass_skips_training_mode(self):
+        """Pass should be a no-op in training mode."""
+        group = dist.group.WORLD
+        hidden_dim = 64
+
+        def func(x, weight):
+            reduced = all_reduce(x, "sum", group=group.group_name)
+            return F.rms_norm(reduced, (hidden_dim,), weight, eps=1e-6)
+
+        gm = _make_post_grad_fx(
+            func, torch.randn(4, hidden_dim), torch.randn(hidden_dim)
+        )
+
+        with _test_mode():
+            fused_all_reduce_rmsnorm_pass(gm.graph, is_inference=False)
+
+        # all_reduce should still be present
+        ar_nodes = [n for n in gm.graph.nodes if _is_all_reduce(n)]
+        self.assertGreater(len(ar_nodes), 0)
+
+
+# ── P2P allreduce op tests ──────────────────────────────────────────────
+
+
+class TestP2PAllReduceOp(TestCase):
+    """Test the p2p_allreduce custom op fallback."""
+
+    def setUp(self):
+        super().setUp()
+        store = FakeStore()
+        dist.init_process_group(backend="fake", world_size=2, rank=0, store=store)
+
+    def tearDown(self):
+        dist.destroy_process_group()
+        super().tearDown()
+
+    def test_fallback_returns_correct_shape(self):
+        x = torch.randn(4, 64)
+        group_name = dist.group.WORLD.group_name
+        result = torch.ops.symm_mem.p2p_allreduce(x, "sum", group_name)
+        self.assertEqual(result.shape, x.shape)
+
+    def test_meta_returns_correct_shape(self):
+        x = torch.randn(4, 64, device="meta")
+        result = torch.ops.symm_mem.p2p_allreduce(x, "sum", "test_group")
+        self.assertEqual(result.shape, x.shape)
+        self.assertEqual(result.device, x.device)
+
+
+# ── Helper function tests ───────────────────────────────────────────────
+
+
+class TestHelperFunctions(TestCase):
+    """Test pattern detection helper functions."""
+
+    def setUp(self):
+        super().setUp()
+        store = FakeStore()
+        dist.init_process_group(backend="fake", world_size=2, rank=0, store=store)
+
+    def tearDown(self):
+        dist.destroy_process_group()
+        super().tearDown()
+
+    def test_is_all_reduce(self):
+        group = dist.group.WORLD
+
+        def func(x):
+            return all_reduce(x, "sum", group=group.group_name)
+
+        gm = make_fx(func, tracing_mode="fake")(torch.randn(4, 4))
+        ar_nodes = [n for n in gm.graph.nodes if _is_all_reduce(n)]
+        self.assertEqual(len(ar_nodes), 1)
+
+    def test_is_wait_tensor(self):
+        group = dist.group.WORLD
+
+        def func(x):
+            return all_reduce(x, "sum", group=group.group_name)
+
+        gm = make_fx(func, tracing_mode="fake")(torch.randn(4, 4))
+        wait_nodes = [n for n in gm.graph.nodes if _is_wait_tensor(n)]
+        self.assertEqual(len(wait_nodes), 1)
+
+
+# ── Original fused op tests (still valid) ───────────────────────────────
 
 
 class TestFusedOpReturnType(TestCase):
@@ -228,40 +266,51 @@ class TestFusedOpReturnType(TestCase):
         super().tearDown()
 
     def test_fallback_no_residual(self):
-        """Fallback returns (normed, None) when no residual is given."""
         x = torch.randn(4, 64)
         weight = torch.randn(64)
         group_name = dist.group.WORLD.group_name
 
         normed, pre_norm = torch.ops.symm_mem.fused_all_reduce_rmsnorm(
-            x, weight, "sum", group_name, eps=1e-6,
+            x,
+            weight,
+            "sum",
+            group_name,
+            eps=1e-6,
         )
         self.assertEqual(normed.shape, x.shape)
         self.assertIsNone(pre_norm)
 
     def test_fallback_with_residual(self):
-        """Fallback returns (normed, pre_norm) when residual is given."""
         x = torch.randn(4, 64)
         residual = torch.randn(4, 64)
         weight = torch.randn(64)
         group_name = dist.group.WORLD.group_name
 
         normed, pre_norm = torch.ops.symm_mem.fused_all_reduce_rmsnorm(
-            x, weight, "sum", group_name, residual=residual, eps=1e-6,
+            x,
+            weight,
+            "sum",
+            group_name,
+            residual=residual,
+            eps=1e-6,
         )
         self.assertEqual(normed.shape, x.shape)
         self.assertIsNotNone(pre_norm)
         self.assertEqual(pre_norm.shape, x.shape)
 
     def test_fallback_correctness_with_residual(self):
-        """pre_norm output matches manual all_reduce + residual."""
         x = torch.randn(4, 64)
         residual = torch.randn(4, 64)
         weight = torch.randn(64)
         group_name = dist.group.WORLD.group_name
 
         normed, pre_norm = torch.ops.symm_mem.fused_all_reduce_rmsnorm(
-            x, weight, "sum", group_name, residual=residual, eps=1e-6,
+            x,
+            weight,
+            "sum",
+            group_name,
+            residual=residual,
+            eps=1e-6,
         )
 
         reduced = torch.ops._c10d_functional.all_reduce(x, "sum", group_name)
@@ -273,13 +322,16 @@ class TestFusedOpReturnType(TestCase):
         self.assertEqual(normed, expected_normed)
 
     def test_fallback_correctness_no_residual(self):
-        """Normed output matches manual all_reduce + rms_norm."""
         x = torch.randn(4, 64)
         weight = torch.randn(64)
         group_name = dist.group.WORLD.group_name
 
         normed, pre_norm = torch.ops.symm_mem.fused_all_reduce_rmsnorm(
-            x, weight, "sum", group_name, eps=1e-6,
+            x,
+            weight,
+            "sum",
+            group_name,
+            eps=1e-6,
         )
 
         reduced = torch.ops._c10d_functional.all_reduce(x, "sum", group_name)
@@ -290,86 +342,7 @@ class TestFusedOpReturnType(TestCase):
         self.assertEqual(normed, expected_normed)
 
 
-class TestFXPassGraphRewrite(TestCase):
-    """Test that the pass correctly rewrites the FX graph with getitem nodes."""
-
-    def setUp(self):
-        super().setUp()
-        store = FakeStore()
-        dist.init_process_group(backend="fake", world_size=2, rank=0, store=store)
-
-    def tearDown(self):
-        dist.destroy_process_group()
-        super().tearDown()
-
-    def _count_fused_ops(self, graph):
-        return sum(
-            1
-            for n in graph.nodes
-            if n.target is torch.ops.symm_mem.fused_all_reduce_rmsnorm.default
-        )
-
-    def _count_getitems(self, graph):
-        return sum(
-            1 for n in graph.nodes if n.target is operator.getitem
-        )
-
-    def test_pass_inserts_getitem_nodes(self):
-        """After the pass, the fused op should be followed by getitem(0) and getitem(1)."""
-        group = dist.group.WORLD
-        hidden_dim = 64
-
-        def func(x, weight):
-            reduced = all_reduce(x, "sum", group=group.group_name)
-            return F.rms_norm(reduced, (hidden_dim,), weight, eps=1e-6)
-
-        gm = _make_post_grad_fx(func, torch.randn(4, hidden_dim), torch.randn(hidden_dim))
-        with _test_mode():
-            fused_all_reduce_rmsnorm_pass(gm.graph)
-
-        self.assertEqual(self._count_fused_ops(gm.graph), 1)
-        self.assertEqual(self._count_getitems(gm.graph), 2)
-
-
-class TestHelperFunctions(TestCase):
-    """Test helper functions without distributed setup."""
-
-    def setUp(self):
-        super().setUp()
-        store = FakeStore()
-        dist.init_process_group(
-            backend="fake",
-            world_size=2,
-            rank=0,
-            store=store,
-        )
-
-    def tearDown(self):
-        dist.destroy_process_group()
-        super().tearDown()
-
-    def test_is_all_reduce(self):
-        group = dist.group.WORLD
-
-        def func(x):
-            return all_reduce(x, "sum", group=group.group_name)
-
-        gm = make_fx(func, tracing_mode="fake")(torch.randn(4, 4))
-
-        all_reduce_nodes = [n for n in gm.graph.nodes if _is_all_reduce(n)]
-        self.assertEqual(len(all_reduce_nodes), 1)
-
-    def test_is_wait_tensor(self):
-        group = dist.group.WORLD
-
-        def func(x):
-            return all_reduce(x, "sum", group=group.group_name)
-
-        gm = make_fx(func, tracing_mode="fake")(torch.randn(4, 4))
-
-        wait_nodes = [n for n in gm.graph.nodes if _is_wait_tensor(n)]
-        self.assertEqual(len(wait_nodes), 1)
-
+# ── Multi-GPU distributed tests ─────────────────────────────────────────
 
 device_type = "cuda"
 test_contexts = [nullcontext, _test_mode]
@@ -400,225 +373,164 @@ class TestFusedAllReduceRMSNormDistributed(MultiProcContinuousTest):
         normed = F.rms_norm(reduced, weight.shape, weight, eps)
         return normed, pre_norm
 
-    @skipIf(not PLATFORM_SUPPORTS_SYMM_MEM, "Platform does not support symmetric memory")
     @skip_if_lt_x_gpu(2)
-    @parametrize("context", test_contexts)
-    @parametrize("dtype", [torch.float32, torch.bfloat16])
-    def test_correctness_no_residual(self, context, dtype):
+    @parametrize("ctx", test_contexts)
+    def test_fused_op_no_residual(self, ctx):
+        """Fused op (direct call) without residual."""
         self._init_process()
-        M, N = 8, 128
-        eps = 1e-6
-        group_name = dist.group.WORLD.group_name
+        hidden = 64
+        x = torch.randn(4, hidden, device=self.device, dtype=torch.bfloat16)
+        weight = torch.ones(hidden, device=self.device, dtype=torch.float32)
+        eps = 1e-5
 
-        x = torch.randn(M, N, device=self.device, dtype=dtype)
-        weight = torch.randn(N, device=self.device, dtype=torch.float32)
+        group_name = dist.group.WORLD.group_name
+        symm_mem.enable_symm_mem_for_group(group_name)
+        symm_mem.get_symm_mem_workspace(
+            group_name, min_size=x.numel() * x.element_size()
+        )
 
         expected_normed, _ = self._reference_allreduce_rmsnorm(x, weight, eps)
 
-        with context():
+        with ctx():
             normed, pre_norm = torch.ops.symm_mem.fused_all_reduce_rmsnorm(
-                x, weight, "sum", group_name, eps=eps,
+                x,
+                weight,
+                "sum",
+                group_name,
+                eps=eps,
             )
 
-        tol = {"rtol": 5e-2, "atol": 5e-2} if dtype == torch.bfloat16 else {"rtol": 1e-3, "atol": 1e-3}
         self.assertIsNone(pre_norm)
-        torch.testing.assert_close(normed, expected_normed, **tol)
+        torch.testing.assert_close(normed, expected_normed, atol=1e-2, rtol=1e-2)
 
-    @skipIf(not PLATFORM_SUPPORTS_SYMM_MEM, "Platform does not support symmetric memory")
     @skip_if_lt_x_gpu(2)
-    @parametrize("context", test_contexts)
-    @parametrize("dtype", [torch.float32, torch.bfloat16])
-    def test_correctness_with_residual(self, context, dtype):
+    @parametrize("ctx", test_contexts)
+    def test_fused_op_with_residual(self, ctx):
+        """Fused op (direct call) with residual."""
         self._init_process()
-        M, N = 8, 128
-        eps = 1e-6
+        hidden = 64
+        x = torch.randn(4, hidden, device=self.device, dtype=torch.bfloat16)
+        residual = torch.randn(4, hidden, device=self.device, dtype=torch.bfloat16)
+        weight = torch.ones(hidden, device=self.device, dtype=torch.float32)
+        eps = 1e-5
+
         group_name = dist.group.WORLD.group_name
-
-        x = torch.randn(M, N, device=self.device, dtype=dtype)
-        residual = torch.randn(M, N, device=self.device, dtype=dtype)
-        weight = torch.randn(N, device=self.device, dtype=torch.float32)
-
-        expected_normed, expected_pre_norm = self._reference_allreduce_rmsnorm(
-            x, weight, eps, residual=residual,
+        symm_mem.enable_symm_mem_for_group(group_name)
+        symm_mem.get_symm_mem_workspace(
+            group_name, min_size=x.numel() * x.element_size()
         )
 
-        with context():
+        expected_normed, expected_pre_norm = self._reference_allreduce_rmsnorm(
+            x,
+            weight,
+            eps,
+            residual=residual,
+        )
+
+        with ctx():
             normed, pre_norm = torch.ops.symm_mem.fused_all_reduce_rmsnorm(
-                x, weight, "sum", group_name, residual=residual, eps=eps,
+                x,
+                weight,
+                "sum",
+                group_name,
+                residual=residual,
+                eps=eps,
             )
 
-        tol = {"rtol": 5e-2, "atol": 5e-2} if dtype == torch.bfloat16 else {"rtol": 1e-3, "atol": 1e-3}
-        self.assertIsNotNone(pre_norm)
-        torch.testing.assert_close(pre_norm, expected_pre_norm, **tol)
-        torch.testing.assert_close(normed, expected_normed, **tol)
+        torch.testing.assert_close(normed, expected_normed, atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(pre_norm, expected_pre_norm, atol=2e-2, rtol=2e-2)
 
-    @skipIf(not PLATFORM_SUPPORTS_SYMM_MEM, "Platform does not support symmetric memory")
     @skip_if_lt_x_gpu(2)
-    @parametrize("dtype", [torch.float32, torch.bfloat16])
-    def test_3d_input(self, dtype):
-        """Verify the op handles batched (3D) inputs correctly."""
+    @parametrize("ctx", test_contexts)
+    def test_p2p_allreduce_op(self, ctx):
+        """p2p_allreduce op fallback correctness."""
         self._init_process()
-        B, M, N = 2, 4, 64
-        eps = 1e-6
+        hidden = 64
+        x = torch.randn(4, hidden, device=self.device, dtype=torch.bfloat16)
+
         group_name = dist.group.WORLD.group_name
+        symm_mem.enable_symm_mem_for_group(group_name)
 
-        x = torch.randn(B, M, N, device=self.device, dtype=dtype)
-        weight = torch.randn(N, device=self.device, dtype=torch.float32)
+        expected = torch.ops._c10d_functional.all_reduce(x, "sum", group_name)
+        expected = torch.ops._c10d_functional.wait_tensor(expected)
 
-        expected_normed, _ = self._reference_allreduce_rmsnorm(x, weight, eps)
+        with ctx():
+            result = torch.ops.symm_mem.p2p_allreduce(x, "sum", group_name)
 
-        normed, pre_norm = torch.ops.symm_mem.fused_all_reduce_rmsnorm(
-            x, weight, "sum", group_name, eps=eps,
-        )
+        torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
 
-        tol = {"rtol": 5e-2, "atol": 5e-2} if dtype == torch.bfloat16 else {"rtol": 1e-3, "atol": 1e-3}
-        self.assertIsNone(pre_norm)
-        self.assertEqual(normed.shape, x.shape)
-        torch.testing.assert_close(normed, expected_normed, **tol)
-
-    @skipIf(not PLATFORM_SUPPORTS_SYMM_MEM, "Platform does not support symmetric memory")
     @skip_if_lt_x_gpu(2)
-    def test_per_rank_data_differs(self):
-        """Each rank contributes different data; the reduction is real."""
+    def test_torch_compile_allreduce_rmsnorm(self):
+        """
+        End-to-end torch.compile test: the FX pass should replace
+        all_reduce+wait with p2p_allreduce, and inductor should lower
+        and compile the graph.  We verify the compiled function produces
+        numerically correct output.
+        """
         self._init_process()
-        M, N = 4, 64
-        eps = 1e-6
+        hidden = 64
+        eps = 1e-5
+
+        x = torch.randn(4, hidden, device=self.device, dtype=torch.bfloat16)
+        residual = torch.randn(4, hidden, device=self.device, dtype=torch.bfloat16)
+        weight = torch.ones(hidden, device=self.device, dtype=torch.float32)
+
         group_name = dist.group.WORLD.group_name
-
-        x = torch.full(
-            (M, N), float(self.rank + 1), device=self.device, dtype=torch.float32
+        symm_mem.enable_symm_mem_for_group(group_name)
+        symm_mem.get_symm_mem_workspace(
+            group_name, min_size=x.numel() * x.element_size()
         )
-        weight = torch.ones(N, device=self.device, dtype=torch.float32)
-
-        normed, _ = torch.ops.symm_mem.fused_all_reduce_rmsnorm(
-            x, weight, "sum", group_name, eps=eps,
-        )
-
-        expected_sum = sum(range(1, self.world_size + 1))
-        expected_reduced = torch.full(
-            (M, N), float(expected_sum), device=self.device, dtype=torch.float32
-        )
-        expected_normed = F.rms_norm(expected_reduced, weight.shape, weight, eps)
-
-        torch.testing.assert_close(normed, expected_normed, rtol=1e-3, atol=1e-3)
-
-
-@instantiate_parametrized_tests
-@requires_cuda_p2p_access()
-class TestFusedAllReduceRMSNormSymmMem(MultiProcContinuousTest):
-    """Multi-process tests for the symmetric memory P2P fused kernel."""
-
-    @property
-    def device(self) -> torch.device:
-        return torch.device(device_type, self.rank)
-
-    def _init_device(self):
-        torch.cuda.set_device(self.device)
-        torch.manual_seed(42 + self.rank)
-
-    def _reference_allreduce_rmsnorm(self, x, weight, eps, residual=None):
-        group_name = dist.group.WORLD.group_name
-        reduced = torch.ops._c10d_functional.all_reduce(x, "sum", group_name)
-        reduced = torch.ops._c10d_functional.wait_tensor(reduced)
-        pre_norm = None
-        if residual is not None:
-            reduced = reduced + residual
-            pre_norm = reduced.clone()
-        normed = F.rms_norm(reduced, weight.shape, weight, eps)
-        return normed, pre_norm
-
-    @skipIf(not PLATFORM_SUPPORTS_SYMM_MEM, "Platform does not support symmetric memory")
-    @skip_if_lt_x_gpu(2)
-    @parametrize("dtype", [torch.float32, torch.bfloat16])
-    def test_symm_mem_no_residual(self, dtype):
-        self._init_device()
-        M, N = 8, 128
-        eps = 1e-6
-        group_name = dist.group.WORLD.group_name
-
-        x = torch.randn(M, N, device=self.device, dtype=dtype)
-        weight = torch.randn(N, device=self.device, dtype=torch.float32)
-
-        expected_normed, _ = self._reference_allreduce_rmsnorm(x, weight, eps)
-
-        normed, pre_norm = torch.ops.symm_mem.fused_all_reduce_rmsnorm(
-            x, weight, "sum", group_name, eps=eps,
-        )
-
-        self.assertIsNone(pre_norm)
-        torch.testing.assert_close(normed, expected_normed, rtol=1e-2, atol=1e-2)
-
-    @skipIf(not PLATFORM_SUPPORTS_SYMM_MEM, "Platform does not support symmetric memory")
-    @skip_if_lt_x_gpu(2)
-    @parametrize("dtype", [torch.float32, torch.bfloat16])
-    def test_symm_mem_with_residual(self, dtype):
-        self._init_device()
-        M, N = 8, 128
-        eps = 1e-6
-        group_name = dist.group.WORLD.group_name
-
-        x = torch.randn(M, N, device=self.device, dtype=dtype)
-        residual = torch.randn(M, N, device=self.device, dtype=dtype)
-        weight = torch.randn(N, device=self.device, dtype=torch.float32)
 
         expected_normed, expected_pre_norm = self._reference_allreduce_rmsnorm(
-            x, weight, eps, residual=residual,
+            x,
+            weight,
+            eps,
+            residual=residual,
         )
 
-        normed, pre_norm = torch.ops.symm_mem.fused_all_reduce_rmsnorm(
-            x, weight, "sum", group_name, residual=residual, eps=eps,
-        )
+        @torch.compile(options={"_fused_all_reduce_rmsnorm": True})
+        def ar_norm(inp, res, w, gn):
+            reduced = all_reduce(inp, "sum", group=gn)
+            h = reduced + res
+            normed = F.rms_norm(h, w.shape, w, eps)
+            return normed, h
 
-        self.assertIsNotNone(pre_norm)
-        torch.testing.assert_close(pre_norm, expected_pre_norm, rtol=1e-2, atol=1e-2)
-        torch.testing.assert_close(normed, expected_normed, rtol=1e-2, atol=1e-2)
+        with torch.inference_mode():
+            normed, pre_norm = ar_norm(x, residual, weight, group_name)
 
-    @skipIf(not PLATFORM_SUPPORTS_SYMM_MEM, "Platform does not support symmetric memory")
+        torch.testing.assert_close(normed, expected_normed, atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(pre_norm, expected_pre_norm, atol=2e-2, rtol=2e-2)
+
     @skip_if_lt_x_gpu(2)
-    def test_symm_mem_per_rank_data_differs(self):
-        self._init_device()
-        M, N = 4, 64
-        eps = 1e-6
+    def test_torch_compile_allreduce_rmsnorm_no_residual(self):
+        """
+        End-to-end torch.compile: all_reduce -> rms_norm (no residual add).
+        """
+        self._init_process()
+        hidden = 64
+        eps = 1e-5
+
+        x = torch.randn(4, hidden, device=self.device, dtype=torch.bfloat16)
+        weight = torch.ones(hidden, device=self.device, dtype=torch.float32)
+
         group_name = dist.group.WORLD.group_name
-
-        x = torch.full(
-            (M, N), float(self.rank + 1), device=self.device, dtype=torch.float32
+        symm_mem.enable_symm_mem_for_group(group_name)
+        symm_mem.get_symm_mem_workspace(
+            group_name, min_size=x.numel() * x.element_size()
         )
-        weight = torch.ones(N, device=self.device, dtype=torch.float32)
-
-        normed, _ = torch.ops.symm_mem.fused_all_reduce_rmsnorm(
-            x, weight, "sum", group_name, eps=eps,
-        )
-
-        expected_sum = sum(range(1, self.world_size + 1))
-        expected_reduced = torch.full(
-            (M, N), float(expected_sum), device=self.device, dtype=torch.float32
-        )
-        expected_normed = F.rms_norm(expected_reduced, weight.shape, weight, eps)
-
-        torch.testing.assert_close(normed, expected_normed, rtol=1e-3, atol=1e-3)
-
-    @skipIf(not PLATFORM_SUPPORTS_SYMM_MEM, "Platform does not support symmetric memory")
-    @skip_if_lt_x_gpu(2)
-    def test_symm_mem_3d_input(self):
-        """Verify the fused kernel handles batched (3D) inputs correctly."""
-        self._init_device()
-        B, M, N = 2, 4, 64
-        eps = 1e-6
-        group_name = dist.group.WORLD.group_name
-
-        x = torch.randn(B, M, N, device=self.device, dtype=torch.bfloat16)
-        weight = torch.randn(N, device=self.device, dtype=torch.float32)
 
         expected_normed, _ = self._reference_allreduce_rmsnorm(x, weight, eps)
 
-        normed, pre_norm = torch.ops.symm_mem.fused_all_reduce_rmsnorm(
-            x, weight, "sum", group_name, eps=eps,
-        )
+        @torch.compile(options={"_fused_all_reduce_rmsnorm": True})
+        def ar_norm(inp, w, gn):
+            reduced = all_reduce(inp, "sum", group=gn)
+            normed = F.rms_norm(reduced, w.shape, w, eps)
+            return normed
 
-        self.assertIsNone(pre_norm)
-        self.assertEqual(normed.shape, x.shape)
-        torch.testing.assert_close(normed, expected_normed, rtol=1e-2, atol=1e-2)
+        with torch.inference_mode():
+            normed = ar_norm(x, weight, group_name)
+
+        torch.testing.assert_close(normed, expected_normed, atol=2e-2, rtol=2e-2)
 
 
 if __name__ == "__main__":

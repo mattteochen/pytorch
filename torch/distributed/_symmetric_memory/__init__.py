@@ -2194,4 +2194,7 @@ __all__ = [
 ]
 
 # Import fused ops (registers custom ops in symm_mem namespace)
-from . import _fused_all_reduce_rmsnorm as _fused_all_reduce_rmsnorm  # noqa: F401
+from . import (  # noqa: F401
+    _fused_all_reduce_rmsnorm as _fused_all_reduce_rmsnorm,
+    _p2p_allreduce as _p2p_allreduce,
+)

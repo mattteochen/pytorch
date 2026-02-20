@@ -755,3 +755,21 @@ def register_symm_mem_lowerings():
             reduce_op,
         )
         return None
+
+    try:
+        symm_mem.p2p_allreduce  # may not exist if _p2p_allreduce not imported yet
+    except AttributeError:
+        pass
+    else:
+
+        @register_lowering(symm_mem.p2p_allreduce)
+        def _symm_mem_p2p_allreduce(
+            inp: ir.TensorBox,
+            reduce_op: str,
+            group_name: str,
+        ) -> ir.TensorBox:
+            """Lower p2p_allreduce to SymmMemP2PAllReduce Pointwise node."""
+            from torch.distributed.distributed_c10d import _get_group_size_by_name
+
+            world_size = _get_group_size_by_name(group_name)
+            return ir.SymmMemP2PAllReduce.create(inp, world_size, group_name, reduce_op)

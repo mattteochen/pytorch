@@ -176,7 +176,12 @@ def is_unaligned_buffer(arg: TensorArg):
         return False
 
     if V.graph.scheduler:
-        layout = V.graph.scheduler.get_buffer_layout(buf_name)
+        try:
+            layout = V.graph.scheduler.get_buffer_layout(buf_name)
+        except KeyError:
+            # Virtual buffers (e.g. symm mem P2P pointers) that are
+            # injected by the codegen but don't exist in the graph.
+            return False
     else:
         buffer = V.graph.try_get_buffer(buf_name)
         # output arg
