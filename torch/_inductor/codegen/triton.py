@@ -6483,6 +6483,13 @@ class TritonScheduling(SIMDScheduling):
             kernel_kwargs["override_persistent_reduction"] = True
             kernel_kwargs["override_cooperative_reduction"] = False
 
+        # P2P allreduce loads from peer NVLink buffers -- repeating these
+        # in a looped reduction is far more expensive than register spill.
+        # Force persistent so the P2P loads happen exactly once.
+        if kernel_features.contains_op("symm_mem_p2p_reduce_load"):
+            kernel_kwargs["override_persistent_reduction"] = True
+            kernel_kwargs["override_cooperative_reduction"] = False
+
         if not TritonKernel.has_persistent_RBLOCK(kernel_features.reduction_numel):
             # Cannot use persistent reduction with unknown dynamic rnumel
             assert not kernel_kwargs.get("override_persistent_reduction")
