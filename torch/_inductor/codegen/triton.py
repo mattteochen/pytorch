@@ -5386,27 +5386,26 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
     def _codegen_symm_mem_prologue(self, code: IndentedBuffer) -> None:
         """
         Emit the symmetric memory P2P prologue:
-        1. Copy the local input into this rank's symmetric buffer.
+        1. Copy XBLOCK rows of the local input into this rank's symmetric buffer.
         2. Device-side sync so all peers' data is visible.
-
-        Uses the same indexing as the kernel's X dimension (one program
-        per row), matching kraken's one-block-per-row convention.
         """
         assert self.symm_mem_input_name is not None
         in_var = self.args.input(self.symm_mem_input_name)
-        # Prologue matches kraken's pattern: load local buffer ptr from the
-        # buffer_ptrs array, copy input row, then device-side sync.
         code.splice(
             f"""
             # --- symm mem prologue: copy local input -> symm buffer ---
             _symm_bptrs = symm_buf_ptrs.to(tl.pointer_type(tl.uint64))
             _symm_local_buf = tl.load(_symm_bptrs + SYMM_RANK).to(tl.pointer_type(tl.bfloat16))
-            _symm_row_off = tl.program_id(0).to(tl.int64)
+            _symm_x_base = tl.program_id(0).to(tl.int64) * XBLOCK
             _symm_cols = tl.arange(0, R0_BLOCK)
-            _symm_mask = _symm_cols < r0_numel
-            _symm_idx = _symm_row_off * r0_numel + _symm_cols
-            _symm_local = tl.load({in_var} + _symm_idx, _symm_mask, other=0.0)
-            tl.store(_symm_local_buf + _symm_idx, _symm_local, _symm_mask)
+            _symm_col_mask = _symm_cols < r0_numel
+            for _symm_row in tl.static_range(XBLOCK):
+                _symm_row_idx = _symm_x_base + _symm_row
+                _symm_row_mask = _symm_row_idx < xnumel
+                _symm_idx = _symm_row_idx * r0_numel + _symm_cols
+                _symm_mask = _symm_col_mask & _symm_row_mask
+                _symm_val = tl.load({in_var} + _symm_idx, _symm_mask, other=0.0)
+                tl.store(_symm_local_buf + _symm_idx, _symm_val, _symm_mask)
             _symm_mem_sync(symm_signal_pad_ptrs, None, SYMM_RANK, SYMM_WORLD_SIZE, hasPreviousMemAccess=True, hasSubsequentMemAccess=True)
             """
         )
@@ -5705,10 +5704,6 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
             triton_meta["constants"]["SYMM_RANK"] = _dist.get_rank()
             triton_meta["constants"]["SYMM_WORLD_SIZE"] = self.symm_mem_world_size
-            # Force XBLOCK=1 so grid = xnumel (one program per row).
-            # This is required for kraken's per-block sync to work --
-            # all ranks must launch the same number of blocks.
-            triton_meta["constants"]["XBLOCK"] = 1
 
         self.triton_meta = triton_meta
         self.inductor_meta = inductor_meta
