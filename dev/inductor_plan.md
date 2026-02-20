@@ -1,240 +1,156 @@
----
-name: Inductor P2P Allreduce Codegen
-overview: Teach torch inductor to automatically generate fused allreduce+RMSNorm Triton kernels using kraken's device-side PTX sync, replacing the current handwritten-kernel approach. The inductor codegen pipeline will be extended with a new "P2P reduce load" primitive that replaces standard `tl.load` with multi-rank P2P loads, while inductor's existing RMSNorm codegen generates the rest of the kernel.
-todos:
-  - id: ops-handler
-    content: Add symm_mem_p2p_reduce_load to OpsHandler and all its subclasses (MockHandler, WrapperHandler, TritonOverrides, etc.)
-    status: completed
-  - id: ir-node
-    content: Create SymmMemP2PAllReduce IR node in ir.py that produces a fusible Pointwise using the new ops method
-    status: completed
-  - id: triton-codegen
-    content: Implement TritonKernel.symm_mem_p2p_reduce_load() to generate P2P load+reduce loop; add sync prologue/epilogue and kraken ptx_utils import
-    status: completed
-  - id: fx-pass
-    content: Modify the FX pass to replace all_reduce+wait_tensor with p2p_allreduce, keeping downstream RMSNorm ops for inductor to fuse
-    status: completed
-  - id: custom-op-lowering
-    content: Create symm_mem.p2p_allreduce custom op and register its inductor lowering to produce the new IR node
-    status: completed
-  - id: wrapper-codegen
-    content: Generate symm mem workspace setup and peer pointer passing in the wrapper codegen
-    status: in_progress
-  - id: grid-consistency
-    content: Ensure grid/block size consistency across ranks (deterministic tiling for kernels with P2P loads)
-    status: pending
-  - id: tests
-    content: "Update tests: codegen unit tests, FX pass tests, multi-GPU correctness, fusion verification"
-    status: pending
-isProject: false
----
-
 # Inductor-Generated Fused AllReduce via Kraken PTX
 
-## Problem
+## Status: Working E2E on 4xGB200
 
-Currently, the fused allreduce+RMSNorm kernel is handwritten in `[torch/distributed/_symmetric_memory/_fused_allreduce_rmsnorm_triton.py](torch/distributed/_symmetric_memory/_fused_allreduce_rmsnorm_triton.py)`. The FX pass in `[torch/_inductor/fx_passes/fused_allreduce_rmsnorm.py](torch/_inductor/fx_passes/fused_allreduce_rmsnorm.py)` replaces the pattern with a call to this handwritten kernel via a custom op. This limits flexibility -- any change to the compute (different fusion, different norm, different dtype) requires rewriting the kernel.
+All 22 tests pass (14 single-process + 6 multi-GPU distributed + 2 torch.compile e2e).
+The `torch.compile` path generates a single fused Triton kernel that does
+P2P allreduce + residual add + RMSNorm with kraken device-side sync.
 
-Inductor already generates excellent RMSNorm Triton kernels via its standard Pointwise+Reduction fusion. The goal is to inject the allreduce communication (P2P loads + kraken device-side sync) into the inductor-generated kernel, not replace the kernel entirely.
+## Pipeline
 
-## Architecture
-
-```mermaid
-flowchart TD
-    subgraph before ["Current Pipeline"]
-        A1["FX: all_reduce -> wait -> add -> rmsnorm"] --> B1["FX Pass: replace with custom op"]
-        B1 --> C1["Handwritten Triton Kernel"]
-    end
-    subgraph after ["New Pipeline"]
-        A2["FX: all_reduce -> wait -> add -> rmsnorm"] --> B2["FX Pass: replace all_reduce+wait with p2p_allreduce"]
-        B2 --> C2["FX: p2p_allreduce -> add -> rmsnorm"]
-        C2 --> D2["IR: SymmMemP2PAllReduce Pointwise -> add -> Reduction"]
-        D2 --> E2["Scheduler fuses into single kernel"]
-        E2 --> F2["Codegen: P2P load loop + kraken sync + inductor RMSNorm"]
-    end
+```
+User code:  funcol.all_reduce(x) → x + residual → F.rms_norm(x, w, eps)
+                │
+                ▼  FX pass (post_grad.py, config._fused_all_reduce_rmsnorm)
+Transformed:  symm_mem.p2p_allreduce(x) → add(_, residual) → decomposed rmsnorm
+                │
+                ▼  IR lowering (comm_lowering.py)
+IR:           SymmMemP2PAllReduce Pointwise → add Pointwise → Reduction (rmsnorm)
+                │
+                ▼  Scheduler fusion (all fuse into one kernel)
+                │
+                ▼  Triton codegen
+Generated:    prologue (copy→symm_mem + sync) → P2P reduce load loop →
+              add + pow + mean + rsqrt + mul + mul_weight → epilogue (sync)
 ```
 
+## Files Modified / Created
 
+| File | Role |
+|------|------|
+| `torch/_inductor/ops_handler.py` | `symm_mem_p2p_reduce_load` op on OpsHandler |
+| `torch/_inductor/codegen/common.py` | CSEProxy + Kernel base method |
+| `torch/_inductor/codegen/triton.py` | P2P load codegen, prologue/epilogue, kraken import, constants, call_kernel |
+| `torch/_inductor/codegen/triton_utils.py` | `is_unaligned_buffer` safety for virtual buffers |
+| `torch/_inductor/ir.py` | `SymmMemP2PAllReduce` factory (creates fusible Pointwise) |
+| `torch/_inductor/fx_passes/fused_allreduce_rmsnorm.py` | Simplified FX pass (only replaces all_reduce+wait) |
+| `torch/_inductor/comm_lowering.py` | Lowering for `symm_mem.p2p_allreduce` |
+| `torch/_inductor/dtype_propagation.py` | Dtype rule for `symm_mem_p2p_reduce_load` |
+| `torch/_inductor/dependencies.py` | Read-dep tracking |
+| `torch/_inductor/loop_body.py` | Index forwarding |
+| `torch/_inductor/sizevars.py` | Index simplification forwarding |
+| `torch/distributed/_symmetric_memory/_p2p_allreduce.py` | Custom op (Meta + fallback) |
+| `torch/distributed/_symmetric_memory/__init__.py` | Import registration |
+| `torch/_inductor/runtime/symm_mem_helpers.py` | Wrapper runtime: cached workspace + pointer tensors |
+| `test/distributed/test_fused_allreduce_rmsnorm.py` | 22 tests (pattern, op, compile e2e, multi-GPU) |
 
-The key insight: the P2P allreduce is **pointwise** in element space (each output element = sum of that element across ranks). Inductor's scheduler will naturally fuse this Pointwise with downstream ops (add, pow, mean, rsqrt, mul) into a single kernel. Only the "load" step changes -- instead of `tl.load(buf + offset)`, we emit `sum(tl.load(peer_buf[i] + offset) for i in range(world_size))`.
+## Generated Kernel vs Kraken Reference
 
-## Generated Kernel Structure
+| Aspect | Generated | Kraken handwritten |
+|--------|-----------|-------------------|
+| Copy-in | `tl.load(buffer_ptrs + RANK)` → `tl.store` | Same |
+| Sync | `_symm_mem_sync(signal_pad_ptrs, ...)` | Same function |
+| P2P reduce | `tl.static_range(WS)` loop, pointer-to-pointer deref | `range(world_size)` loop, same deref |
+| RMSNorm | **Inductor-generated** (pow→mean→rsqrt→mul) | Hand-coded |
+| Grid | `xnumel` programs (XBLOCK=1 forced) | `num_blocks` (one per row) |
+| Kernel launches | 1 | 1 |
 
-The inductor-generated Triton kernel will look like:
+## Current Overhead
+
+### 1. `symm_mem_setup` called per kernel invocation
+
+`symm_mem_helpers.symm_mem_setup()` is called from the wrapper before
+every kernel launch.  It is cached (dict lookup), but still runs Python
+per call:
 
 ```python
-@triton.jit
-def triton_red_fused_kernel(
-    in_ptr0,           # original input (pre-allreduce)
-    in_ptr1,           # weight
-    in_ptr2,           # residual (optional)
-    out_ptr0,          # normed output
-    out_ptr1,          # pre_norm output (optional)
-    symm_buf_ptr,      # local rank's symm mem buffer
-    peer_buf_ptrs,     # all peer buffer pointers (tl.tensor of uint64)
-    signal_pad_ptrs,   # signal pad pointers (tl.tensor of uint64)
-    xnumel, rnumel,
-    rank: tl.constexpr,
-    WORLD_SIZE: tl.constexpr,
-    XBLOCK: tl.constexpr,
-    RBLOCK: tl.constexpr,
-):
-    # === Prologue: copy local input to symm mem ===
-    # (generated by codegen when kernel has P2P loads)
-    xoffset = tl.program_id(0) * XBLOCK
-    # ... copy in_ptr0[row] -> symm_buf_ptr[row] ...
-
-    # === Device-side sync (kraken PTX) ===
-    ptx_utils.symm_mem_sync(signal_pad_ptrs, None, rank, WORLD_SIZE,
-                            hasPreviousMemAccess=True, hasSubsequentMemAccess=True)
-
-    # === P2P reduce load (replaces standard tl.load) ===
-    # tmp0 = sum over all ranks of tl.load(peer_buf[i] + offset)
-    # ... inductor generates this via ops.symm_mem_p2p_reduce_load() ...
-
-    # === Standard inductor-generated RMSNorm compute ===
-    # ... add residual, pow, mean, rsqrt, mul weight ...
-    # (this code is IDENTICAL to what inductor generates for standalone RMSNorm)
-
-    # === Epilogue: device-side sync ===
-    ptx_utils.symm_mem_sync(signal_pad_ptrs, None, rank, WORLD_SIZE,
-                            hasPreviousMemAccess=True)
+# Generated wrapper (output_code.py line 164-165):
+_symm_buf_ptrs, _symm_signal_pad_ptrs, _symm_rank, _symm_world_size = symm_mem_setup(arg0_1, "0")
+triton_per_fused_...run(arg0_1, arg1_1, arg2_1, buf0, buf2, 4, 64, _symm_buf_ptrs, _symm_signal_pad_ptrs, ...)
 ```
 
-## Implementation Components
+**Fix:** Move to `Runner.__init__` (one-time) or to module-level init.
+The pointer tensors are stable after rendezvous.
 
-### 1. New ops handler: `symm_mem_p2p_reduce_load`
+### 2. Two CUDA int64 tensors allocated for pointer arrays
 
-**File**: `[torch/_inductor/ops_handler.py](torch/_inductor/ops_handler.py)`
+`symm_mem_setup` creates `torch.tensor([ptr0, ptr1, ...], device=cuda)`
+for `buffer_ptrs` and `signal_pad_ptrs`.  Small (world_size elements)
+but real CUDA allocations on first call.
 
-Add a new method to `OpsHandler`:
+**Fix:** Use `SymmetricMemory.buffer_ptrs_dev` / `signal_pad_ptrs_dev`
+directly.  These are raw ints pointing to device-resident arrays
+maintained by the C++ runtime — no Python tensor wrapper needed.
+Requires solving the `TensorArg` vs raw-int issue in
+`triton_heuristics` (the heuristics wrapper expects typed args in
+`triton_meta.signature`).
+
+### 3. XBLOCK forced to 1
+
+Required for grid consistency (all ranks must launch the same number
+of programs for kraken's per-block sync).  Prevents inductor from
+using larger XBLOCK for better occupancy.
+
+**Fix:** Allow XBLOCK > 1 by adjusting the prologue to copy XBLOCK
+rows per program.  Grid = `cdiv(xnumel, XBLOCK)` is consistent
+across ranks if XBLOCK and xnumel are the same.  Risk: autotuning
+could pick different XBLOCK per rank.  Mitigate by broadcasting the
+autotuning result from rank 0.
+
+### 4. bf16 hardcoded in prologue pointer cast
 
 ```python
-def symm_mem_p2p_reduce_load(
-    self, name: str, index: sympy.Expr, world_size: int
-) -> T:
-    """Load from all peer symmetric memory buffers and reduce (sum)."""
-    raise NotImplementedError
+_symm_local_buf = tl.load(_symm_bptrs + SYMM_RANK).to(tl.pointer_type(tl.bfloat16))
 ```
 
-This follows the same pattern as `ops.load()` but signals to the codegen that this load should be a P2P reduce across `world_size` peer buffers.
+**Fix:** Use the actual input dtype from `V.graph.get_dtype(name)`.
 
-### 2. Triton codegen for `symm_mem_p2p_reduce_load`
+### 5. Redundant `symm_buf_ptrs.to(pointer_type)` cast
 
-**File**: `[torch/_inductor/codegen/triton.py](torch/_inductor/codegen/triton.py)`
+Done once in the prologue and once in the P2P load body.
+Minor — Triton optimizes it away.
 
-Add `TritonKernel.symm_mem_p2p_reduce_load()`:
+## Improvements: Short Term
 
-- Register peer buffer pointers and signal pad pointers as kernel arguments
-- Generate the P2P load + sum loop using `tl.static_range(WORLD_SIZE)`
-- Mark the kernel as "has_symm_mem_p2p" so prologue/epilogue sync is emitted
+- [ ] Move `symm_mem_setup` to graph init (one-time, not per-call)
+- [ ] Use `buffer_ptrs_dev` / `signal_pad_ptrs_dev` raw ints instead
+      of wrapping in `torch.tensor`
+- [ ] Fix bf16 hardcoding → use actual input dtype
+- [ ] Profile the generated kernel vs kraken reference on realistic
+      shapes (hidden=4096/8192, seq=2048)
+- [ ] Clean up: remove `symm_buf_ptr` arg (no longer used, prologue
+      loads from `buffer_ptrs + RANK`)
 
-Modify `TritonKernel.codegen_kernel()`:
+## Improvements: Medium Term
 
-- When `has_symm_mem_p2p`, add kraken `ptx_utils` import (`from kraken._ptx_utils import symm_mem_barrier as ptx_utils`)
-- Emit copy-to-symm-mem + `ptx_utils.symm_mem_sync(...)` in the prologue
-- Emit final `ptx_utils.symm_mem_sync(...)` after all stores
-- Add `rank` and `WORLD_SIZE` as `tl.constexpr` kernel args
+- [ ] **LayerNorm variant:** The FX pass only replaces `all_reduce + wait`;
+      any downstream compute fuses automatically.  LayerNorm = same
+      pipeline, inductor already generates LayerNorm kernels.
+- [ ] **Training support:** Currently inference-only (FX pass gated on
+      `is_inference`).  Training requires the fused kernel to produce
+      intermediates for autograd (e.g. rsqrt for backward).  Approach:
+      extra Pointwise outputs, or recomputation in backward.
+- [ ] **Memory pool zero-copy:** Allocate upstream compute output
+      directly in symmetric memory via `symm_mem.get_mem_pool()`,
+      eliminating the prologue copy entirely.
+- [ ] **XBLOCK > 1 with deterministic autotuning:** Broadcast autotuning
+      config from rank 0.  Larger XBLOCK → better occupancy for many rows.
+- [ ] **Non-sum reduce ops:** `avg` needs `/ world_size` after reduce.
+      Trivial addition to the P2P load codegen.
 
-### 3. IR node: `SymmMemP2PAllReduce`
+## Improvements: Long Term
 
-**File**: `[torch/_inductor/ir.py](torch/_inductor/ir.py)`
-
-New class extending `Buffer` or creating a `Pointwise` with custom loader:
-
-```python
-class SymmMemP2PAllReduce:
-    """IR node: load from all peer symmetric memory buffers and sum."""
-    
-    @staticmethod
-    def create(input_buffer, world_size, group_name, reduce_op="sum"):
-        # Creates a Pointwise whose inner_fn calls ops.symm_mem_p2p_reduce_load
-        def inner_fn(index):
-            return ops.symm_mem_p2p_reduce_load(input_name, indexer(index), world_size)
-        return Pointwise.create(device=..., dtype=torch.float32, inner_fn=inner_fn, ranges=...)
-```
-
-The resulting `Pointwise` is fusible by the scheduler with downstream ops (RMSNorm chain).
-
-### 4. FX pass modification
-
-**File**: `[torch/_inductor/fx_passes/fused_allreduce_rmsnorm.py](torch/_inductor/fx_passes/fused_allreduce_rmsnorm.py)`
-
-Simplify the pass -- instead of matching the FULL `all_reduce + add + rmsnorm` pattern and replacing with a custom op, just:
-
-1. Match `all_reduce -> wait_tensor` where downstream consumers are fusible
-2. Replace with `symm_mem.p2p_allreduce(input, reduce_op, group_name)`
-3. Leave the RMSNorm decomposition and residual add **untouched** -- inductor fuses them naturally
-
-This is simpler than the current pass and more general (works for any pattern after the allreduce, not just RMSNorm).
-
-### 5. New custom op + lowering
-
-**Custom op** (in `[torch/distributed/_symmetric_memory/](torch/distributed/_symmetric_memory/)`):
-
-```python
-@torch.library.custom_op("symm_mem::p2p_allreduce", mutates_args=())
-def p2p_allreduce(input: Tensor, reduce_op: str, group_name: str) -> Tensor:
-    """P2P allreduce designed to be fused into consumer kernels by inductor."""
-    # Fallback: regular all_reduce + wait
-    return funcol.all_reduce(input, reduce_op, group_name)
-```
-
-**Lowering** (in `[torch/_inductor/comm_lowering.py](torch/_inductor/comm_lowering.py)` or a dedicated file):
-
-Register a lowering for `symm_mem.p2p_allreduce` that creates the `SymmMemP2PAllReduce` IR node, which the scheduler can fuse with downstream compute.
-
-### 6. Wrapper codegen for symm mem setup
-
-**File**: `[torch/_inductor/codegen/wrapper.py](torch/_inductor/codegen/wrapper.py)`
-
-When a kernel uses symm mem P2P, generate setup code before the kernel call:
-
-```python
-# Generated wrapper code:
-_symm_workspace = torch.distributed._symmetric_memory.get_symm_mem_workspace(group_name, size)
-_sm_hdl = torch.distributed._symmetric_memory.rendezvous(_symm_workspace, group)
-_peer_buf_ptrs = torch.tensor([_sm_hdl.buffer_ptrs[i] for i in range(world_size)], dtype=torch.int64)
-_signal_pad_ptrs = torch.tensor(_sm_hdl.signal_pad_ptrs, dtype=torch.int64)
-
-kernel[grid](input, weight, ..., _symm_workspace, _peer_buf_ptrs, _signal_pad_ptrs, rank=rank, WORLD_SIZE=world_size, ...)
-```
-
-### 7. Grid size consistency
-
-For kraken's per-block sync to work, all ranks must use the same grid. The kernel's grid and block sizes must be deterministic (not autotuned differently per rank). Options:
-
-- Fix XBLOCK = 1 (one row per program, matching kraken's approach)
-- Fix RBLOCK = next_power_of_2(hidden_dim) for persistent reduction
-- Or add a constraint that disables autotuning variance for this kernel type
-
-## Key files to modify
-
-- `[torch/_inductor/ops_handler.py](torch/_inductor/ops_handler.py)` -- new `symm_mem_p2p_reduce_load` op
-- `[torch/_inductor/codegen/triton.py](torch/_inductor/codegen/triton.py)` -- P2P load codegen, sync prologue/epilogue, kraken import
-- `[torch/_inductor/ir.py](torch/_inductor/ir.py)` -- `SymmMemP2PAllReduce` IR node
-- `[torch/_inductor/fx_passes/fused_allreduce_rmsnorm.py](torch/_inductor/fx_passes/fused_allreduce_rmsnorm.py)` -- simplified FX pass
-- `[torch/_inductor/comm_lowering.py](torch/_inductor/comm_lowering.py)` -- lowering for `p2p_allreduce`
-- `[torch/_inductor/codegen/wrapper.py](torch/_inductor/codegen/wrapper.py)` -- symm mem setup in wrapper
-- `[torch/distributed/_symmetric_memory/](torch/distributed/_symmetric_memory/)` -- new `p2p_allreduce` custom op
-- `[test/distributed/test_fused_allreduce_rmsnorm.py](test/distributed/test_fused_allreduce_rmsnorm.py)` -- updated tests
-
-## Kraken dependency
-
-The generated kernel imports from kraken:
-
-```python
-from kraken._ptx_utils.symm_mem_barrier import symm_mem_sync as ptx_utils_symm_mem_sync
-```
-
-The `[third_party/kraken/](third_party/kraken/)` submodule is already vendored. The key function is `symm_mem_sync` in `[third_party/kraken/kraken/_ptx_utils/symm_mem_barrier.py](third_party/kraken/kraken/_ptx_utils/symm_mem_barrier.py)` -- a `@triton.jit` function using PTX `atom.global.sys.cas` for device-side cross-rank synchronization.
-
-## Testing strategy
-
-- Unit test: verify that `ops.symm_mem_p2p_reduce_load` generates correct Triton code
-- Single-process test: verify the FX pass transforms the graph correctly (reuse existing pattern-matching tests)
-- Multi-GPU test: verify numerical correctness against the baseline (NCCL allreduce + eager RMSNorm)
-- Verify inductor fusion: check that the P2P allreduce is fused into the RMSNorm kernel (not a separate kernel)
-- Profile: compare against the existing handwritten kernel (should match kraken's single-kernel performance)
-
-
+- [ ] **Generalize beyond allreduce:** The P2P load + sync pattern applies
+      to reduce_scatter, all_gather.  Parameterize the sync pattern and
+      P2P access.
+- [ ] **Multi-node via NVSHMEM:** Replace `tl.load(peer_buf + offset)` with
+      `nvshmem.get()`.  Kernel structure stays the same.
+- [ ] **Double buffering:** Alternate between two symmetric memory buffers
+      across iterations to eliminate the epilogue sync.
+- [ ] **CUDA graph capture:** The current design is CUDA-graph friendly
+      (kraken's signal pad auto-resets, pointers are stable).  Needs
+      testing under `torch.cuda.graph()` capture.
+- [ ] **Upstream to PyTorch:** The new `ops.symm_mem_p2p_reduce_load`
+      primitive, `SymmMemP2PAllReduce` IR node, and codegen changes
+      should be upstreamed as a first-class inductor feature for
+      P2P communication fusion.
