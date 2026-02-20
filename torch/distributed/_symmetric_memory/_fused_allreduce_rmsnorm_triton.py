@@ -14,15 +14,6 @@ from torch.distributed._symmetric_memory import get_symm_mem_workspace
 
 _MAX_WORLD_SIZE = 8
 
-# Cache peer buffer tensor views across calls. The views point into the
-# persistent symmetric memory workspace so they remain valid until the
-# workspace is reallocated (which only happens when a larger size is needed).
-# Key: (group_name, shape, dtype) → (workspace_id, [peer_buf_views...])
-_peer_buf_cache: dict[
-    tuple[str, tuple[int, ...], torch.dtype],
-    tuple[int, list[torch.Tensor]],
-] = {}
-
 
 @triton.jit
 def _fused_allreduce_rmsnorm_kernel(
@@ -91,27 +82,6 @@ def _fused_allreduce_rmsnorm_kernel(
     )
 
 
-def _get_peer_bufs(
-    sm: object,
-    group_name: str,
-    shape: tuple[int, ...],
-    dtype: torch.dtype,
-) -> list[torch.Tensor]:
-    """Return cached P2P buffer views, creating them on first call."""
-    cache_key = (group_name, shape, dtype)
-    workspace_id = id(sm)
-    cached = _peer_buf_cache.get(cache_key)
-    if cached is not None and cached[0] == workspace_id:
-        return cached[1]
-
-    world_size = sm.world_size  # type: ignore[attr-defined]
-    bufs = [sm.get_buffer(r, shape, dtype) for r in range(world_size)]  # type: ignore[attr-defined]
-    while len(bufs) < _MAX_WORLD_SIZE:
-        bufs.append(bufs[0])
-    _peer_buf_cache[cache_key] = (workspace_id, bufs)
-    return bufs
-
-
 def fused_allreduce_rmsnorm_symm_mem(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -136,7 +106,10 @@ def fused_allreduce_rmsnorm_symm_mem(
             f"world_size {sm.world_size} exceeds maximum {_MAX_WORLD_SIZE}"
         )
 
-    peer_bufs = _get_peer_bufs(sm, group_name, tuple(input_2d.shape), input_2d.dtype)
+    shape = tuple(input_2d.shape)
+    peer_bufs = [sm.get_buffer(r, shape, input_2d.dtype) for r in range(sm.world_size)]
+    while len(peer_bufs) < _MAX_WORLD_SIZE:
+        peer_bufs.append(peer_bufs[0])
     peer_bufs[sm.rank].copy_(input_2d)
 
     sm.barrier(channel=0)
