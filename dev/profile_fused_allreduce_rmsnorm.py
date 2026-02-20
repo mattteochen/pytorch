@@ -29,10 +29,9 @@ from torch.distributed._symmetric_memory._fused_allreduce_rmsnorm_triton import 
     _make_peer_bufs,
 )
 
-HIDDEN = 4096
-SEQ_LEN = 2048
-BATCH = 1
-INTER = 8192  # MoE/FFN intermediate dim
+HIDDEN = 2880
+NUM_TOKENS = 1  # decode tokens (flattened, no batch dim in SGLang)
+INTER = 2880 * 4  # MoE/FFN intermediate dim
 EPS = 1e-5
 WARMUP_ITERS = 10
 PROFILE_ITERS = 20
@@ -135,7 +134,7 @@ def main():
 
     # --- Symmetric memory setup (mirrors what SGLang model init would do) ---
     symm_mem.enable_symm_mem_for_group(group_name)
-    workspace_bytes = BATCH * SEQ_LEN * HIDDEN * 2  # bf16 = 2 bytes
+    workspace_bytes = NUM_TOKENS * HIDDEN * 2  # bf16 = 2 bytes
     symm_mem.get_symm_mem_workspace(group_name, min_size=workspace_bytes)
     if rank == 0:
         print(f"Symmetric memory workspace pre-allocated: {workspace_bytes} bytes")
@@ -143,8 +142,8 @@ def main():
     # --- Build dummy model ---
     layer = DummyDecoderLayer(HIDDEN, INTER, EPS, device)
 
-    # --- Inputs ---
-    x = torch.randn(BATCH, SEQ_LEN, HIDDEN, device=device, dtype=torch.bfloat16)
+    # --- Inputs (flattened, SGLang-style: num_tokens × hidden) ---
+    x = torch.randn(NUM_TOKENS, HIDDEN, device=device, dtype=torch.bfloat16)
     residual = torch.randn_like(x)
     weight = layer.norm_weight
 
@@ -185,7 +184,7 @@ def main():
     # Pre-allocate output in symmetric memory and rendezvous BEFORE capture
     # so the CUDA graph only sees GPU ops with fixed addresses.
     mempool = symm_mem.get_mem_pool(device)
-    M_total = BATCH * SEQ_LEN
+    M_total = NUM_TOKENS
     with torch.cuda.use_mem_pool(mempool):
         h_symm = torch.empty(M_total, HIDDEN, device=device, dtype=torch.bfloat16)
     sm_hdl = symm_mem.rendezvous(h_symm, dist.group.WORLD)
