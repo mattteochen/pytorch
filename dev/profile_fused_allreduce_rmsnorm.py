@@ -3,17 +3,21 @@ Profile fused allreduce + RMSNorm: end-to-end SGLang-style repro.
 
 Simulates a decoder layer: linear (MoE stand-in) → allreduce → residual add → RMSNorm.
 
-Profiles seven variants:
+Profiles eight variants:
   1. baseline          – NCCL all_reduce + eager F.rms_norm
   2. fused_op          – torch.ops.symm_mem.fused_all_reduce_rmsnorm (direct, host-side barriers)
   3. compiled          – torch.compile with inductor P2P codegen (kraken device-side sync)
-  4. compiled_mempool  – compiled + mempool zero-copy (matmul → symm mem, single kernel)
-  5. mempool           – mem pool zero-copy with handwritten kernel (host-side barriers)
-  6. kraken            – kraken handwritten single kernel (device-side sync, reference)
-  7. flashinfer        – FlashInfer trtllm_allreduce_fusion one-shot (no quant)
+  4. compiled_plain    – torch.compile default settings (no fused allreduce+rmsnorm option)
+  5. compiled_mempool  – compiled + mempool zero-copy (matmul → symm mem, single kernel)
+  6. mempool           – mem pool zero-copy with handwritten kernel (host-side barriers)
+  7. kraken            – kraken handwritten single kernel (device-side sync, reference)
+  8. flashinfer        – FlashInfer trtllm_allreduce_fusion one-shot (no quant)
 
 Launch (torch profiler):
     torchrun --nproc_per_node=NUM_GPUS dev/profile_fused_allreduce_rmsnorm.py
+
+Launch (wall-clock timer only, no profiler overhead):
+    torchrun --nproc_per_node=NUM_GPUS dev/profile_fused_allreduce_rmsnorm.py --timer
 
 Launch (nsys, NVTX markers only, no torch profiler):
     nsys profile torchrun --nproc_per_node=NUM_GPUS dev/profile_fused_allreduce_rmsnorm.py --nsys
@@ -80,7 +84,8 @@ class DummyDecoderLayer(nn.Module):
         self, x: torch.Tensor, residual: torch.Tensor, group_name: str
     ):
         """NCCL all_reduce + eager RMSNorm (unfused baseline)."""
-        h = self.down_proj(F.silu(self.moe_proj(x)))
+        # h = self.down_proj(F.silu(self.moe_proj(x)))
+        h = x
         h = funcol.all_reduce(h, "sum", group_name)
         h = h + residual
         residual = h
@@ -103,10 +108,26 @@ def _make_compiled_ar_norm(eps: float):
     return _ar_norm
 
 
+def _make_compiled_plain_ar_norm(eps: float):
+    """Inductor default compile path without fused allreduce+rmsnorm option."""
+
+    @torch.compile
+    def _ar_norm_plain(x, residual, weight, group_name):
+        reduced = funcol.all_reduce(x, "sum", group_name)
+        h = reduced + residual
+        normed = F.rms_norm(h, weight.shape, weight, eps)
+        return normed, h
+
+    return _ar_norm_plain
+
+
 def _profile(
     name, fn, rank, warmup=WARMUP_ITERS, iters=PROFILE_ITERS, cuda_graph=False,
-    nsys_mode=False,
-):
+    nsys_mode=False, timer_mode=False,
+) -> float | None:
+    """Returns avg_us when timer_mode is True, else None."""
+    import time
+
     # Eager warmup: Triton compilation, NCCL init, buffer allocation, etc.
     for _ in range(warmup):
         fn()
@@ -136,16 +157,21 @@ def _profile(
     else:
         run = fn
 
+    # Always measure wall-clock time.
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
     if nsys_mode:
-        # NVTX-only path: no torch profiler, just NVTX markers for nsys.
         torch.cuda.nvtx.range_push(name)
-        for _ in range(iters):
-            run()
-        torch.cuda.synchronize()
+    for _ in range(iters):
+        run()
+    torch.cuda.synchronize()
+    t1 = time.perf_counter()
+    avg_us = (t1 - t0) / iters * 1e6
+    if nsys_mode:
         torch.cuda.nvtx.range_pop()
-        if rank == 0:
-            print(f"  {name}: {iters} iters (NVTX)")
-    else:
+
+    if not timer_mode and not nsys_mode:
+        # Torch profiler pass (re-run to capture trace).
         trace_path = f"/tmp/fused_ar_rmsnorm_{name}_rank{rank}.json"
         with torch.profiler.profile(
             activities=[
@@ -166,6 +192,8 @@ def _profile(
             print(f"{'=' * 60}")
             print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=15))
 
+    return avg_us
+
 
 @torch.inference_mode()
 def main():
@@ -174,9 +202,21 @@ def main():
         "--nsys", action="store_true",
         help="NVTX-only mode: skip torch profiler, emit NVTX ranges for nsys",
     )
+    parser.add_argument(
+        "--timer", action="store_true",
+        help="Wall-clock timer only: no profiler, no NVTX, just elapsed time",
+    )
+    parser.add_argument(
+        "--num-tokens",
+        type=int,
+        default=NUM_TOKENS,
+        help="Number of decode tokens (sequence length)",
+    )
     # torchrun injects extra args; ignore them.
     args, _ = parser.parse_known_args()
     nsys_mode = args.nsys
+    timer_mode = args.timer
+    num_tokens = args.num_tokens
 
     dist.init_process_group(backend="nccl")
     rank = dist.get_rank()
@@ -187,18 +227,21 @@ def main():
 
     # --- Symmetric memory setup (mirrors what SGLang model init would do) ---
     symm_mem.enable_symm_mem_for_group(group_name)
-    workspace_bytes = NUM_TOKENS * HIDDEN * 2  # bf16 = 2 bytes
+    workspace_bytes = num_tokens * HIDDEN * 2  # bf16 = 2 bytes
     symm_mem.get_symm_mem_workspace(group_name, min_size=workspace_bytes)
+    results: list[tuple[str, float | None]] = []
+
     if rank == 0:
-        mode_str = "nsys (NVTX only)" if nsys_mode else "torch profiler"
+        mode_str = "timer" if timer_mode else ("nsys (NVTX only)" if nsys_mode else "torch profiler")
         print(f"Mode: {mode_str}")
+        print(f"Config: NUM_TOKENS={num_tokens}, HIDDEN={HIDDEN}, world_size={dist.get_world_size()}")
         print(f"Symmetric memory workspace pre-allocated: {workspace_bytes} bytes")
 
     # --- Build dummy model ---
     layer = DummyDecoderLayer(HIDDEN, INTER, EPS, device)
 
     # --- Inputs (flattened, SGLang-style: num_tokens × hidden) ---
-    x = torch.randn(NUM_TOKENS, HIDDEN, device=device, dtype=torch.bfloat16)
+    x = torch.randn(num_tokens, HIDDEN, device=device, dtype=torch.bfloat16)
     residual = torch.randn_like(x)
     weight = layer.norm_weight
 
@@ -208,19 +251,20 @@ def main():
     )
 
     # --- Variant 1: baseline (NCCL + eager) ---
-    _profile(
+    results.append(("baseline", _profile(
         "baseline",
         lambda: layer.forward_baseline(x, residual, group_name),
         rank,
         cuda_graph=True,
-        nsys_mode=nsys_mode,
-    )
+        nsys_mode=nsys_mode, timer_mode=timer_mode,
+    )))
 
     # --- Variant 2: fused op (direct call, no torch.compile) ---
     __import__("torch.distributed._symmetric_memory._fused_all_reduce_rmsnorm")
 
     def fused_op_call():
-        h = layer.down_proj(F.silu(layer.moe_proj(x)))
+        # h = layer.down_proj(F.silu(layer.moe_proj(x)))
+        h = x
         return torch.ops.symm_mem.fused_all_reduce_rmsnorm(
             h,
             weight,
@@ -230,21 +274,34 @@ def main():
             eps=EPS,
         )
 
-    _profile("fused_op", fused_op_call, rank, cuda_graph=True, nsys_mode=nsys_mode)
+    results.append(("fused_op", _profile("fused_op", fused_op_call, rank, cuda_graph=True, nsys_mode=nsys_mode, timer_mode=timer_mode)))
 
     # --- Variant 3: torch.compile (inductor P2P codegen, kraken sync) ---
     ar_norm_compiled = _make_compiled_ar_norm(EPS)
 
     def compiled_call():
-        h = layer.down_proj(F.silu(layer.moe_proj(x)))
+        # h = layer.down_proj(F.silu(layer.moe_proj(x)))
+        h = x
         return ar_norm_compiled(h, residual, weight, group_name)
 
-    _profile(
+    results.append(("compiled", _profile(
         "compiled", compiled_call, rank,
-        warmup=WARMUP_ITERS + 5, cuda_graph=True, nsys_mode=nsys_mode,
-    )
+        warmup=WARMUP_ITERS + 5, cuda_graph=True, nsys_mode=nsys_mode, timer_mode=timer_mode,
+    )))
 
-    # --- Variant 4: compiled + mempool (zero-copy matmul → symm mem) ---
+    # --- Variant 4: torch.compile plain (default options) ---
+    ar_norm_compiled_plain = _make_compiled_plain_ar_norm(EPS)
+
+    def compiled_plain_call():
+        h = x
+        return ar_norm_compiled_plain(h, residual, weight, group_name)
+
+    results.append(("compiled_plain", _profile(
+        "compiled_plain", compiled_plain_call, rank,
+        warmup=WARMUP_ITERS + 5, cuda_graph=True, nsys_mode=nsys_mode, timer_mode=timer_mode,
+    )))
+
+    # --- Variant 5: compiled + mempool (zero-copy matmul → symm mem) ---
     # The matmul output lands directly in symmetric memory via the mem pool.
     # _symm_mem_skip_prologue_copy tells the codegen to skip the copy
     # (input is already where peers can read it) and just sync.
@@ -253,7 +310,7 @@ def main():
     mempool_for_compiled = symm_mem.get_mem_pool(device)
     with torch.cuda.use_mem_pool(mempool_for_compiled):
         h_symm_compiled = torch.empty(
-            NUM_TOKENS, HIDDEN, device=device, dtype=torch.bfloat16
+            num_tokens, HIDDEN, device=device, dtype=torch.bfloat16
         )
     symm_mem.rendezvous(h_symm_compiled, dist.group.WORLD)
 
@@ -274,33 +331,35 @@ def main():
         return normed, h
 
     def compiled_mempool_call():
-        intermediate = F.silu(layer.moe_proj(x))
-        torch.mm(
-            intermediate.view(-1, INTER),
-            layer.down_proj.weight.t(),
-            out=h_symm_compiled,
-        )
+        # intermediate = F.silu(layer.moe_proj(x))
+        # torch.mm(
+        #     intermediate.view(-1, INTER),
+        #     layer.down_proj.weight.t(),
+        #     out=h_symm_compiled,
+        # )
+        h_symm_compiled.copy_(x)
         return _ar_norm_mp(h_symm_compiled, residual, weight, group_name)
 
-    _profile(
+    results.append(("compiled_mempool", _profile(
         "compiled_mempool", compiled_mempool_call, rank,
-        warmup=WARMUP_ITERS + 5, cuda_graph=True, nsys_mode=nsys_mode,
-    )
+        warmup=WARMUP_ITERS + 5, cuda_graph=True, nsys_mode=nsys_mode, timer_mode=timer_mode,
+    )))
 
-    # --- Variant 5: mem pool (zero-copy with handwritten kernel) ---
+    # --- Variant 6: mem pool (zero-copy with handwritten kernel) ---
     # (Uses the old handwritten Triton kernel with host-side barriers)
     # Pre-allocate output in symmetric memory and rendezvous BEFORE capture
     # so the CUDA graph only sees GPU ops with fixed addresses.
     mempool = symm_mem.get_mem_pool(device)
-    M_total = NUM_TOKENS
+    M_total = num_tokens
     with torch.cuda.use_mem_pool(mempool):
         h_symm = torch.empty(M_total, HIDDEN, device=device, dtype=torch.bfloat16)
     sm_hdl = symm_mem.rendezvous(h_symm, dist.group.WORLD)
     peer_bufs = _make_peer_bufs(sm_hdl, tuple(h_symm.shape), h_symm.dtype)
 
     def mempool_call():
-        intermediate = F.silu(layer.moe_proj(x))
-        torch.mm(intermediate.view(-1, INTER), layer.down_proj.weight.t(), out=h_symm)
+        # intermediate = F.silu(layer.moe_proj(x))
+        # torch.mm(intermediate.view(-1, INTER), layer.down_proj.weight.t(), out=h_symm)
+        h_symm.copy_(x)
         output, residual_out = _launch_fused_kernel(
             sm_hdl,
             peer_bufs,
@@ -311,12 +370,12 @@ def main():
         )
         return output.view(x.shape), residual_out.view(x.shape)
 
-    _profile("mempool", mempool_call, rank, cuda_graph=True, nsys_mode=nsys_mode)
+    results.append(("mempool", _profile("mempool", mempool_call, rank, cuda_graph=True, nsys_mode=nsys_mode, timer_mode=timer_mode)))
 
-    # --- Variant 6: kraken (device-side sync, single kernel launch) ---
+    # --- Variant 7: kraken (device-side sync, single kernel launch) ---
     # Kraken needs a pre-allocated symmetric memory buffer + pre-allocated output.
     kraken_symm_buf = symm_mem.empty(
-        (NUM_TOKENS, HIDDEN),
+        (num_tokens, HIDDEN),
         dtype=torch.bfloat16,
         device=device,
     )
@@ -324,7 +383,8 @@ def main():
     kraken_output = torch.empty_like(x)
 
     def kraken_call():
-        h = layer.down_proj(F.silu(layer.moe_proj(x)))
+        # h = layer.down_proj(F.silu(layer.moe_proj(x)))
+        h = x
         one_shot_all_reduce_bias_rms_norm(
             kraken_symm_buf,
             h,
@@ -335,9 +395,9 @@ def main():
         )
         return kraken_output
 
-    _profile("kraken", kraken_call, rank, cuda_graph=True, nsys_mode=nsys_mode)
+    results.append(("kraken", _profile("kraken", kraken_call, rank, cuda_graph=True, nsys_mode=nsys_mode, timer_mode=timer_mode)))
 
-    # --- Variant 6: FlashInfer trtllm_allreduce_fusion (one-shot, no quant) ---
+    # --- Variant 8: FlashInfer trtllm_allreduce_fusion (one-shot, no quant) ---
     try:
         import flashinfer.comm as flashinfer_comm
 
@@ -355,7 +415,8 @@ def main():
         fi_residual_out = torch.empty_like(x)
 
         def flashinfer_call():
-            h = layer.down_proj(F.silu(layer.moe_proj(x)))
+            # h = layer.down_proj(F.silu(layer.moe_proj(x)))
+            h = x
             flashinfer_comm.trtllm_allreduce_fusion(
                 allreduce_in=h,
                 token_num=h.shape[0],
@@ -381,7 +442,7 @@ def main():
             )
             return fi_norm_out
 
-        _profile("flashinfer", flashinfer_call, rank, cuda_graph=True, nsys_mode=nsys_mode)
+        results.append(("flashinfer", _profile("flashinfer", flashinfer_call, rank, cuda_graph=True, nsys_mode=nsys_mode, timer_mode=timer_mode)))
 
         flashinfer_comm.trtllm_destroy_ipc_workspace_for_all_reduce(
             fi_ipc_handles, dist.group.WORLD
@@ -390,9 +451,28 @@ def main():
         if rank == 0:
             print(f"\nSkipping FlashInfer variant: {e}")
 
+    # --- Summary table ---
+    if rank == 0 and results:
+        baseline_us = next((us for name, us in results if name == "baseline" and us), None)
+        print(f"\n{'=' * 65}")
+        print(f"  SUMMARY  (NUM_TOKENS={num_tokens}, HIDDEN={HIDDEN}, "
+              f"world_size={dist.get_world_size()})")
+        print(f"{'=' * 65}")
+        print(f"  {'Variant':<25s} {'us/iter':>10s} {'vs baseline':>12s}")
+        print(f"  {'-'*25} {'-'*10} {'-'*12}")
+        for name, avg_us in results:
+            if avg_us is None:
+                continue
+            speedup = ""
+            if baseline_us and baseline_us > 0:
+                ratio = baseline_us / avg_us
+                speedup = f"{ratio:.2f}x"
+            print(f"  {name:<25s} {avg_us:10.1f} {speedup:>12s}")
+        print()
+
     dist.destroy_process_group()
     if rank == 0:
-        print("\nDone. Compare traces in /tmp/fused_ar_rmsnorm_*.json")
+        print("Done. Compare traces in /tmp/fused_ar_rmsnorm_*.json")
     
     torch.cuda.cudart().cudaProfilerStop()
 
