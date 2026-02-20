@@ -5391,24 +5391,35 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         """
         assert self.symm_mem_input_name is not None
         in_var = self.args.input(self.symm_mem_input_name)
-        code.splice(
-            f"""
-            # --- symm mem prologue: copy local input -> symm buffer ---
-            _symm_bptrs = symm_buf_ptrs.to(tl.pointer_type(tl.uint64))
-            _symm_local_buf = tl.load(_symm_bptrs + SYMM_RANK).to(tl.pointer_type(tl.bfloat16))
-            _symm_x_base = tl.program_id(0).to(tl.int64) * XBLOCK
-            _symm_cols = tl.arange(0, R0_BLOCK)
-            _symm_col_mask = _symm_cols < r0_numel
-            for _symm_row in tl.static_range(XBLOCK):
-                _symm_row_idx = _symm_x_base + _symm_row
-                _symm_row_mask = _symm_row_idx < xnumel
-                _symm_idx = _symm_row_idx * r0_numel + _symm_cols
-                _symm_mask = _symm_col_mask & _symm_row_mask
-                _symm_val = tl.load({in_var} + _symm_idx, _symm_mask, other=0.0)
-                tl.store(_symm_local_buf + _symm_idx, _symm_val, _symm_mask)
-            _symm_mem_sync(symm_signal_pad_ptrs, None, SYMM_RANK, SYMM_WORLD_SIZE, hasPreviousMemAccess=True, hasSubsequentMemAccess=True)
-            """
-        )
+
+        if config._symm_mem_skip_prologue_copy:
+            # Input is already in symmetric memory (e.g. via mempool).
+            # Skip the copy, just sync.
+            code.splice(
+                """
+                # --- symm mem prologue: input already in symm mem, sync only ---
+                _symm_mem_sync(symm_signal_pad_ptrs, None, SYMM_RANK, SYMM_WORLD_SIZE, hasPreviousMemAccess=True, hasSubsequentMemAccess=True)
+                """
+            )
+        else:
+            code.splice(
+                f"""
+                # --- symm mem prologue: copy local input -> symm buffer ---
+                _symm_bptrs = symm_buf_ptrs.to(tl.pointer_type(tl.uint64))
+                _symm_local_buf = tl.load(_symm_bptrs + SYMM_RANK).to(tl.pointer_type(tl.bfloat16))
+                _symm_x_base = tl.program_id(0).to(tl.int64) * XBLOCK
+                _symm_cols = tl.arange(0, R0_BLOCK)
+                _symm_col_mask = _symm_cols < r0_numel
+                for _symm_row in tl.static_range(XBLOCK):
+                    _symm_row_idx = _symm_x_base + _symm_row
+                    _symm_row_mask = _symm_row_idx < xnumel
+                    _symm_idx = _symm_row_idx * r0_numel + _symm_cols
+                    _symm_mask = _symm_col_mask & _symm_row_mask
+                    _symm_val = tl.load({in_var} + _symm_idx, _symm_mask, other=0.0)
+                    tl.store(_symm_local_buf + _symm_idx, _symm_val, _symm_mask)
+                _symm_mem_sync(symm_signal_pad_ptrs, None, SYMM_RANK, SYMM_WORLD_SIZE, hasPreviousMemAccess=True, hasSubsequentMemAccess=True)
+                """
+            )
 
     def _codegen_symm_mem_epilogue(self, code: IndentedBuffer) -> None:
         """Emit the final device-side sync after all stores."""

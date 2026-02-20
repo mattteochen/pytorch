@@ -993,6 +993,11 @@ _micro_pipeline_tp: bool = False
 # single fused kernel using symmetric memory.
 _fused_all_reduce_rmsnorm: bool = False
 
+# When True, the inductor-generated P2P allreduce kernel skips the
+# prologue copy (input → symmetric memory) because the input is already
+# in symmetric memory (e.g. via symm_mem.get_mem_pool()).
+_symm_mem_skip_prologue_copy: bool = False
+
 
 # Enable/disable partitioned scatter optimization for atomic add kernels
 # this will improve kernel performance at cost of memory usage.
