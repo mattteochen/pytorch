@@ -3,20 +3,25 @@ Profile fused allreduce + RMSNorm: end-to-end SGLang-style repro.
 
 Simulates a decoder layer: linear (MoE stand-in) → allreduce → residual add → RMSNorm.
 
-Profiles six variants:
-  1. baseline     – NCCL all_reduce + eager F.rms_norm
-  2. fused_op     – torch.ops.symm_mem.fused_all_reduce_rmsnorm (direct, host-side barriers)
-  3. compiled     – torch.compile with inductor P2P codegen (kraken device-side sync)
-  4. mempool      – mem pool zero-copy: matmul output lands in symmetric memory
-  5. kraken       – kraken handwritten single kernel (device-side sync, reference)
-  6. flashinfer   – FlashInfer trtllm_allreduce_fusion one-shot (no quant)
+Profiles seven variants:
+  1. baseline          – NCCL all_reduce + eager F.rms_norm
+  2. fused_op          – torch.ops.symm_mem.fused_all_reduce_rmsnorm (direct, host-side barriers)
+  3. compiled          – torch.compile with inductor P2P codegen (kraken device-side sync)
+  4. compiled_mempool  – compiled + mempool zero-copy (matmul → symm mem, single kernel)
+  5. mempool           – mem pool zero-copy with handwritten kernel (host-side barriers)
+  6. kraken            – kraken handwritten single kernel (device-side sync, reference)
+  7. flashinfer        – FlashInfer trtllm_allreduce_fusion one-shot (no quant)
 
-Launch:
+Launch (torch profiler):
     torchrun --nproc_per_node=NUM_GPUS dev/profile_fused_allreduce_rmsnorm.py
+
+Launch (nsys, NVTX markers only, no torch profiler):
+    nsys profile torchrun --nproc_per_node=NUM_GPUS dev/profile_fused_allreduce_rmsnorm.py --nsys
 
 Trace output: /tmp/fused_ar_rmsnorm_*.json
 """
 
+import argparse
 import logging
 import os
 import sys
@@ -46,11 +51,13 @@ from kraken.fused.one_shot_all_reduce_bias_rms_norm import (
 
 
 HIDDEN = 2880
-NUM_TOKENS = 32  # decode tokens (flattened, no batch dim in SGLang)
+NUM_TOKENS = 1  # decode tokens (flattened, no batch dim in SGLang)
 INTER = 2880 * 4  # MoE/FFN intermediate dim
 EPS = 1e-5
 WARMUP_ITERS = 10
 PROFILE_ITERS = 20
+
+torch.cuda.cudart().cudaProfilerStart()
 
 
 class DummyDecoderLayer(nn.Module):
@@ -97,7 +104,8 @@ def _make_compiled_ar_norm(eps: float):
 
 
 def _profile(
-    name, fn, rank, warmup=WARMUP_ITERS, iters=PROFILE_ITERS, cuda_graph=False
+    name, fn, rank, warmup=WARMUP_ITERS, iters=PROFILE_ITERS, cuda_graph=False,
+    nsys_mode=False,
 ):
     # Eager warmup: Triton compilation, NCCL init, buffer allocation, etc.
     for _ in range(warmup):
@@ -128,29 +136,48 @@ def _profile(
     else:
         run = fn
 
-    trace_path = f"/tmp/fused_ar_rmsnorm_{name}_rank{rank}.json"
-    with torch.profiler.profile(
-        activities=[
-            torch.profiler.ProfilerActivity.CPU,
-            torch.profiler.ProfilerActivity.CUDA,
-        ],
-        record_shapes=True,
-        with_stack=True,
-    ) as prof:
+    if nsys_mode:
+        # NVTX-only path: no torch profiler, just NVTX markers for nsys.
+        torch.cuda.nvtx.range_push(name)
         for _ in range(iters):
             run()
-            torch.cuda.synchronize()
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_pop()
+        if rank == 0:
+            print(f"  {name}: {iters} iters (NVTX)")
+    else:
+        trace_path = f"/tmp/fused_ar_rmsnorm_{name}_rank{rank}.json"
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            record_shapes=True,
+            with_stack=True,
+        ) as prof:
+            for _ in range(iters):
+                run()
+                torch.cuda.synchronize()
 
-    if rank == 0:
-        prof.export_chrome_trace(trace_path)
-        print(f"\n{'=' * 60}")
-        print(f"  {name}  (trace: {trace_path})")
-        print(f"{'=' * 60}")
-        print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=15))
+        if rank == 0:
+            prof.export_chrome_trace(trace_path)
+            print(f"\n{'=' * 60}")
+            print(f"  {name}  (trace: {trace_path})")
+            print(f"{'=' * 60}")
+            print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=15))
 
 
 @torch.inference_mode()
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--nsys", action="store_true",
+        help="NVTX-only mode: skip torch profiler, emit NVTX ranges for nsys",
+    )
+    # torchrun injects extra args; ignore them.
+    args, _ = parser.parse_known_args()
+    nsys_mode = args.nsys
+
     dist.init_process_group(backend="nccl")
     rank = dist.get_rank()
     device = torch.device("cuda", rank)
@@ -163,6 +190,8 @@ def main():
     workspace_bytes = NUM_TOKENS * HIDDEN * 2  # bf16 = 2 bytes
     symm_mem.get_symm_mem_workspace(group_name, min_size=workspace_bytes)
     if rank == 0:
+        mode_str = "nsys (NVTX only)" if nsys_mode else "torch profiler"
+        print(f"Mode: {mode_str}")
         print(f"Symmetric memory workspace pre-allocated: {workspace_bytes} bytes")
 
     # --- Build dummy model ---
@@ -184,6 +213,7 @@ def main():
         lambda: layer.forward_baseline(x, residual, group_name),
         rank,
         cuda_graph=True,
+        nsys_mode=nsys_mode,
     )
 
     # --- Variant 2: fused op (direct call, no torch.compile) ---
@@ -200,7 +230,7 @@ def main():
             eps=EPS,
         )
 
-    _profile("fused_op", fused_op_call, rank, cuda_graph=True)
+    _profile("fused_op", fused_op_call, rank, cuda_graph=True, nsys_mode=nsys_mode)
 
     # --- Variant 3: torch.compile (inductor P2P codegen, kraken sync) ---
     ar_norm_compiled = _make_compiled_ar_norm(EPS)
@@ -211,10 +241,53 @@ def main():
 
     _profile(
         "compiled", compiled_call, rank,
-        warmup=WARMUP_ITERS + 5, cuda_graph=True,
+        warmup=WARMUP_ITERS + 5, cuda_graph=True, nsys_mode=nsys_mode,
     )
 
-    # --- Variant 4: mem pool (zero-copy, no DtoD workspace copy) ---
+    # --- Variant 4: compiled + mempool (zero-copy matmul → symm mem) ---
+    # The matmul output lands directly in symmetric memory via the mem pool.
+    # _symm_mem_skip_prologue_copy tells the codegen to skip the copy
+    # (input is already where peers can read it) and just sync.
+    import torch._inductor.config as inductor_config
+
+    mempool_for_compiled = symm_mem.get_mem_pool(device)
+    with torch.cuda.use_mem_pool(mempool_for_compiled):
+        h_symm_compiled = torch.empty(
+            NUM_TOKENS, HIDDEN, device=device, dtype=torch.bfloat16
+        )
+    symm_mem.rendezvous(h_symm_compiled, dist.group.WORLD)
+
+    ar_norm_compiled_mp = _make_compiled_ar_norm(EPS)
+    # Compile with skip_prologue_copy so the kernel omits the copy.
+    # We need to trigger recompilation with the new config, so we
+    # create a fresh compiled function.
+    @torch.compile(
+        options={
+            "_fused_all_reduce_rmsnorm": True,
+            "_symm_mem_skip_prologue_copy": True,
+        },
+    )
+    def _ar_norm_mp(x, residual, w, group_name):
+        reduced = funcol.all_reduce(x, "sum", group_name)
+        h = reduced + residual
+        normed = F.rms_norm(h, w.shape, w, EPS)
+        return normed, h
+
+    def compiled_mempool_call():
+        intermediate = F.silu(layer.moe_proj(x))
+        torch.mm(
+            intermediate.view(-1, INTER),
+            layer.down_proj.weight.t(),
+            out=h_symm_compiled,
+        )
+        return _ar_norm_mp(h_symm_compiled, residual, weight, group_name)
+
+    _profile(
+        "compiled_mempool", compiled_mempool_call, rank,
+        warmup=WARMUP_ITERS + 5, cuda_graph=True, nsys_mode=nsys_mode,
+    )
+
+    # --- Variant 5: mem pool (zero-copy with handwritten kernel) ---
     # (Uses the old handwritten Triton kernel with host-side barriers)
     # Pre-allocate output in symmetric memory and rendezvous BEFORE capture
     # so the CUDA graph only sees GPU ops with fixed addresses.
@@ -238,9 +311,9 @@ def main():
         )
         return output.view(x.shape), residual_out.view(x.shape)
 
-    _profile("mempool", mempool_call, rank, cuda_graph=True)
+    _profile("mempool", mempool_call, rank, cuda_graph=True, nsys_mode=nsys_mode)
 
-    # --- Variant 5: kraken (device-side sync, single kernel launch) ---
+    # --- Variant 6: kraken (device-side sync, single kernel launch) ---
     # Kraken needs a pre-allocated symmetric memory buffer + pre-allocated output.
     kraken_symm_buf = symm_mem.empty(
         (NUM_TOKENS, HIDDEN),
@@ -262,7 +335,7 @@ def main():
         )
         return kraken_output
 
-    _profile("kraken", kraken_call, rank, cuda_graph=True)
+    _profile("kraken", kraken_call, rank, cuda_graph=True, nsys_mode=nsys_mode)
 
     # --- Variant 6: FlashInfer trtllm_allreduce_fusion (one-shot, no quant) ---
     try:
@@ -308,7 +381,7 @@ def main():
             )
             return fi_norm_out
 
-        _profile("flashinfer", flashinfer_call, rank, cuda_graph=True)
+        _profile("flashinfer", flashinfer_call, rank, cuda_graph=True, nsys_mode=nsys_mode)
 
         flashinfer_comm.trtllm_destroy_ipc_workspace_for_all_reduce(
             fi_ipc_handles, dist.group.WORLD
@@ -320,6 +393,8 @@ def main():
     dist.destroy_process_group()
     if rank == 0:
         print("\nDone. Compare traces in /tmp/fused_ar_rmsnorm_*.json")
+    
+    torch.cuda.cudart().cudaProfilerStop()
 
 
 if __name__ == "__main__":
