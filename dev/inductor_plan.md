@@ -137,6 +137,44 @@ nsys profile torchrun --nproc_per_node=4 dev/profile_fused_allreduce_rmsnorm.py 
 Added FlashInfer `trtllm_allreduce_fusion` one-shot (no quant) as variant 7
 in the profiling script for direct comparison.
 
+## Known Limitation: Large Token Counts
+
+The current implementation uses **one-shot P2P allreduce**: every rank
+reads the FULL tensor from ALL peers over NVLink.  This is optimal for
+small tensors (decode, 1-32 tokens) where kernel launch latency
+dominates.  For large tensors it becomes bandwidth-bound and loses to
+NCCL and FlashInfer:
+
+```
+NVLink traffic per rank (hidden=2880):
+                    1 token (5.6KB)     1024 tokens (5.6MB)
+one-shot P2P:       4 × 5.6KB = 22KB   4 × 5.6MB  = 22.4MB
+NCCL ring:          2 × 5.6KB = 11KB   2 × 5.6MB  = 11.2MB
+TRT-LLM two-shot:  2 × 5.6KB = 11KB   2 × 5.6MB  = 11.2MB
+```
+
+Benchmark results (hidden=2880, 4xGB200, `dev/benchmark.py --no-quant`):
+
+| seq_len | inductor P2P | standard NCCL | flashinfer one-shot |
+|---------|-------------|---------------|---------------------|
+| 1       | 0.024ms     | 0.010ms       | 0.006ms             |
+| 32      | 0.025ms     | 0.011ms       | 0.007ms             |
+| 1024    | 0.107ms     | 0.061ms       | 0.040ms             |
+
+At seq_len=1024 our kernel is 2.6x slower than flashinfer because:
+1. **4x NVLink reads** vs 2x for ring/two-shot algorithms
+2. **Prologue copy** (5.6MB input → symm mem) inside the kernel
+3. **1024 device-side sync points** (one per row/block)
+
+The FX pass should be gated on tensor size: only replace `all_reduce +
+wait` with P2P when the data is small enough for one-shot to win.  For
+large tensors, let NCCL handle the allreduce as a separate kernel.
+
+**Crossover point:** roughly where `data_size * world_size` exceeds
+NVLink bandwidth gains from fusion.  On GB200 with 4 ranks this is
+around 64-128KB (32-64 tokens at hidden=2880).  FlashInfer dynamically
+switches between one-shot and two-shot at a similar threshold.
+
 ## Remaining Overhead
 
 ### 1. `symm_mem_setup` called per kernel invocation
@@ -162,13 +200,19 @@ _symm_local_buf = tl.load(_symm_bptrs + SYMM_RANK).to(tl.pointer_type(tl.bfloat1
 
 ## Improvements: Short Term
 
+- [ ] **Gate FX pass on tensor size:** Only replace `all_reduce + wait`
+      with P2P when `numel * element_size < threshold` (e.g. 128KB).
+      For larger tensors, keep NCCL allreduce as separate kernel.
 - [ ] Move `symm_mem_setup` to graph init (one-time, not per-call)
 - [ ] Use `buffer_ptrs_dev` / `signal_pad_ptrs_dev` raw ints
 - [ ] Fix bf16 hardcoding → use actual input dtype
-- [ ] Profile on realistic shapes (hidden=4096/8192, seq=2048)
 
 ## Improvements: Medium Term
 
+- [ ] **Two-shot P2P allreduce:** Implement reduce-scatter + allgather
+      in the codegen for large tensors, matching kraken's `two_shot_`
+      and FlashInfer's two-shot mode.  This halves NVLink traffic from
+      `world_size × data` to `2 × data`.
 - [ ] **LayerNorm variant:** FX pass already general (replaces all_reduce+wait).
       Inductor generates LayerNorm kernels automatically.
 - [ ] **Training support:** Currently inference-only. Training needs
