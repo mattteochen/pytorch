@@ -4,9 +4,12 @@ Tests for the fused all_reduce + rmsnorm pass.
 """
 
 import operator
+from contextlib import nullcontext
+from unittest import skipIf
 
 import torch
 import torch.distributed as dist
+import torch.distributed._symmetric_memory as symm_mem
 import torch.nn.functional as F
 from functorch import make_fx
 from torch._inductor.decomposition import decompositions
@@ -16,11 +19,21 @@ from torch._inductor.fx_passes.fused_allreduce_rmsnorm import (
     _is_wait_tensor,
     fused_all_reduce_rmsnorm_pass,
 )
-import torch.distributed._symmetric_memory  # registers symm_mem custom ops
+from torch.distributed._functional_collectives import all_reduce
 from torch.distributed._symmetric_memory import _test_mode
 from torch._inductor.fx_passes.post_grad import remove_noop_ops, view_to_reshape
-from torch.distributed._functional_collectives import all_reduce
-from torch.testing._internal.common_utils import run_tests, TestCase
+from torch.testing._internal.common_distributed import (
+    MultiProcContinuousTest,
+    PLATFORM_SUPPORTS_SYMM_MEM,
+    skip_if_lt_x_gpu,
+)
+from torch.testing._internal.common_utils import (
+    instantiate_parametrized_tests,
+    parametrize,
+    requires_cuda_p2p_access,
+    run_tests,
+    TestCase,
+)
 from torch.testing._internal.distributed.fake_pg import FakeStore
 
 
@@ -356,6 +369,256 @@ class TestHelperFunctions(TestCase):
 
         wait_nodes = [n for n in gm.graph.nodes if _is_wait_tensor(n)]
         self.assertEqual(len(wait_nodes), 1)
+
+
+device_type = "cuda"
+test_contexts = [nullcontext, _test_mode]
+
+
+@instantiate_parametrized_tests
+@requires_cuda_p2p_access()
+class TestFusedAllReduceRMSNormDistributed(MultiProcContinuousTest):
+    """Multi-process tests that run real distributed allreduce + rmsnorm."""
+
+    @property
+    def device(self) -> torch.device:
+        return torch.device(device_type, self.rank)
+
+    def _init_process(self):
+        torch.cuda.set_device(self.device)
+        torch.manual_seed(42 + self.rank)
+
+    def _reference_allreduce_rmsnorm(self, x, weight, eps, residual=None):
+        """Compute expected result via manual all_reduce + rms_norm."""
+        group_name = dist.group.WORLD.group_name
+        reduced = torch.ops._c10d_functional.all_reduce(x, "sum", group_name)
+        reduced = torch.ops._c10d_functional.wait_tensor(reduced)
+        pre_norm = None
+        if residual is not None:
+            reduced = reduced + residual
+            pre_norm = reduced.clone()
+        normed = F.rms_norm(reduced, weight.shape, weight, eps)
+        return normed, pre_norm
+
+    @skipIf(not PLATFORM_SUPPORTS_SYMM_MEM, "Platform does not support symmetric memory")
+    @skip_if_lt_x_gpu(2)
+    @parametrize("context", test_contexts)
+    @parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_correctness_no_residual(self, context, dtype):
+        self._init_process()
+        M, N = 8, 128
+        eps = 1e-6
+        group_name = dist.group.WORLD.group_name
+
+        x = torch.randn(M, N, device=self.device, dtype=dtype)
+        weight = torch.randn(N, device=self.device, dtype=torch.float32)
+
+        expected_normed, _ = self._reference_allreduce_rmsnorm(x, weight, eps)
+
+        with context():
+            normed, pre_norm = torch.ops.symm_mem.fused_all_reduce_rmsnorm(
+                x, weight, "sum", group_name, eps=eps,
+            )
+
+        tol = {"rtol": 5e-2, "atol": 5e-2} if dtype == torch.bfloat16 else {"rtol": 1e-3, "atol": 1e-3}
+        self.assertIsNone(pre_norm)
+        torch.testing.assert_close(normed, expected_normed, **tol)
+
+    @skipIf(not PLATFORM_SUPPORTS_SYMM_MEM, "Platform does not support symmetric memory")
+    @skip_if_lt_x_gpu(2)
+    @parametrize("context", test_contexts)
+    @parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_correctness_with_residual(self, context, dtype):
+        self._init_process()
+        M, N = 8, 128
+        eps = 1e-6
+        group_name = dist.group.WORLD.group_name
+
+        x = torch.randn(M, N, device=self.device, dtype=dtype)
+        residual = torch.randn(M, N, device=self.device, dtype=dtype)
+        weight = torch.randn(N, device=self.device, dtype=torch.float32)
+
+        expected_normed, expected_pre_norm = self._reference_allreduce_rmsnorm(
+            x, weight, eps, residual=residual,
+        )
+
+        with context():
+            normed, pre_norm = torch.ops.symm_mem.fused_all_reduce_rmsnorm(
+                x, weight, "sum", group_name, residual=residual, eps=eps,
+            )
+
+        tol = {"rtol": 5e-2, "atol": 5e-2} if dtype == torch.bfloat16 else {"rtol": 1e-3, "atol": 1e-3}
+        self.assertIsNotNone(pre_norm)
+        torch.testing.assert_close(pre_norm, expected_pre_norm, **tol)
+        torch.testing.assert_close(normed, expected_normed, **tol)
+
+    @skipIf(not PLATFORM_SUPPORTS_SYMM_MEM, "Platform does not support symmetric memory")
+    @skip_if_lt_x_gpu(2)
+    @parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_3d_input(self, dtype):
+        """Verify the op handles batched (3D) inputs correctly."""
+        self._init_process()
+        B, M, N = 2, 4, 64
+        eps = 1e-6
+        group_name = dist.group.WORLD.group_name
+
+        x = torch.randn(B, M, N, device=self.device, dtype=dtype)
+        weight = torch.randn(N, device=self.device, dtype=torch.float32)
+
+        expected_normed, _ = self._reference_allreduce_rmsnorm(x, weight, eps)
+
+        normed, pre_norm = torch.ops.symm_mem.fused_all_reduce_rmsnorm(
+            x, weight, "sum", group_name, eps=eps,
+        )
+
+        tol = {"rtol": 5e-2, "atol": 5e-2} if dtype == torch.bfloat16 else {"rtol": 1e-3, "atol": 1e-3}
+        self.assertIsNone(pre_norm)
+        self.assertEqual(normed.shape, x.shape)
+        torch.testing.assert_close(normed, expected_normed, **tol)
+
+    @skipIf(not PLATFORM_SUPPORTS_SYMM_MEM, "Platform does not support symmetric memory")
+    @skip_if_lt_x_gpu(2)
+    def test_per_rank_data_differs(self):
+        """Each rank contributes different data; the reduction is real."""
+        self._init_process()
+        M, N = 4, 64
+        eps = 1e-6
+        group_name = dist.group.WORLD.group_name
+
+        x = torch.full(
+            (M, N), float(self.rank + 1), device=self.device, dtype=torch.float32
+        )
+        weight = torch.ones(N, device=self.device, dtype=torch.float32)
+
+        normed, _ = torch.ops.symm_mem.fused_all_reduce_rmsnorm(
+            x, weight, "sum", group_name, eps=eps,
+        )
+
+        expected_sum = sum(range(1, self.world_size + 1))
+        expected_reduced = torch.full(
+            (M, N), float(expected_sum), device=self.device, dtype=torch.float32
+        )
+        expected_normed = F.rms_norm(expected_reduced, weight.shape, weight, eps)
+
+        torch.testing.assert_close(normed, expected_normed, rtol=1e-3, atol=1e-3)
+
+
+@instantiate_parametrized_tests
+@requires_cuda_p2p_access()
+class TestFusedAllReduceRMSNormSymmMem(MultiProcContinuousTest):
+    """Multi-process tests for the symmetric memory P2P fused kernel."""
+
+    @property
+    def device(self) -> torch.device:
+        return torch.device(device_type, self.rank)
+
+    def _init_device(self):
+        torch.cuda.set_device(self.device)
+        torch.manual_seed(42 + self.rank)
+
+    def _reference_allreduce_rmsnorm(self, x, weight, eps, residual=None):
+        group_name = dist.group.WORLD.group_name
+        reduced = torch.ops._c10d_functional.all_reduce(x, "sum", group_name)
+        reduced = torch.ops._c10d_functional.wait_tensor(reduced)
+        pre_norm = None
+        if residual is not None:
+            reduced = reduced + residual
+            pre_norm = reduced.clone()
+        normed = F.rms_norm(reduced, weight.shape, weight, eps)
+        return normed, pre_norm
+
+    @skipIf(not PLATFORM_SUPPORTS_SYMM_MEM, "Platform does not support symmetric memory")
+    @skip_if_lt_x_gpu(2)
+    @parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_symm_mem_no_residual(self, dtype):
+        self._init_device()
+        M, N = 8, 128
+        eps = 1e-6
+        group_name = dist.group.WORLD.group_name
+
+        x = torch.randn(M, N, device=self.device, dtype=dtype)
+        weight = torch.randn(N, device=self.device, dtype=torch.float32)
+
+        expected_normed, _ = self._reference_allreduce_rmsnorm(x, weight, eps)
+
+        normed, pre_norm = torch.ops.symm_mem.fused_all_reduce_rmsnorm(
+            x, weight, "sum", group_name, eps=eps,
+        )
+
+        self.assertIsNone(pre_norm)
+        torch.testing.assert_close(normed, expected_normed, rtol=1e-2, atol=1e-2)
+
+    @skipIf(not PLATFORM_SUPPORTS_SYMM_MEM, "Platform does not support symmetric memory")
+    @skip_if_lt_x_gpu(2)
+    @parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_symm_mem_with_residual(self, dtype):
+        self._init_device()
+        M, N = 8, 128
+        eps = 1e-6
+        group_name = dist.group.WORLD.group_name
+
+        x = torch.randn(M, N, device=self.device, dtype=dtype)
+        residual = torch.randn(M, N, device=self.device, dtype=dtype)
+        weight = torch.randn(N, device=self.device, dtype=torch.float32)
+
+        expected_normed, expected_pre_norm = self._reference_allreduce_rmsnorm(
+            x, weight, eps, residual=residual,
+        )
+
+        normed, pre_norm = torch.ops.symm_mem.fused_all_reduce_rmsnorm(
+            x, weight, "sum", group_name, residual=residual, eps=eps,
+        )
+
+        self.assertIsNotNone(pre_norm)
+        torch.testing.assert_close(pre_norm, expected_pre_norm, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(normed, expected_normed, rtol=1e-2, atol=1e-2)
+
+    @skipIf(not PLATFORM_SUPPORTS_SYMM_MEM, "Platform does not support symmetric memory")
+    @skip_if_lt_x_gpu(2)
+    def test_symm_mem_per_rank_data_differs(self):
+        self._init_device()
+        M, N = 4, 64
+        eps = 1e-6
+        group_name = dist.group.WORLD.group_name
+
+        x = torch.full(
+            (M, N), float(self.rank + 1), device=self.device, dtype=torch.float32
+        )
+        weight = torch.ones(N, device=self.device, dtype=torch.float32)
+
+        normed, _ = torch.ops.symm_mem.fused_all_reduce_rmsnorm(
+            x, weight, "sum", group_name, eps=eps,
+        )
+
+        expected_sum = sum(range(1, self.world_size + 1))
+        expected_reduced = torch.full(
+            (M, N), float(expected_sum), device=self.device, dtype=torch.float32
+        )
+        expected_normed = F.rms_norm(expected_reduced, weight.shape, weight, eps)
+
+        torch.testing.assert_close(normed, expected_normed, rtol=1e-3, atol=1e-3)
+
+    @skipIf(not PLATFORM_SUPPORTS_SYMM_MEM, "Platform does not support symmetric memory")
+    @skip_if_lt_x_gpu(2)
+    def test_symm_mem_3d_input(self):
+        """Verify the fused kernel handles batched (3D) inputs correctly."""
+        self._init_device()
+        B, M, N = 2, 4, 64
+        eps = 1e-6
+        group_name = dist.group.WORLD.group_name
+
+        x = torch.randn(B, M, N, device=self.device, dtype=torch.bfloat16)
+        weight = torch.randn(N, device=self.device, dtype=torch.float32)
+
+        expected_normed, _ = self._reference_allreduce_rmsnorm(x, weight, eps)
+
+        normed, pre_norm = torch.ops.symm_mem.fused_all_reduce_rmsnorm(
+            x, weight, "sum", group_name, eps=eps,
+        )
+
+        self.assertIsNone(pre_norm)
+        self.assertEqual(normed.shape, x.shape)
+        torch.testing.assert_close(normed, expected_normed, rtol=1e-2, atol=1e-2)
 
 
 if __name__ == "__main__":
