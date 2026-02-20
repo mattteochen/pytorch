@@ -200,7 +200,7 @@ Tests across 5 test classes:
 | `torch/distributed/_symmetric_memory/_fused_allreduce_rmsnorm_triton.py` | Triton kernel (P2P loads, reduce, RMSNorm) |
 | `torch/distributed/_symmetric_memory/__init__.py` | Op registration import |
 | `test/distributed/test_fused_allreduce_rmsnorm.py` | Tests |
-| `dev/profile_fused_allreduce_rmsnorm.py` | Profiling script (3 variants, CUDA graph capture) |
+| `dev/profile_fused_allreduce_rmsnorm.py` | Profiling script (4 variants: baseline, fused_op, compiled, mempool) |
 
 ## torch.compile Integration (SGLang-style)
 
@@ -228,8 +228,9 @@ because the FX pass matches `c10d_functional.all_reduce` nodes specifically.
 
 A profiling script (`dev/profile_fused_allreduce_rmsnorm.py`) demonstrates the
 full integration with a dummy decoder layer (linear → allreduce → add residual
-→ RMSNorm), comparing three variants (NCCL baseline, direct fused op,
-torch.compile) under CUDA graph capture.
+→ RMSNorm), comparing four variants under CUDA graph capture: NCCL baseline,
+direct fused op (workspace copy), torch.compile (FX pass fusion), and memory
+pool zero-copy (matmul output in symmetric memory).
 
 ## Profiling Results (4× GPU, H100, hidden=4096, seq=2048)
 
@@ -242,6 +243,60 @@ torch.compile) under CUDA graph capture.
 The fused Triton kernel replaces NCCL allreduce (24.8ms) + add + rms_norm
 (1.7ms) with a single 1.5ms kernel, at the cost of two barrier kernels
 (~11ms total in this config — dominated by barrier wait time, not overhead).
+
+## Memory Pool Zero-Copy Variant
+
+The default kernel path copies the input into a symmetric memory workspace
+(`Memcpy DtoD`, ~5.7us for 16 MB bf16). The **memory pool variant** eliminates
+this copy by allocating the upstream compute output directly in symmetric
+memory.
+
+**Setup (once, before CUDA graph capture):**
+```python
+import torch.distributed._symmetric_memory as symm_mem
+
+mempool = symm_mem.get_mem_pool(device)
+with torch.cuda.use_mem_pool(mempool):
+    h_symm = torch.empty(M, N, device=device, dtype=torch.bfloat16)
+sm_hdl = symm_mem.rendezvous(h_symm, dist.group.WORLD)
+peer_bufs = _make_peer_bufs(sm_hdl, h_symm.shape, h_symm.dtype)
+```
+
+**Per-iteration (captured in CUDA graph):**
+```python
+torch.mm(intermediate, weight.t(), out=h_symm)   # write directly into symm mem
+output, residual_out = _launch_fused_kernel(       # barrier → kernel → barrier
+    sm_hdl, peer_bufs, h_symm, norm_weight, residual=residual, eps=eps,
+)
+```
+
+**Key details:**
+
+- `rendezvous` is a collective on first call (IPC handle exchange) but cached
+  per block+group thereafter — effectively free in steady state.
+- `use_mem_pool` and `rendezvous` happen *before* CUDA graph capture so the
+  graph only sees GPU ops (matmul, barriers, Triton kernel) with fixed
+  addresses.
+- The pre-kernel barrier is required (wait for all ranks' matmul to finish).
+  The post-kernel barrier is also required in a loop — without it, a rank
+  could overwrite its symmetric buffer (via the next iteration's matmul) while
+  another rank is still reading from it. Eliminating the post-barrier would
+  require double buffering.
+
+**Profiling results (4× GPU, CUDA graphs, hidden=4096, seq=2048):**
+
+| Metric | fused_op (workspace copy) | mempool (zero-copy) |
+|--------|--------------------------|---------------------|
+| Memcpy DtoD | 114us (5.7us/call) | **0** |
+| barrier (40 calls) | 723us (18.1us/call) | 944us (23.6us/call) |
+| fused kernel (20 calls) | 1.657ms (82.8us/call) | 1.682ms (84.1us/call) |
+| **Total CUDA** | **6.682ms** | **6.802ms** |
+
+The DtoD copy is eliminated but the total is ~1.8% slower due to slightly
+higher barrier cost (likely TLB/cache effects from the different backing
+allocation). For this tensor size (16 MB) the copy is only ~5.7us — the
+optimization becomes more relevant for larger tensors or when composing with
+upstream kernels that can also write directly to the pool.
 
 ## Open Questions / Future Work
 
@@ -282,3 +337,8 @@ The fused Triton kernel replaces NCCL allreduce (24.8ms) + add + rms_norm
    op doesn't produce. Supporting training would require either: (a) having the
    fused op also return the intermediates, or (b) recomputing them from the
    pre_norm output in the backward graph.
+
+8. **Memory pool double buffering.** The post-kernel barrier (~5us) could be
+   eliminated by alternating between two symmetric memory buffers across
+   iterations. While rank N reads from buffer A, the next matmul writes to
+   buffer B — removing the read-after-write hazard without synchronization.
