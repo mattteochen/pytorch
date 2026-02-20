@@ -3,12 +3,13 @@ Profile fused allreduce + RMSNorm: end-to-end SGLang-style repro.
 
 Simulates a decoder layer: linear (MoE stand-in) → allreduce → residual add → RMSNorm.
 
-Profiles five variants:
-  1. baseline  – NCCL all_reduce + eager F.rms_norm
-  2. fused_op  – torch.ops.symm_mem.fused_all_reduce_rmsnorm (direct, workspace copy)
-  3. compiled  – torch.compile with FX pass fusion
-  4. mempool   – mem pool zero-copy: matmul output lands in symmetric memory
-  5. kraken    – single kernel with device-side sync (no barrier kernel launches)
+Profiles six variants:
+  1. baseline     – NCCL all_reduce + eager F.rms_norm
+  2. fused_op     – torch.ops.symm_mem.fused_all_reduce_rmsnorm (direct, host-side barriers)
+  3. compiled     – torch.compile with inductor P2P codegen (kraken device-side sync)
+  4. mempool      – mem pool zero-copy: matmul output lands in symmetric memory
+  5. kraken       – kraken handwritten single kernel (device-side sync, reference)
+  6. flashinfer   – FlashInfer trtllm_allreduce_fusion one-shot (no quant)
 
 Launch:
     torchrun --nproc_per_node=NUM_GPUS dev/profile_fused_allreduce_rmsnorm.py
@@ -45,7 +46,7 @@ from kraken.fused.one_shot_all_reduce_bias_rms_norm import (
 
 
 HIDDEN = 2880
-NUM_TOKENS = 1  # decode tokens (flattened, no batch dim in SGLang)
+NUM_TOKENS = 32  # decode tokens (flattened, no batch dim in SGLang)
 INTER = 2880 * 4  # MoE/FFN intermediate dim
 EPS = 1e-5
 WARMUP_ITERS = 10
@@ -81,7 +82,7 @@ class DummyDecoderLayer(nn.Module):
 
 
 def _make_compiled_ar_norm(eps: float):
-    """Build a torch.compile'd wrapper that the FX pass can fuse."""
+    """Inductor generates a single P2P kernel with kraken device-side sync."""
 
     @torch.compile(
         options={"_fused_all_reduce_rmsnorm": True},
@@ -201,16 +202,20 @@ def main():
 
     _profile("fused_op", fused_op_call, rank, cuda_graph=True)
 
-    # --- Variant 3: torch.compile with FX pass fusion ---
+    # --- Variant 3: torch.compile (inductor P2P codegen, kraken sync) ---
     ar_norm_compiled = _make_compiled_ar_norm(EPS)
 
     def compiled_call():
         h = layer.down_proj(F.silu(layer.moe_proj(x)))
         return ar_norm_compiled(h, residual, weight, group_name)
 
-    _profile("compiled", compiled_call, rank, warmup=WARMUP_ITERS + 5, cuda_graph=True)
+    _profile(
+        "compiled", compiled_call, rank,
+        warmup=WARMUP_ITERS + 5, cuda_graph=True,
+    )
 
     # --- Variant 4: mem pool (zero-copy, no DtoD workspace copy) ---
+    # (Uses the old handwritten Triton kernel with host-side barriers)
     # Pre-allocate output in symmetric memory and rendezvous BEFORE capture
     # so the CUDA graph only sees GPU ops with fixed addresses.
     mempool = symm_mem.get_mem_pool(device)
@@ -258,6 +263,59 @@ def main():
         return kraken_output
 
     _profile("kraken", kraken_call, rank, cuda_graph=True)
+
+    # --- Variant 6: FlashInfer trtllm_allreduce_fusion (one-shot, no quant) ---
+    try:
+        import flashinfer.comm as flashinfer_comm
+
+        fi_max_token = 4096
+        fi_ipc_handles, fi_workspace = (
+            flashinfer_comm.trtllm_create_ipc_workspace_for_all_reduce_fusion(
+                tp_rank=rank,
+                tp_size=dist.get_world_size(),
+                max_token_num=fi_max_token,
+                hidden_dim=HIDDEN,
+                group=dist.group.WORLD,
+            )
+        )
+        fi_norm_out = torch.empty_like(x)
+        fi_residual_out = torch.empty_like(x)
+
+        def flashinfer_call():
+            h = layer.down_proj(F.silu(layer.moe_proj(x)))
+            flashinfer_comm.trtllm_allreduce_fusion(
+                allreduce_in=h,
+                token_num=h.shape[0],
+                residual_in=residual,
+                residual_out=fi_residual_out,
+                norm_out=fi_norm_out,
+                rms_gamma=weight,
+                rms_eps=EPS,
+                hidden_dim=HIDDEN,
+                workspace_ptrs=fi_workspace,
+                pattern_code=flashinfer_comm.AllReduceFusionPattern.kARResidualRMSNorm,
+                allreduce_out=None,
+                quant_out=None,
+                scale_out=None,
+                layout_code=None,
+                scale_factor=None,
+                use_oneshot=True,
+                world_rank=rank,
+                world_size=dist.get_world_size(),
+                launch_with_pdl=True,
+                trigger_completion_at_end=True,
+                fp32_acc=True,
+            )
+            return fi_norm_out
+
+        _profile("flashinfer", flashinfer_call, rank, cuda_graph=True)
+
+        flashinfer_comm.trtllm_destroy_ipc_workspace_for_all_reduce(
+            fi_ipc_handles, dist.group.WORLD
+        )
+    except (ImportError, AttributeError, RuntimeError) as e:
+        if rank == 0:
+            print(f"\nSkipping FlashInfer variant: {e}")
 
     dist.destroy_process_group()
     if rank == 0:
