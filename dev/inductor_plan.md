@@ -406,8 +406,192 @@ the codegen to emit either one-shot P2P (small) or two-shot
 reduce-scatter + allgather (large) based on size. This keeps fusion
 benefits at all sizes. See "Two-shot P2P allreduce" in Medium Term.
 
+## Sync Strategy Plan: Host Barriers
+
+Profiling confirmed host-side barriers beat both device-side CAS (our
+compiled kernel, kraken one-shot) and kraken two-shot across all token
+counts. The two-shot algorithm's halved NVLink traffic doesn't
+compensate for its 3 device-side CAS barriers, and one-shot NVLink
+traffic is negligible at the sizes where P2P beats NCCL (< 1MB).
+
+**Conclusion:** Switch the codegen to host-side barriers + one-shot
+pull. This is the fused_op model (2 host barrier launches + 1 Triton
+compute kernel) applied to the inductor-generated kernel.
+
+### Profiling evidence (2xGB200, hidden=2880, `--timer`)
+
+| tokens | compiled (CAS) | kraken 2-shot | fused_op (host barrier) |
+|--------|---------------|---------------|------------------------|
+| 1      | 11 µs         | ~11 µs        | 14 µs                  |
+| 32     | ~18 µs        | ~20 µs        | ~15 µs                 |
+| 1024   | 50 µs         | ~75 µs        | 24 µs                  |
+| 2048   | 95 µs         | ~140 µs       | 33 µs                  |
+
+Host barriers win at all medium-to-large sizes. At 1 token, device-side
+CAS saves ~3µs (avoids 2 barrier launches) — but the 1-token case is
+already fast enough. The consistent 2–3x win at larger sizes matters
+more.
+
+### Implementation: switch codegen from CAS to host barriers
+
+**Approach:** Remove device-side `_symm_mem_sync` from inside the
+generated Triton kernel. Instead, emit host-side `symm_mem.barrier()`
+calls before and after the kernel launch in the wrapper code.
+
+**What changes in the generated code:**
+
+Before (current, device-side CAS):
+```
+kernel(input, ..., signal_pad_ptrs, RANK, WORLD_SIZE):
+    # prologue: copy input → symm_mem
+    tl.store(local_buf, tl.load(input))
+    _symm_mem_sync(signal_pad_ptrs, ...)    # device-side CAS
+
+    # P2P reduce + compute
+    for peer in range(WORLD_SIZE):
+        acc += tl.load(peer_buf + offsets)
+    # ... add residual, RMSNorm ...
+
+    _symm_mem_sync(signal_pad_ptrs, ...)    # device-side CAS
+```
+
+After (host-side barriers):
+```
+# wrapper code (Python):
+symm_mem_copy_and_barrier(input, workspace, group_name)  # copy + barrier
+kernel(input, ..., RANK, WORLD_SIZE):                     # no signal_pad_ptrs
+    # P2P reduce + compute (no sync inside kernel)
+    for peer in range(WORLD_SIZE):
+        acc += tl.load(peer_buf + offsets)
+    # ... add residual, RMSNorm ...
+symm_mem_barrier(workspace, group_name)                   # epilogue barrier
+```
+
+**Files to modify:**
+
+1. `torch/_inductor/runtime/symm_mem_helpers.py` — Add
+   `symm_mem_copy_and_barrier()` and `symm_mem_barrier()` wrapper
+   functions that do `workspace.copy_(input)` + `sm_hdl.barrier()`.
+
+2. `torch/_inductor/codegen/triton.py`:
+   - `_codegen_symm_mem_prologue()` — gut it: remove `_symm_mem_sync`
+     call and the copy loop. The copy happens host-side now.
+   - `_codegen_symm_mem_epilogue()` — gut it: remove `_symm_mem_sync`.
+   - `call_kernel()` — emit `symm_mem_copy_and_barrier(...)` before the
+     kernel call and `symm_mem_barrier(...)` after.
+   - Remove `symm_signal_pad_ptrs` from kernel arguments.
+   - Remove kraken `_symm_mem_sync` import from codegen.
+
+3. `torch/_inductor/codegen/triton.py` (persistent reduction override):
+   - Keep `override_persistent_reduction = True` for P2P kernels.
+     The P2P loads still need to read the full row in one pass.
+
+**What stays the same:**
+- The FX pass (replaces `all_reduce + wait` with `p2p_allreduce`)
+- The IR lowering (`SymmMemP2PAllReduce` Pointwise)
+- The P2P reduce load codegen (`symm_mem_p2p_reduce_load` inner_fn)
+- Buffer pointer arrays (`buffer_ptrs_dev`)
+- The fusion with downstream compute (add + RMSNorm)
+
+## Push Model Plan: External Triton Helpers
+
+A future optimization: replace the current pull model (each rank reads
+from all peers over NVLink) with a push model (each rank writes its
+data to all peers' local buffers). The receiver then reads from its own
+local memory (cheap L2 hit) instead of remote NVLink reads.
+
+This is what FlashInfer's Lamport protocol does. It avoids both
+per-block atomics AND explicit barriers by using sentinel values
+(`-0.0`) to signal completion.
+
+### Why push can be faster than pull
+
+- **NVLink write is fire-and-forget:** The writer doesn't stall waiting
+  for data to return. With pull, every `tl.load` from a peer blocks
+  until the data traverses NVLink.
+- **Receiver reads locally:** Once data arrives, it's in the receiver's
+  L2 cache. Local loads are ~10x cheaper than NVLink loads.
+- **No barriers at all (with sentinels):** The receiver polls for
+  non-sentinel values, which acts as an implicit sync. No CAS atomics,
+  no barrier kernel launches.
+
+### Implementation approach: external Triton JIT helpers
+
+The codegen already imports and calls external `@triton.jit` functions
+(kraken's `_symm_mem_sync`). The same pattern works for push helpers.
+
+Create `torch/_inductor/runtime/p2p_push_helpers.py`:
+
+```python
+@triton.jit
+def push_to_peers(buffer_ptrs, data, offset, mask, rank, world_size):
+    """Write local data to all peers' symmetric memory buffers."""
+    for peer in tl.static_range(world_size):
+        peer_buf = tl.load(buffer_ptrs + peer).to(tl.pointer_type(tl.bfloat16))
+        tl.store(peer_buf + offset, data, mask=mask)
+    # System-scope fence: make all stores visible to other GPUs
+    _fence_sys()
+
+@triton.jit
+def _fence_sys():
+    tl.inline_asm_elementwise(
+        "fence.sc.sys;", "=r", [], dtype=tl.int32, is_pure=False, pack=1,
+    )
+
+@triton.jit
+def poll_for_sentinel(addr, mask):
+    """Spin until value at addr is not -0.0 (Lamport sentinel)."""
+    val = tl.load(addr, mask=mask)
+    while _is_neg_zero(val):
+        val = _volatile_load(addr, mask)
+    return val
+
+@triton.jit
+def _volatile_load(addr, mask):
+    """Bypass cache to see latest write from peer."""
+    tl.inline_asm_elementwise(
+        "ld.volatile.global.b16 $0, [$1];",
+        "=h, l", [addr], dtype=tl.bfloat16, is_pure=False, pack=1,
+    )
+```
+
+The codegen would emit:
+```python
+from torch._inductor.runtime.p2p_push_helpers import push_to_peers, poll_for_sentinel
+```
+
+### Challenges
+
+- **Buffer layout:** Each peer pushes to a distinct region of the
+  receiver's buffer (to avoid write collisions), requiring
+  `world_size × data_size` symmetric memory per rank. Or use the
+  sentinel approach where all peers write to the same location and
+  data replaces the sentinel in-place.
+- **Sentinel stripping:** Buffer must be initialized to `-0.0` before
+  each iteration. During reduction, sentinel values must be excluded.
+  This adds per-element overhead during the poll loop.
+- **Volatile loads:** Needed to bypass L2 cache and see fresh data from
+  peers. `ld.volatile.global` is more expensive than normal loads but
+  cheaper than NVLink reads.
+- **Correctness with CUDA graphs:** The sentinel init must happen
+  inside the graph. Double buffering (alternating two buffers with
+  opposite sentinels) avoids the init step.
+
+### Ordering of improvements
+
+1. **First:** Switch to host barriers (above). Simple, immediate win
+   for medium-to-large tensors. No new PTX, just restructure where
+   barriers are emitted.
+2. **Second:** Gate FX pass on tensor size. Quick config change.
+3. **Third (optional):** Push model with sentinels. More complex but
+   eliminates all sync overhead. Only worthwhile if host barrier
+   latency (~6µs) is a bottleneck for the target workload.
+
 ## Improvements: Short Term
 
+- [ ] **Switch to host-side barriers:** Remove device-side CAS from
+      kernel, emit `symm_mem.barrier()` in wrapper before/after kernel.
+      Immediate ~2x speedup at 1024+ tokens.
 - [ ] **Gate FX pass on tensor size:** Only replace `all_reduce + wait`
       with P2P when `numel * element_size < threshold` (default 1MB).
       Implement in `_can_replace()` using `node.meta["val"]`.
@@ -418,10 +602,17 @@ benefits at all sizes. See "Two-shot P2P allreduce" in Medium Term.
 
 ## Improvements: Medium Term
 
+- [ ] **Push model with sentinel sync:** Replace pull (NVLink reads
+      from peers) with push (NVLink writes to peers + local polling).
+      Implement via external `@triton.jit` helpers using
+      `tl.inline_asm_elementwise` for `fence.sc.sys` and
+      `ld.volatile.global`. Eliminates all barrier overhead.
 - [ ] **Two-shot P2P allreduce:** Implement reduce-scatter + allgather
       in the codegen for large tensors, matching kraken's `two_shot_`
       and FlashInfer's two-shot mode.  This halves NVLink traffic from
-      `world_size × data` to `2 × data`.
+      `world_size × data` to `2 × data`. Only useful if combined with
+      host barriers (device-side CAS with 3 barriers is worse than
+      one-shot + host barriers, per profiling).
 - [ ] **LayerNorm variant:** FX pass already general (replaces all_reduce+wait).
       Inductor generates LayerNorm kernels automatically.
 - [ ] **Training support:** Currently inference-only. Training needs
