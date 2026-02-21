@@ -3,15 +3,16 @@ Profile fused allreduce + RMSNorm: end-to-end SGLang-style repro.
 
 Simulates a decoder layer: linear (MoE stand-in) → allreduce → residual add → RMSNorm.
 
-Profiles eight variants:
+Profiles nine variants:
   1. baseline          – NCCL all_reduce + eager F.rms_norm
   2. fused_op          – torch.ops.symm_mem.fused_all_reduce_rmsnorm (direct, host-side barriers)
   3. compiled          – torch.compile with inductor P2P codegen (kraken device-side sync)
   4. compiled_plain    – torch.compile default settings (no fused allreduce+rmsnorm option)
   5. compiled_mempool  – compiled + mempool zero-copy (matmul → symm mem, single kernel)
   6. mempool           – mem pool zero-copy with handwritten kernel (host-side barriers)
-  7. kraken            – kraken handwritten single kernel (device-side sync, reference)
-  8. flashinfer        – FlashInfer trtllm_allreduce_fusion one-shot (no quant)
+  7. kraken            – kraken handwritten single kernel (one-shot, device-side sync)
+  8. kraken_2shot      – kraken handwritten single kernel (two-shot, device-side sync)
+  9. flashinfer        – FlashInfer trtllm_allreduce_fusion one-shot (no quant)
 
 Launch (torch profiler):
     torchrun --nproc_per_node=NUM_GPUS dev/profile_fused_allreduce_rmsnorm.py
@@ -51,6 +52,9 @@ sys.path.insert(
 )
 from kraken.fused.one_shot_all_reduce_bias_rms_norm import (
     one_shot_all_reduce_bias_rms_norm,
+)
+from kraken.fused.two_shot_all_reduce_bias_rms_norm import (
+    two_shot_all_reduce_bias_rms_norm,
 )
 
 
@@ -397,7 +401,30 @@ def main():
 
     results.append(("kraken", _profile("kraken", kraken_call, rank, cuda_graph=True, nsys_mode=nsys_mode, timer_mode=timer_mode)))
 
-    # --- Variant 8: FlashInfer trtllm_allreduce_fusion (one-shot, no quant) ---
+    # --- Variant 8: kraken two-shot (device-side sync, single kernel launch) ---
+    kraken_2shot_symm_buf = symm_mem.empty(
+        (num_tokens, HIDDEN),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    symm_mem.rendezvous(kraken_2shot_symm_buf, group=dist.group.WORLD)
+    kraken_2shot_output = torch.empty_like(x)
+
+    def kraken_2shot_call():
+        h = x
+        two_shot_all_reduce_bias_rms_norm(
+            kraken_2shot_symm_buf,
+            h,
+            residual,
+            weight,
+            kraken_2shot_output,
+            eps=EPS,
+        )
+        return kraken_2shot_output
+
+    results.append(("kraken_2shot", _profile("kraken_2shot", kraken_2shot_call, rank, cuda_graph=True, nsys_mode=nsys_mode, timer_mode=timer_mode)))
+
+    # --- Variant 9: FlashInfer trtllm_allreduce_fusion (one-shot, no quant) ---
     try:
         import flashinfer.comm as flashinfer_comm
 
