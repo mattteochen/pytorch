@@ -112,15 +112,6 @@ redundancy, and the op falls back to the same ops that would have run anyway.
 The kernel uses P2P-mapped symmetric memory buffers. Each rank's data is
 accessible to all other ranks via direct GPU memory loads (NVLink).
 
-**Host-side flow:**
-```
-1. get_symm_mem_workspace(group_name, input_bytes)  — cached allocation
-2. Copy local input into the symmetric buffer
-3. symm_mem.barrier(channel=0) — all ranks' data is now visible
-4. Launch Triton kernel — P2P loads from all ranks' buffers
-5. symm_mem.barrier(channel=0) — safe to reuse buffers
-```
-
 **Kernel logic** (one program per row, M programs total):
 ```
 for each row (parallelized across programs):
@@ -140,15 +131,304 @@ with `WORLD_SIZE` as a `tl.constexpr`, so unused rank branches are eliminated
 at compile time. All accumulation happens in fp32 registers regardless of
 input dtype.
 
-**Synchronization:** Host-side `symm_mem.barrier()` provides lightweight
-synchronization before and after the kernel. This is the same mechanism used
-by all existing symmetric memory ops in PyTorch (`_pipelined_all_gather`,
-`_fused_all_gather_matmul`, etc.). No NVSHMEM dependency required.
+## Synchronization: Three Approaches Compared
 
-**GPU timeline (3 kernel launches per iteration):**
+This is the most performance-critical design axis. Three distinct
+synchronization strategies have been implemented and benchmarked, each
+with fundamentally different trade-offs. All three use symmetric memory
+(P2P-mapped NVLink buffers) but differ in how they coordinate ranks.
+
+### Data flow: Pull vs Push
+
+The three approaches split into two data-flow models:
+
+**Pull model** (our kernel, kraken): Each rank copies its data into its
+own symmetric buffer, waits for all peers to do the same (barrier), then
+reads from all peers' buffers over NVLink.
+
 ```
-barrier (~5us) → fused kernel (P2P loads + reduce + RMSNorm) → barrier (~5us)
+rank 0: store(my_buf)  ──barrier──  load(peer_1_buf) ← NVLink read
+rank 1: store(my_buf)  ──barrier──  load(peer_0_buf) ← NVLink read
 ```
+
+**Push model** (FlashInfer): Each rank writes its data directly into
+every peer's local buffer over NVLink. The receiver polls its own local
+memory for data arrival.
+
+```
+rank 0: store(peer_0_local + rank0_slot)  store(peer_1_local + rank0_slot)  ← NVLink writes
+rank 1: store(peer_0_local + rank1_slot)  store(peer_1_local + rank1_slot)  ← NVLink writes
+        ... each rank polls its own local memory ...
+```
+
+The pull model requires an explicit barrier between "all writes done" and
+"start reading." The push model eliminates this: data arrival IS readiness
+(see Lamport sentinel below).
+
+### Strategy 1: Host-side barriers (fused_op, mempool)
+
+**Used by:** handwritten Triton kernel
+(`torch/distributed/_symmetric_memory/_fused_allreduce_rmsnorm_triton.py`)
+
+Two `symm_mem.barrier()` kernel launches bracket the compute kernel.
+Each barrier is a **separate 1-block CUDA kernel** (`barrier_kernel` in
+`CUDASymmetricMemory.cu`):
+
+```cpp
+// Launched as: barrier_kernel<<<1, max(warp_size, world_size), 0, stream>>>
+static __global__ void barrier_kernel(uint32_t** signal_pads, ...) {
+  if (threadIdx.x < world_size) {
+    auto target_rank = threadIdx.x;
+    // CAS loop: spin until slot is 0, atomically set to 1 (release)
+    try_put_signal<memory_order_release>(
+        signal_pads[target_rank] + world_size * channel + rank, ...);
+    // CAS loop: spin until slot is 1, atomically reset to 0 (acquire)
+    try_wait_signal<memory_order_acquire>(
+        signal_pads[rank] + world_size * channel + target_rank, ...);
+  }
+}
+```
+
+Each CAS (`cas<Sem>(addr, expected, desired)`) is a system-scope
+`cuda::atomic_ref` compare-and-swap. The auto-reset (put writes `0→1`,
+wait resets `1→0`) makes it CUDA-graph friendly.
+
+**GPU timeline:** DtoD copy + barrier + kernel + barrier = 4 items.
+
+**Cost:** Fixed at `2 × (world_size - 1)` system-scope CAS ops per
+barrier, regardless of grid size. With world_size=2, that's 2 CAS per
+barrier × 2 barriers = 4 CAS total per iteration.
+
+### Strategy 2: Device-side per-block atomics (compiled, kraken)
+
+**Used by:** inductor-generated kernel (via kraken's `symm_mem_sync`)
+
+Same CAS mechanism as the host barrier, but executed **inside the
+compute kernel by every block** using inline PTX:
+
+```python
+# kraken/_ptx_utils/symm_mem_barrier.py
+@triton.jit
+def symm_mem_sync(signal_pad_ptrs, block_id, rank, world_size, ...):
+    # Each block gets its own signal pad slot: block_id * world_size + rank
+    send_addrs = remote_signal_pad_addrs + block_id * world_size + rank
+    wait_addrs = local_signal_pad_addr + block_id * world_size + remote_ranks
+
+    if hasPreviousMemAccess:
+        tl.debug_barrier()           # __syncthreads — flush intra-block stores
+
+    if flat_tid < world_size:        # only thread 0 (or 0..WS-1) does the sync
+        _send_signal(send_addrs, "release")   # atom.global.release.sys.cas 0→1
+        _wait_signal(wait_addrs, "acquire")   # atom.global.sys.acquire.cas 1→0
+
+    if hasSubsequentMemAccess:
+        tl.debug_barrier()           # __syncthreads — make acquired data visible
+```
+
+**GPU timeline:** Single kernel (prologue copy + sync + P2P loads +
+reduce + norm + sync).
+
+**Cost:** `num_blocks × 2 sync_points × 2 × (world_size - 1)` system-scope
+CAS ops. With 1024 tokens, world_size=2: `1024 × 2 × 2 = 4096` CAS —
+vs 4 for the host barrier approach. Each CAS is a system-scope atomic
+over NVLink, which is expensive.
+
+### Strategy 3: Lamport sentinel protocol (FlashInfer)
+
+**Used by:** FlashInfer `trtllm_allreduce_fusion`
+(`third_party/flashinfer/include/flashinfer/comm/trtllm_allreduce_fusion.cuh`)
+
+**Zero barriers, zero atomics.** Uses the data itself as the sync signal.
+
+**Key insight: the data IS the signal.** There is no separation between
+"write data" and "signal that data is ready." In the CAS approaches,
+these are two distinct operations (store data, then atomic on signal pad)
+that require `release`/`acquire` ordering. In Lamport, they are the same
+store — when the receiver sees non-sentinel data, it knows the write
+is complete because there is nothing to reorder.
+
+**Mechanism:**
+
+1. Comm buffers are pre-filled with `-0.0` (negative zero, bit pattern
+   `0x8000` for bf16) as sentinel.
+
+2. Writers strip `-0.0` from real data (`remove_neg_zero`) then push
+   to ALL peers' local buffers via NVLink:
+
+```cpp
+for (int idx = access_id; idx < tot_access; idx += access_stride) {
+    vec_t<T, VEC_SIZE> val;
+    val.load(reinterpret_cast<T*>(params.allreduce_in) + idx * VEC_SIZE);
+    remove_neg_zero<T, VEC_SIZE>(val);          // guarantee no -0.0
+    for (int r = 0; r < NRanks; ++r) {
+        val.store(reinterpret_cast<T*>(comm.data_bufs[r]) +
+                  (params.rank * tot_access + idx) * VEC_SIZE);  // NVLink write
+    }
+}
+```
+
+3. Receivers poll their **own local memory** via volatile loads until
+   data is no longer `-0.0`:
+
+```cpp
+while (!done) {
+    done = true;
+    for (int r = 0; r < NRanks; ++r) {
+        vals[r].load_global_volatile(               // local DRAM read, NOT NVLink
+            reinterpret_cast<T*>(comm.data_bufs[params.rank]) + ...);
+        done &= !has_neg_zero<T, VEC_SIZE>(vals[r]);  // sentinel check
+    }
+}
+```
+
+The volatile load (`ld.global.volatile`) bypasses L1 cache and reads
+from L2/DRAM, ensuring the poll sees the remote write. Since the writer
+stores to the receiver's local memory (via NVLink P2P mapping), the
+receiver's volatile load is a cheap local DRAM read, not an NVLink
+traversal.
+
+**Triple buffering eliminates the post-iteration barrier.** The comm
+flag rotates through `0 → 1 → 2 → 0`. Each iteration writes to buffer
+`flag % 3` and clears buffer `(flag + 2) % 3` (from 2 iterations ago):
+
+```
+Iter 0: write buf[0], clear buf[1]  (wrap)
+Iter 1: write buf[1], clear buf[2]
+Iter 2: write buf[2], clear buf[0]  ← buf[0] last used in iter 0, safe
+Iter 3: write buf[0], clear buf[1]  ← buf[0] last used in iter 2, safe
+```
+
+By the time a buffer is reused, no rank can still be reading from it.
+The read-after-write hazard is eliminated by construction.
+
+**Cost:** 0 kernel launches for sync, 0 system-scope atomics. Sync cost
+is O(data_size) local volatile loads (cheap) + O(data_size) sentinel
+clearing + NRanks NVLink writes per element. Uses 3x comm buffer memory.
+
+### Summary: sync cost at scale
+
+| | Pre-sync mechanism | Post-sync mechanism | Kernel launches | NVLink atomics per iter (WS=2, 1024 tokens) |
+|---|---|---|---|---|
+| **Host barriers** | CAS in dedicated 1-block kernel | Same | 3 | 4 (fixed) |
+| **Device-side** | CAS per block (inline PTX) | Same | 1 | ~8192 (scales with grid) |
+| **Lamport** | Sentinel poll (local volatile load) | **none** (triple buffering) | 1 | 0 |
+
+**Benchmark results (2xGB200, HIDDEN=2880, CUDA graphs):**
+
+| Approach | 1 token | 1024 tokens | Scaling |
+|----------|---------|-------------|---------|
+| Device-side atomics (compiled) | **11.7us** | 49.8us | Poor — O(blocks) NVLink atomics |
+| Host barriers (fused_op) | 14.3us | **24.4us** | Good — O(1) barrier cost |
+| Lamport (FlashInfer, one-shot) | **5.2us** | 35.8us | Moderate — O(data) local polls |
+
+At 1 token, device-side sync wins by eliminating 2 barrier launches
+(~3us savings). At 1024 tokens, per-block atomics overwhelm any
+launch-latency savings.
+
+### FlashInfer one-shot vs two-shot
+
+FlashInfer auto-switches at `kOneShotMaxToken = 128`:
+- **One-shot** (≤128 tokens): Lamport sentinel protocol, all-to-all push
+- **Two-shot** (>128 tokens): Reduce-scatter + allgather with only 2
+  device-side barriers (using `st.global.release.sys`/`ld.global.acquire.sys`),
+  halving NVLink traffic from `NRanks × data` to `2 × data`
+
+The profiling script passes `use_oneshot=None` to let FlashInfer
+auto-select.
+
+### Post-iteration barrier purpose
+
+The second sync (host barrier or device-side epilogue) is NOT needed for
+the norm computation — each rank computes norm independently after reducing.
+It protects against a **read-after-write hazard across iterations**: without
+it, rank 0 could start iteration N+1's copy into its symmetric buffer while
+rank 1 is still reading from rank 0's buffer in iteration N.
+
+Three ways to eliminate this:
+- **Double buffering:** Alternate between two symmetric buffers. Cost: 2x
+  comm buffer memory.
+- **Triple buffering (FlashInfer):** Rotate through 3 buffers, clear the
+  one from 2 iterations ago. Cost: 3x memory, but also eliminates the
+  pre-iteration barrier via the sentinel protocol.
+- **Separate output buffer:** If the reduced result is written to a
+  non-symmetric output (not back to the comm buffer), reads and writes
+  don't conflict. Doesn't help when the comm buffer IS the next
+  iteration's input.
+
+## Why We Can't Easily Adopt Lamport
+
+FlashInfer's Lamport protocol is the fastest approach at small token
+counts and avoids all barriers. Adopting it in the inductor codegen
+would require addressing five architectural gaps:
+
+### 1. Pull → Push model change
+
+The entire codegen pipeline is built around pull: `symm_mem_p2p_reduce_load`
+emits `tl.load` from peer buffers. Lamport requires push: each rank
+stores to all peers' local buffers, then polls local memory. This is a
+fundamentally different IR op and data flow through the scheduler.
+
+```
+Current (pull):   prologue: copy → my_buf, SYNC → tl.load(peer_buf) → reduce
+Lamport (push):   tl.store(peer_0_local), tl.store(peer_1_local) → poll_local → reduce
+```
+
+### 2. No volatile loads in Triton
+
+FlashInfer uses `load_global_volatile` (CUDA C++) to bypass L1 cache
+during the sentinel poll. Triton has no `tl.load` volatile mode — the
+compiler may hoist or cache the load, breaking the spin loop. Inline
+PTX would work but is awkward for per-element polls in generated code.
+
+### 3. Triple-buffer infrastructure
+
+FlashInfer manages its own IPC workspace with 3x comm buffers and a
+rotating flag (`flag_value % 3`). PyTorch's symmetric memory API
+(`get_symm_mem_workspace`) provides a single buffer with explicit
+barriers. Supporting triple buffering requires changes to the
+`SymmetricMemory` C++ class and the `symm_mem_helpers.py` runtime.
+
+### 4. Sentinel value constraint
+
+The `-0.0` trick only works for floating-point types where:
+- `-0.0` is bitwise distinct from `+0.0` and all other values
+- Real data can reliably avoid `-0.0` (`remove_neg_zero` strips it)
+- The sentinel check is cheap (bitwise comparison)
+
+This doesn't generalize to integer types. FlashInfer handles FP4/FP8
+quant by quantizing AFTER the reduce, so the comm buffer is always in
+the original float type.
+
+### 5. What it would take
+
+| Change | Files affected |
+|--------|---------------|
+| Push-model IR op (store-to-all-peers + poll-local) | `ir.py`, `ops_handler.py`, `codegen/triton.py` |
+| Volatile load in Triton (inline PTX) | `codegen/triton.py` P2P load codegen |
+| Triple-buffered workspace | `symm_mem_helpers.py`, `SymmetricMemory` C++ |
+| Sentinel stripping on write | codegen prologue |
+| Remove epilogue sync | codegen epilogue |
+
+The pragmatic near-term fix is gating the FX pass on tensor size: use
+P2P with device-side sync for small tensors (where it wins), fall back
+to NCCL for large tensors (where it doesn't).
+
+## Persistent Reduction Analysis
+
+The inductor-generated kernel forces persistent reduction via
+`override_persistent_reduction = True` when the kernel contains
+`symm_mem_p2p_reduce_load` ops. This is the correct choice:
+
+- Without the override, the heuristic chooses looped reduction for
+  `r0_numel=2880 > threshold=1024`, causing P2P loads to repeat per loop
+  chunk: `world_size × num_chunks` NVLink loads instead of just
+  `world_size`.
+- The handwritten kernel (`fused_op`) also uses persistent-style reduction
+  (`BLOCK_N = next_power_of_2(N)`, one block handles the full row).
+- The performance gap at large token counts is caused by device-side sync
+  scaling, not the reduction strategy. Evidence: `compiled` (49.8us) is
+  nearly identical to `compiled_plain` (51.2us, standard NCCL + separate
+  kernels) at 1024 tokens.
 
 ## Patterns Matched
 
@@ -163,49 +443,11 @@ barrier (~5us) → fused kernel (P2P loads + reduce + RMSNorm) → barrier (~5us
 
 ## Requirements
 
-The Triton kernel path requires symmetric memory (P2P access over NVLink):
-
-```
-                             ┌─────────────────────────┐
-  NVLink-connected GPUs ─────┤  get_symm_mem_workspace  │
-  CUDA backend ──────────────┤  symm_mem.barrier()      │
-  Triton ────────────────────┤  P2P tl.load from peers  │
-                             └─────────────────────────┘
-```
-
+The Triton kernel path requires symmetric memory (P2P access over NVLink).
 Without P2P access, the feature still works — it just uses the decomposed
 fallback (NCCL all_reduce + standard rms_norm).
 
-## Test Coverage
-
-Tests across 5 test classes:
-
-| Category | Count | Description |
-|----------|-------|-------------|
-| Pattern matching | 8 | Positive/negative cases, multiple patterns, operand ordering |
-| Op correctness (fallback) | 4 | Fallback impl numerical accuracy, return type semantics |
-| Graph rewrite | 1 | Pass inserts fused op + getitem nodes |
-| Helper functions | 2 | Node predicate helpers |
-| Distributed (symm_mem) | 4 | Multi-GPU P2P kernel: no residual, with residual, per-rank data, 3D input |
-| Distributed (fallback) | 4 | Multi-GPU fallback path via `_test_mode` |
-
-## File Inventory
-
-| File | Role |
-|------|------|
-| `torch/_inductor/config.py` | Config flag |
-| `torch/_inductor/fx_passes/post_grad.py` | Wiring (passes `is_inference` to FX pass) |
-| `torch/_inductor/fx_passes/fused_allreduce_rmsnorm.py` | FX pass (pattern match, replace, absorb trailing convert) |
-| `torch/distributed/_symmetric_memory/_fused_all_reduce_rmsnorm.py` | Custom op (Meta/CUDA/fallback dispatch) |
-| `torch/distributed/_symmetric_memory/_fused_allreduce_rmsnorm_triton.py` | Triton kernel (P2P loads, reduce, RMSNorm) |
-| `torch/distributed/_symmetric_memory/__init__.py` | Op registration import |
-| `test/distributed/test_fused_allreduce_rmsnorm.py` | Tests |
-| `dev/profile_fused_allreduce_rmsnorm.py` | Profiling script (5 variants: baseline, fused_op, compiled, mempool, kraken) |
-| `third_party/kraken/` | Submodule: Triton-based symmetric memory operators ([github](https://github.com/meta-pytorch/kraken)) |
-
 ## torch.compile Integration (SGLang-style)
-
-The intended integration path for serving frameworks like SGLang:
 
 ```python
 import torch.distributed._functional_collectives as funcol
@@ -226,24 +468,6 @@ because the FX pass matches `c10d_functional.all_reduce` nodes specifically.
 2. `get_symm_mem_workspace(group_name, min_size=...)` — pre-allocates the
    P2P workspace (required before CUDA graph capture)
 3. Run under `torch.inference_mode()` — required for the FX pass to fire
-
-A profiling script (`dev/profile_fused_allreduce_rmsnorm.py`) demonstrates the
-full integration with a dummy decoder layer (linear → allreduce → add residual
-→ RMSNorm), comparing five variants under CUDA graph capture: NCCL baseline,
-direct fused op (workspace copy), torch.compile (FX pass fusion), memory pool
-zero-copy, and kraken (device-side sync, single kernel).
-
-## Profiling Results (4× GPU, H100, hidden=4096, seq=2048)
-
-| Variant | CUDA total | Key kernels |
-|---------|-----------|-------------|
-| **Baseline** (NCCL) | ~30.8ms | NCCL allreduce 24.8ms, mm 3.8ms, rms_norm 1.7ms |
-| **Fused op** (direct) | ~17.0ms | barrier 11.1ms, fused kernel 1.5ms, mm 3.9ms |
-| **Compiled** (torch.compile) | Similar to fused op | FX pass fires: "found 1 patterns / fused 1 patterns" |
-
-The fused Triton kernel replaces NCCL allreduce (24.8ms) + add + rms_norm
-(1.7ms) with a single 1.5ms kernel, at the cost of two barrier kernels
-(~11ms total in this config — dominated by barrier wait time, not overhead).
 
 ## Memory Pool Zero-Copy Variant
 
@@ -271,134 +495,182 @@ output, residual_out = _launch_fused_kernel(       # barrier → kernel → barr
 )
 ```
 
-**Key details:**
+## Profiling Results
 
-- `rendezvous` is a collective on first call (IPC handle exchange) but cached
-  per block+group thereafter — effectively free in steady state.
-- `use_mem_pool` and `rendezvous` happen *before* CUDA graph capture so the
-  graph only sees GPU ops (matmul, barriers, Triton kernel) with fixed
-  addresses.
-- The pre-kernel barrier is required (wait for all ranks' matmul to finish).
-  The post-kernel barrier is also required in a loop — without it, a rank
-  could overwrite its symmetric buffer (via the next iteration's matmul) while
-  another rank is still reading from it. Eliminating the post-barrier would
-  require double buffering.
+### 2xGB200 wall-clock (HIDDEN=2880, CUDA graphs, --timer mode)
 
-**Profiling results (4× GPU, CUDA graphs, hidden=4096, seq=2048):**
+NUM_TOKENS=1:
 
-| Metric | fused_op (workspace copy) | mempool (zero-copy) |
-|--------|--------------------------|---------------------|
-| Memcpy DtoD | 114us (5.7us/call) | **0** |
-| barrier (40 calls) | 723us (18.1us/call) | 944us (23.6us/call) |
-| fused kernel (20 calls) | 1.657ms (82.8us/call) | 1.682ms (84.1us/call) |
-| **Total CUDA** | **6.682ms** | **6.802ms** |
+| Variant | us/iter | vs baseline |
+|---------|---------|-------------|
+| baseline (NCCL) | 29.1 | 1.00x |
+| fused_op (host barriers) | 14.3 | 2.04x |
+| **compiled** (device sync) | 11.7 | 2.49x |
+| compiled_plain (no fusion) | 16.8 | 1.73x |
+| kraken (device sync) | 11.2 | 2.58x |
+| flashinfer (Lamport) | 5.2 | 5.55x |
 
-The DtoD copy is eliminated but the total is ~1.8% slower due to slightly
-higher barrier cost (likely TLB/cache effects from the different backing
-allocation). For this tensor size (16 MB) the copy is only ~5.7us — the
-optimization becomes more relevant for larger tensors or when composing with
-upstream kernels that can also write directly to the pool.
+NUM_TOKENS=1024:
 
-## Kraken Variant (Device-Side Sync, Single Kernel)
+| Variant | us/iter | vs baseline |
+|---------|---------|-------------|
+| baseline (NCCL) | 86.8 | 1.00x |
+| fused_op (host barriers) | 24.4 | 3.56x |
+| **compiled** (device sync) | 49.8 | 1.74x |
+| compiled_plain (no fusion) | 51.2 | 1.70x |
+| mempool (host barriers) | 23.9 | 3.63x |
+| kraken (device sync) | 75.1 | 1.16x |
+| flashinfer (Lamport, forced one-shot) | 35.8 | 2.42x |
 
-[Kraken](https://github.com/meta-pytorch/kraken) (`third_party/kraken/`)
-provides a Triton-based `one_shot_all_reduce_bias_rms_norm` that performs
-the entire allreduce + add + RMSNorm in a **single kernel launch** using
-device-side synchronization via inline PTX.
+### 4xGB200 torch profiler (HIDDEN=2880, CUDA graphs)
 
-**How it differs from our kernel:**
+NUM_TOKENS=32:
 
-| | Our kernel | Kraken |
-|---|---|---|
-| Kernel launches | 3 (barrier → kernel → barrier) | **1** (all fused) |
-| Synchronization | Host-side `symm_mem.barrier()` | Device-side `ptx_utils.symm_mem_sync()` (inline PTX atomics) |
-| Copy to symm mem | Host-side `peer_bufs[rank].copy_()` | Inside the kernel (`tl.load` + `tl.store`) |
-| Residual output | Returns `(normed, pre_norm)` | Only returns `normed` |
-| Reduction | Unrolled `if WORLD_SIZE >= N` | `for i in range(world_size)` loop |
+| Variant | Fused kernel (avg) | Total Self CUDA | Launches |
+|---------|-------------------|-----------------|----------|
+| baseline (NCCL) | 149us (NCCL) | 4.5ms | many |
+| fused_op (host barriers) | 10.8us | 1.4ms | 3 |
+| **compiled** (device sync) | 18.5us | **1.008ms** | **1** |
+| **kraken** (device sync) | 15.1us | **1.002ms** | **1** |
+| flashinfer (Lamport) | 9.2us | 837us | 1 |
 
-**Device-side sync (`ptx_utils.symm_mem_sync`):**
+## Test Coverage
 
-Kraken's sync primitive uses PTX `atom.global.sys.cas` (system-scope
-compare-and-swap) with `release`/`acquire` memory ordering. Thread 0 of
-each block sends a signal to all peers and waits for all peers' signals.
-`tl.debug_barrier()` ensures intra-block memory consistency. The signal pad
-auto-resets to zero after each sync, making it CUDA graph friendly.
+Tests across 5 test classes:
 
-**Single-kernel flow:**
-```
-1. tl.load(input_ptr)              — load row from regular CUDA memory
-2. tl.store(buffer_ptr[rank])      — copy row into symmetric memory
-3. symm_mem_sync(release, acquire) — flush store, wait for all peers
-4. for i in range(world_size):     — P2P loads + reduce + bias add
-5. RMSNorm(reduced)                — normalize and store output
-6. symm_mem_sync(release)          — signal reads complete
-```
+| Category | Count | Description |
+|----------|-------|-------------|
+| Pattern matching | 8 | Positive/negative cases, multiple patterns, operand ordering |
+| Op correctness (fallback) | 4 | Fallback impl numerical accuracy, return type semantics |
+| Graph rewrite | 1 | Pass inserts fused op + getitem nodes |
+| Helper functions | 2 | Node predicate helpers |
+| Distributed (symm_mem) | 4 | Multi-GPU P2P kernel: no residual, with residual, per-rank data, 3D input |
+| Distributed (fallback) | 4 | Multi-GPU fallback path via `_test_mode` |
 
-**Usage (profiling script variant 5):**
-```python
-import torch.distributed._symmetric_memory as symm_mem
-from kraken.fused.one_shot_all_reduce_bias_rms_norm import (
-    one_shot_all_reduce_bias_rms_norm,
-)
+## File Inventory
 
-# One-time setup:
-symm_buf = symm_mem.empty((num_tokens, hidden), dtype=torch.bfloat16, device=device)
-symm_mem.rendezvous(symm_buf, group=tp_group)
-output = torch.empty_like(x)
+| File | Role |
+|------|------|
+| `torch/_inductor/config.py` | Config flag |
+| `torch/_inductor/fx_passes/post_grad.py` | Wiring (passes `is_inference` to FX pass) |
+| `torch/_inductor/fx_passes/fused_allreduce_rmsnorm.py` | FX pass (pattern match, replace, absorb trailing convert) |
+| `torch/distributed/_symmetric_memory/_fused_all_reduce_rmsnorm.py` | Custom op (Meta/CUDA/fallback dispatch) |
+| `torch/distributed/_symmetric_memory/_fused_allreduce_rmsnorm_triton.py` | Triton kernel (P2P loads, reduce, RMSNorm) |
+| `torch/distributed/_symmetric_memory/__init__.py` | Op registration import |
+| `test/distributed/test_fused_allreduce_rmsnorm.py` | Tests |
+| `dev/profile_fused_allreduce_rmsnorm.py` | Profiling script (8 variants) |
+| `third_party/kraken/` | Submodule: Triton-based symmetric memory operators |
 
-# Per-iteration (CUDA-graph capturable):
-one_shot_all_reduce_bias_rms_norm(
-    symm_buf, hidden_states, residual, norm_weight, output, eps=eps,
-)
-```
+## Reference: SGLang Custom AllReduce
 
-Note: kraken's kernel passes the residual/bias tensor as an additive term
-(`all_reduce(x) + bias`), which is mathematically identical to the residual
-add. However, it does not return the pre-norm value (`reduced + residual`),
-so the caller must handle residual propagation separately if needed for
-Pre-LN architectures.
+SGLang's `tensor_model_parallel_all_reduce` dispatches to a custom CUDA
+kernel (`sgl-kernel/csrc/allreduce/custom_all_reduce.cuh`) that beats
+both NCCL and our Inductor P2P fused kernel for small messages.
+
+Benchmark (`dev/benchmark.py`, 2xGB200, hidden=2880, seq_len=1):
+
+| Variant | Time | Notes |
+|---------|------|-------|
+| SGLang custom AR + separate RMSNorm | 9 µs | 2+ kernels |
+| Inductor P2P fused (allreduce+add+norm) | 11 µs | 1 kernel |
+| funcol compiled (NCCL + compiled norm) | 17 µs | 2+ kernels |
+| FlashInfer oneshot | 6 µs | 1 kernel |
+
+### How it works
+
+SGLang uses CUDA IPC handles (`cudaIpcGetMemHandle` / `cudaIpcOpenMemHandle`)
+for direct NVLink P2P access between GPUs — conceptually the same as
+PyTorch symmetric memory but at a lower level, bypassing the Python
+`_SymmetricMemory` abstraction.
+
+Two kernel variants are selected based on message size:
+- **1-stage** (`cross_device_reduce_1stage`): all ranks read from all
+  peers and reduce in one pass. Used for world_size=2 or small messages
+  (< 512KB for ≤4 GPUs, < 256KB for ≤8 GPUs).
+- **2-stage** (`cross_device_reduce_2stage`): reduce-scatter + allgather,
+  halving NVLink traffic. Used for larger messages.
+
+### Why it's faster than our compiled kernel at small sizes
+
+1. **Native CUDA kernel, no Triton overhead.** The CUDA kernel uses
+   128-bit aligned packed loads (`ld.128` / `st.128`) and hand-tuned
+   PTX memory barriers. Triton adds overhead from its own code generation,
+   register allocation, and block-level abstractions.
+
+2. **Lightweight custom barrier.** Uses per-block counters with
+   `st.release.sys.global` / `ld.acquire.sys.global` — just two
+   NVLink atomics per block (similar to kraken CAS). But the grid is
+   capped at 36 blocks regardless of token count: "too many SMs will
+   cause contention on NVLink bus". This avoids the CAS scaling problem
+   our kernel has at larger grids.
+
+3. **No wrapper-level overhead.** No Python `symm_mem_setup` call, no
+   cached dict lookup, no torch.ops dispatch. The kernel launch is a
+   direct CUDA kernel call through a pre-initialized C++ object.
+
+4. **No prologue copy.** The input is passed directly to the kernel
+   which reads from it. No copy into a symmetric buffer — the IPC
+   handles are set up once at initialization and the kernel reads
+   directly from peers' allocations.
+
+### Key difference: fixed grid cap vs. scaling grid
+
+SGLang caps the grid at 36 blocks, then each block processes multiple
+rows. This means the sync cost stays bounded: 36 × 2 barrier atomics =
+72 NVLink atomics regardless of token count. Our compiled kernel
+launches one block per XBLOCK rows, so the grid (and sync cost) grows
+with token count.
+
+This is the same insight behind the host-barrier approach: decouple sync
+cost from grid size. SGLang achieves it by capping the grid; we can
+achieve it by moving sync out of the kernel (host barriers) or by
+capping XBLOCK to keep the grid small.
+
+### Implications for our approach
+
+The SGLang results show that for a serving runtime, a pre-compiled CUDA
+kernel with fixed grid + direct IPC handles is hard to beat. Our Inductor
+approach trades some performance for generality (works with any fused
+downstream compute, auto-generated from user code). The key areas where
+we can close the gap:
+
+- **Cap the grid** or use host barriers to bound sync cost (host-barrier
+  plan addresses this)
+- **Eliminate prologue copy** via mempool zero-copy (already implemented
+  as `_symm_mem_skip_prologue_copy`)
+- **Reduce wrapper overhead** by moving `symm_mem_setup` to graph init
 
 ## Open Questions / Future Work
 
-1. **Device-side synchronization in our kernel.** Our kernel uses host-side
-   `symm_mem.barrier()`. Kraken demonstrates that device-side sync via inline
-   PTX is viable and eliminates two barrier kernel launches. Porting
-   `ptx_utils.symm_mem_sync` into our kernel would reduce from 3 launches to
-   1, matching kraken's performance. The copy-into-workspace step can also be
-   folded into the kernel (as kraken does).
+1. **Sync strategy selection.** Device-side per-block atomics don't scale
+   beyond ~32 tokens. Options: (a) gate the FX pass on tensor size,
+   (b) implement Lamport-style sentinel in codegen, (c) implement
+   two-shot reduce-scatter + allgather for large tensors.
 
-2. **LayerNorm variant.** The same pattern applies to `all_reduce + LayerNorm`.
-   The kernel would need an additional mean-subtraction step. The FX pass
-   would need to match the LayerNorm decomposition (which includes a mean
-   subtraction before variance computation).
+2. **Lamport-style sentinel sync for codegen.** Would keep single-launch
+   advantage while scaling to large token counts. Requires push model,
+   volatile loads, triple buffering, and sentinel stripping. See
+   "Why We Can't Easily Adopt Lamport" section for full analysis.
 
-3. **Non-sum reduce ops.** The Triton kernel currently only supports `sum`.
-   Supporting `avg` requires dividing by world_size after the reduction, which
-   is trivial to add.
+3. **Two-shot P2P allreduce.** For large tensors, implement
+   reduce-scatter + allgather to halve NVLink traffic from
+   `world_size × data` to `2 × data` (matching FlashInfer's two-shot).
 
-4. **Performance tuning.** The kernel uses `BLOCK_N = next_power_of_2(N)` which
-   may not be optimal for all hidden dimensions. Auto-tuning or a lookup table
-   based on common hidden sizes (4096, 5120, 8192, etc.) could improve
-   throughput.
+4. **LayerNorm variant.** Same pattern applies; kernel needs an additional
+   mean-subtraction step.
 
-5. **Integration with compute-comm overlap.** The fused op changes the
-   scheduling picture for `reorder_for_compute_comm_overlap` since the
-   communication is now inside the fused kernel rather than a separate NCCL
-   call. Need to verify the two passes compose correctly.
+5. **Training support.** AOTAutograd saves intermediates for backward that
+   the fused op doesn't produce. Options: (a) return intermediates from
+   fused op, (b) recompute in backward.
 
-6. **Multi-node support.** The current kernel uses direct P2P loads which
-   require NVLink (intra-node). For multi-node TP, the P2P loads could be
-   replaced with `nvshmem.get()` and `symm_mem.barrier()` with
-   `nvshmem.barrier_all()`, at the cost of requiring NVSHMEM and cooperative
-   launch.
+6. **Multi-node via NVSHMEM.** Replace `tl.load` with `nvshmem.get()`,
+   `symm_mem.barrier()` with `nvshmem.barrier_all()`.
 
-7. **Training support.** The FX pass currently skips training mode because
-   AOTAutograd saves intermediates (e.g. `rsqrt`) for backward that the fused
-   op doesn't produce. Supporting training would require either: (a) having the
-   fused op also return the intermediates, or (b) recomputing them from the
-   pre_norm output in the backward graph.
+7. **Memory pool double buffering.** Eliminate epilogue sync by alternating
+   two symmetric buffers across iterations.
 
-8. **Memory pool double buffering.** The post-kernel barrier (~5us) could be
-   eliminated by alternating between two symmetric memory buffers across
-   iterations. While rank N reads from buffer A, the next matmul writes to
-   buffer B — removing the read-after-write hazard without synchronization.
+8. **Non-sum reduce ops.** Supporting `avg` (divide by world_size after
+   reduce) is trivial.
+
+9. **Integration with compute-comm overlap.** Verify composition with
+   `reorder_for_compute_comm_overlap` pass.
