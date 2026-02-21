@@ -128,25 +128,25 @@ def _profile(
     """Returns avg_us when timer_mode is True, else None."""
     import time
 
+    CUDA_GRAPH_ITERS = 10
+
     # Eager warmup: Triton compilation, NCCL init, buffer allocation, etc.
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
 
     if cuda_graph:
-        # Side-stream warmup + capture (standard PyTorch pattern)
+        # Side-stream capture (standard PyTorch pattern)
         stream = torch.cuda.Stream()
-        stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(stream):
-            for _ in range(3):
-                fn()
-        stream.synchronize()
-        torch.cuda.current_stream().wait_stream(stream)
-        torch.cuda.synchronize()
-
         g = torch.cuda.CUDAGraph()
+        with torch.cuda.stream(stream):
+            for _ in range(warmup):
+                fn()
+        torch.cuda.current_stream().wait_stream(stream)
+
         with torch.cuda.graph(g, stream=stream):
-            fn()
+            for _ in range(CUDA_GRAPH_ITERS):
+                fn()
         torch.cuda.synchronize()
 
         # Replay warmup so profiling sees steady-state only
@@ -162,7 +162,7 @@ def _profile(
     t0 = time.perf_counter()
     if nsys_mode:
         torch.cuda.nvtx.range_push(name)
-    for _ in range(iters):
+    for _ in range(iters // CUDA_GRAPH_ITERS if cuda_graph else iters):
         run()
     torch.cuda.synchronize()
     t1 = time.perf_counter()
