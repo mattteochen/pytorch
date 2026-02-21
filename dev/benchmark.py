@@ -27,6 +27,7 @@ from typing import Optional
 
 import torch  # type: ignore
 import torch.distributed as dist  # type: ignore
+import torch.distributed._symmetric_memory  # register symm_mem ops before torch.compile
 
 from sglang.srt.distributed import get_tp_group, tensor_model_parallel_all_reduce
 from sglang.srt.distributed.parallel_state import (
@@ -494,6 +495,33 @@ def _make_inductor_fused_ar_norm(eps: float):
     return _ar_norm
 
 
+def _make_inductor_p2p_sglang_norm(rmsnorm_layer: RMSNorm):
+    """Compiled P2P allreduce + SGLang RMSNorm.forward_native (fused into one kernel)."""
+    import torch.distributed._functional_collectives as funcol
+
+    @torch.compile(options={"_fused_all_reduce_rmsnorm": True})
+    def _ar_norm(x, residual, group_name):
+        reduced = funcol.all_reduce(x, "sum", group_name)
+        return rmsnorm_layer.forward_native(reduced, residual)
+
+    return _ar_norm
+
+
+def _make_funcol_compiled_ar_norm(eps: float):
+    """torch.compile with funcol.all_reduce (NCCL) + F.rms_norm, no P2P fusion."""
+    import torch.distributed._functional_collectives as funcol
+    import torch.nn.functional as F
+
+    @torch.compile
+    def _ar_norm(x, residual, weight, group_name):
+        reduced = funcol.all_reduce(x, "sum", group_name)
+        h = reduced + residual
+        normed = F.rms_norm(h, weight.shape, weight, eps)
+        return normed, h
+
+    return _ar_norm
+
+
 # Compiled versions of native functions
 @torch.compile
 def standard_allreduce_rmsnorm_native_compiled(
@@ -623,6 +651,7 @@ def benchmark_operation(
     return avg_time_ms
 
 
+
 def run_benchmarks(
     seq_len: int,
     hidden_dim: int,
@@ -686,11 +715,28 @@ def run_benchmarks(
             logger.error("Standard AllReduce+RMSNorm Native Compiled failed: %s", e)
             results["standard_allreduce_rmsnorm_native_compiled"] = float("inf")
 
+        # funcol compiled (NCCL all_reduce + F.rms_norm, no P2P fusion)
+        try:
+            group_name = dist.group.WORLD.group_name
+            funcol_ar_norm = _make_funcol_compiled_ar_norm(rms_eps)
+
+            def _funcol_compiled_call():
+                return funcol_ar_norm(
+                    input_tensor, residual, rms_gamma, group_name
+                )
+
+            time_ms = benchmark_operation(_funcol_compiled_call)
+            results["funcol_compiled_allreduce_rmsnorm"] = time_ms
+        except Exception as e:
+            logger.error("funcol compiled AllReduce+RMSNorm failed: %s", e)
+            results["funcol_compiled_allreduce_rmsnorm"] = float("inf")
+
         # Inductor P2P Fused AllReduce + RMSNorm (kraken device-side sync)
         try:
             import torch.distributed._symmetric_memory as symm_mem_mod
 
             group_name = dist.group.WORLD.group_name
+            symm_mem_mod.enable_symm_mem_for_group(group_name)
             symm_mem_mod.get_symm_mem_workspace(
                 group_name,
                 min_size=input_tensor.numel() * input_tensor.element_size(),
@@ -707,6 +753,27 @@ def run_benchmarks(
         except Exception as e:
             logger.error("Inductor P2P Fused AllReduce+RMSNorm failed: %s", e)
             results["inductor_fused_p2p_allreduce_rmsnorm"] = float("inf")
+
+        # Inductor P2P AllReduce + SGLang RMSNorm.forward_native (fused, 1 kernel)
+        try:
+            import torch.distributed._symmetric_memory as symm_mem_mod
+
+            group_name = dist.group.WORLD.group_name
+            symm_mem_mod.enable_symm_mem_for_group(group_name)
+            symm_mem_mod.get_symm_mem_workspace(
+                group_name,
+                min_size=input_tensor.numel() * input_tensor.element_size(),
+            )
+            inductor_p2p_sglang = _make_inductor_p2p_sglang_norm(rmsnorm_layer)
+
+            def _inductor_p2p_sglang_call():
+                return inductor_p2p_sglang(input_tensor, residual, group_name)
+
+            time_ms = benchmark_operation(_inductor_p2p_sglang_call)
+            results["inductor_p2p_sglang_rmsnorm"] = time_ms
+        except Exception as e:
+            logger.error("Inductor P2P + SGLang RMSNorm failed: %s", e)
+            results["inductor_p2p_sglang_rmsnorm"] = float("inf")
 
         # FlashInfer Fused AllReduce + RMSNorm Oneshot
         if flashinfer_comm is not None and allreduce_params is not None:
@@ -955,6 +1022,7 @@ def prepare_results_with_speedups(results_dict):
             candidates = [
                 "standard_allreduce_rmsnorm",
                 "standard_allreduce_rmsnorm_native_compiled",
+                "funcol_compiled_allreduce_rmsnorm",
             ]
 
         # Find the fastest among available candidates
@@ -977,6 +1045,9 @@ def prepare_results_with_speedups(results_dict):
     for op_name in results_dict:
         if (
             op_name.startswith("flashinfer_")
+            or op_name.startswith("inductor_fused_")
+            or op_name.startswith("inductor_p2p_")
+            or op_name.startswith("funcol_compiled_")
             or op_name.startswith("standard_")
             and not op_name.endswith("_native_compiled")
         ):

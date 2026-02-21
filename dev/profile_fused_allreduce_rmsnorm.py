@@ -59,7 +59,7 @@ NUM_TOKENS = 1  # decode tokens (flattened, no batch dim in SGLang)
 INTER = 2880 * 4  # MoE/FFN intermediate dim
 EPS = 1e-5
 WARMUP_ITERS = 10
-PROFILE_ITERS = 20
+PROFILE_ITERS = 100
 
 torch.cuda.cudart().cudaProfilerStart()
 
@@ -433,7 +433,7 @@ def main():
                 scale_out=None,
                 layout_code=None,
                 scale_factor=None,
-                use_oneshot=True,
+                use_oneshot=None,
                 world_rank=rank,
                 world_size=dist.get_world_size(),
                 launch_with_pdl=True,
