@@ -430,6 +430,79 @@ The inductor-generated kernel forces persistent reduction via
   nearly identical to `compiled_plain` (51.2us, standard NCCL + separate
   kernels) at 1024 tokens.
 
+## GPU Execution Model for the Fused Kernel
+
+Understanding how the generated kernel maps to GPU hardware is important
+for reasoning about performance in the SGLang inference workload, where
+token counts range from 1 (decode) to thousands (prefill).
+
+### Thread hierarchy: CTAs, warps, threads
+
+The generated kernel is a **persistent reduction**: each CTA (thread
+block) loads the entire reduction dimension (`hidden_dim`) into registers
+in one pass and reduces within shared memory.
+
+For a tensor `[num_tokens, hidden_dim]` with `hidden_dim=2880`:
+- `RBLOCK = next_power_of_2(2880) = 4096`
+- Grid = `cdiv(num_tokens, XBLOCK)` CTAs
+- Each CTA has `num_warps` warps (typically 4–8, chosen by autotuner)
+
+```
+4 warps (128 threads):  4096 / 128 = 32 elements per thread
+8 warps (256 threads):  4096 / 256 = 16 elements per thread
+```
+
+The reduction (`pow → mean → rsqrt`) uses warp shuffles within each
+warp (direct register exchange, ~1 cycle), then shared memory across
+warps within the CTA (~tens of nanoseconds). All of this stays on a
+single SM — no global memory coordination.
+
+### SM utilization vs token count
+
+| num_tokens | CTAs | SMs used (GB200, 152 SMs) | Utilization |
+|-----------|------|--------------------------|-------------|
+| 1 | 1 | 1 | 0.7% |
+| 32 | 32 | 32 | 21% |
+| 152 | 152 | 152 | 100% |
+| 1024 | 1024 | 152 | 100%, ~7 CTAs/SM |
+
+At `num_tokens = 1` (decode), only 1 SM does work — the kernel is fast
+(~10-20us) but vastly underutilizes the GPU. This is inherent to
+row-parallel reductions: a single output row must be reduced within a
+single CTA because threads need shared memory to coordinate.
+
+At `num_tokens >= 152`, all SMs are occupied and the kernel becomes
+memory-bandwidth-bound (loading hidden_dim from each NVLink peer). This
+is where host-barrier overhead (fixed ~6us for 2 barrier launches) is
+amortized across many CTAs, and where two-shot allreduce (halving NVLink
+traffic) provides the biggest win.
+
+### Why persistent reduction is forced for P2P kernels
+
+Inductor's default heuristic chooses looped reduction when
+`rnumel > 1024` (for INNER reductions). With `hidden_dim = 2880`,
+looped reduction would use `RBLOCK = 256` and loop 12 times. Each loop
+iteration re-executes the P2P load from all peers — that's
+`world_size × 12` NVLink loads instead of `world_size × 1`.
+
+The kernel forces `override_persistent_reduction = True` to avoid this.
+The cost is higher register pressure (`RBLOCK = 4096` means 32 elements
+per thread with 4 warps), but NVLink latency (~microseconds per load)
+dominates over register spill cost (~nanoseconds).
+
+### Cooperative reduction (split-K)
+
+For very large `rnumel` with few output rows, inductor can split the
+reduction across multiple CTAs (cooperative reduction / split-K). Each
+CTA reduces a chunk, then they combine partial results via a global
+memory workspace.
+
+This doesn't trigger for our workload: with `xnumel = 1` (decode),
+the threshold is `32768 × 1 = 32768`, and `rnumel = 2880 < 32768`.
+The coordination overhead (global memory writes + reads + an extra
+kernel launch for the final reduce) isn't worth it when a single CTA
+finishes the 2880-element reduction in ~2us.
+
 ## Patterns Matched
 
 | Pattern | Matched | Notes |
