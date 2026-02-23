@@ -58,6 +58,11 @@ from sglang.srt.server_args import ServerArgs, set_global_server_args_for_schedu
 
 set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
 
+INDUCTOR_P2P_FUSED_AR_NORM_OPTIONS = {
+    "_fused_all_reduce_rmsnorm": True,
+    "_symm_mem_host_barrier_threshold": -1, # for fused P2P allreduce
+}
+
 
 # Try to import FlashInfer
 try:
@@ -539,7 +544,22 @@ def _make_inductor_fused_ar_norm(rmsnorm_layer: RMSNorm):
     """Inductor P2P allreduce + SGLang RMSNorm fused into one kernel."""
     import torch.distributed._functional_collectives as funcol
 
-    @torch.compile(options={"_fused_all_reduce_rmsnorm": True, "_symm_mem_host_barrier_threshold": -1}) #P2P fused
+    @torch.compile(options=INDUCTOR_P2P_FUSED_AR_NORM_OPTIONS) #P2P fused
+    def _ar_norm(x, residual, group_name):
+        reduced = funcol.all_reduce(x, "sum", group_name)
+        return rmsnorm_layer.forward_native(reduced, residual)
+
+    return _ar_norm
+
+
+def _make_inductor_fused_ar_norm_mempool(rmsnorm_layer: RMSNorm):
+    """Inductor P2P allreduce + SGLang RMSNorm, zero-copy via mempool."""
+    import torch.distributed._functional_collectives as funcol
+
+    @torch.compile(options={
+        **INDUCTOR_P2P_FUSED_AR_NORM_OPTIONS,
+        "_symm_mem_host_barrier_threshold": -1,
+    })
     def _ar_norm(x, residual, group_name):
         reduced = funcol.all_reduce(x, "sum", group_name)
         return rmsnorm_layer.forward_native(reduced, residual)
@@ -705,6 +725,39 @@ def run_benchmarks(
         except Exception as e:
             logger.error("Inductor P2P Fused AllReduce+RMSNorm failed: %s", e)
             results["inductor_fused_p2p_allreduce_rmsnorm"] = float("inf")
+
+        # Inductor P2P Fused AllReduce + RMSNorm (mempool zero-copy)
+        try:
+            import torch.distributed._symmetric_memory as symm_mem_mod
+
+            group_name = dist.group.WORLD.group_name
+            symm_mem_mod.enable_symm_mem_for_group(group_name)
+            symm_mem_mod.get_symm_mem_workspace(
+                group_name,
+                min_size=input_tensor.numel() * input_tensor.element_size(),
+            )
+
+            mempool = symm_mem_mod.get_mem_pool(input_tensor.device)
+            with torch.cuda.use_mem_pool(mempool):
+                input_symm = torch.empty_like(input_tensor)
+            symm_mem_mod.rendezvous(input_symm, dist.group.WORLD)
+
+            # Copy once outside the benchmark — simulates upstream matmul
+            # writing directly into symm mem (e.g. torch.mm(..., out=input_symm))
+            input_symm.copy_(input_tensor)
+
+            inductor_ar_norm_mp = _make_inductor_fused_ar_norm_mempool(rmsnorm_layer)
+
+            def _inductor_mempool_call():
+                return inductor_ar_norm_mp(
+                    input_symm, residual, group_name
+                )
+
+            time_ms = benchmark_operation(_inductor_mempool_call)
+            results["inductor_fused_p2p_mempool"] = time_ms
+        except Exception as e:
+            logger.error("Inductor P2P Fused (mempool) failed: %s", e)
+            results["inductor_fused_p2p_mempool"] = float("inf")
 
         # FlashInfer Fused AllReduce + RMSNorm Oneshot
         if flashinfer_comm is not None and allreduce_params is not None:
