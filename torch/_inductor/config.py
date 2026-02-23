@@ -1004,6 +1004,12 @@ _symm_mem_skip_prologue_copy: bool = False
 # N > 0 = use host barriers when xnumel > N or xnumel is dynamic.
 _symm_mem_host_barrier_threshold: int = 0
 
+# Grid cap for P2P allreduce kernels using device-side CAS sync.
+# 0 = no cap (current behavior).
+# N > 0 = cap the grid at N blocks; each block grid-strides over rows.
+# Only effective when device-side CAS is active (host_barrier_threshold=-1).
+_symm_mem_grid_cap: int = 0
+
 
 # Enable/disable partitioned scatter optimization for atomic add kernels
 # this will improve kernel performance at cost of memory usage.

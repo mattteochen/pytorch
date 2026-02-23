@@ -283,6 +283,56 @@ though it uses 3 device-side CAS barriers. This suggests that for
 the inductor codegen path, implementing two-shot P2P allreduce is
 more impactful than adopting Lamport-style sync for large tensors.
 
+### Device-side sync improvement options
+
+The host-barrier path (default) solves CAS scaling for medium/large
+tensors. For workloads that benefit from device-side sync at small
+sizes (avoiding 2 barrier kernel launches), three approaches can
+reduce the per-block CAS cost:
+
+**(a) Cap the grid (implemented, but ineffective for persistent
+reduction).** Reduce the grid from `xnumel` CTAs to a fixed cap
+(e.g. 36, matching SGLang). Each block processes multiple row tiles
+via a grid-stride loop. CAS cost drops from
+`O(xnumel × world_size)` to `O(grid_cap × world_size)`. Config:
+`_symm_mem_grid_cap = 36` with `_symm_mem_host_barrier_threshold = -1`.
+
+**Result: slower, not faster.** At 1024 tokens, 4 GPUs:
+`compiled_gridcap36` = 140.5µs vs uncapped `compiled` = 93.3µs.
+The generated code is correct (grid-stride prologue + body + CAS),
+but persistent reduction (`R0_BLOCK = 4096`) inside a dynamic
+`range()` loop causes Triton register spills. Each iteration holds
+4096 fp32 elements per thread; the compiler can't unroll a dynamic-
+bound loop, so it must spill/reload registers on every iteration.
+The uncapped version (1 row per block, no loop) avoids this because
+there's no loop to manage registers across. This is a fundamental
+Triton compiler limitation — `range()` with dynamic bounds forces
+register management overhead that `tl.static_range()` (compile-time
+unroll) avoids, but static_range requires a compile-time trip count.
+
+SGLang's custom allreduce avoids this because it uses a hand-written
+CUDA kernel (not Triton) where register allocation is explicit, and
+the reduction dimension is much smaller (allreduce only, no fused
+RMSNorm). For inductor-generated persistent reduction + P2P, the
+grid cap approach is not viable.
+
+**(b) Replace CAS with `st.release.sys` / `ld.acquire.sys`.** Plain
+stores and loads are cheaper than CAS (compare-and-swap is a
+read-modify-write) over NVLink. The barrier would use a monotonically
+incrementing counter: sender does `st.release.sys [peer_flag], iter`,
+receiver spins on `ld.acquire.sys [my_flag]` until it reaches `iter`.
+Tradeoff: the counter doesn't auto-reset, so CUDA graph friendliness
+requires double-buffering or periodic resets from the host.
+
+**(c) FlashInfer Lamport sentinel protocol.** Zero barriers, zero
+atomics. The data itself is the sync signal — push model with `-0.0`
+sentinel, receivers poll local memory via `ld.volatile.global`. This
+is the fastest approach at low token counts (5.7µs vs 11.0µs for
+kraken at 1 token, 4 GPUs) but requires the largest codegen change:
+push model IR, volatile loads in Triton (inline PTX), triple-buffer
+workspace, and sentinel stripping. See "Why We Can't Easily Adopt
+Lamport" in `ALLREDUCE_FUSION.md`.
+
 ### Why persistent reduction is correct
 
 The forced persistent override is the right choice for P2P kernels.

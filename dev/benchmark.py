@@ -488,38 +488,30 @@ def standard_allreduce_rmsnorm_fp4_quant_native(
 def _make_inductor_fused_ar_norm(eps: float):
     """Inductor-generated single kernel: P2P allreduce + add + RMSNorm."""
     import torch.distributed._functional_collectives as funcol
+    import torch.distributed._symmetric_memory  # noqa: F401 — register p2p_allreduce op before compile
     import torch.nn.functional as F
 
-    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__))))
-    from compile import compile_with_debug
-
+    @torch.compile(options={"_fused_all_reduce_rmsnorm": True})
     def _ar_norm(x, residual, weight, group_name):
         reduced = funcol.all_reduce(x, "sum", group_name)
         h = reduced + residual
         normed = F.rms_norm(h, weight.shape, weight, eps)
         return normed, h
 
-    return compile_with_debug(
-        _ar_norm,
-        inductor_kwargs={"_fused_all_reduce_rmsnorm": True},
-    )
+    return _ar_norm
 
 
 def _make_inductor_p2p_sglang_norm(rmsnorm_layer: RMSNorm):
     """Compiled P2P allreduce + SGLang RMSNorm.forward_native (fused into one kernel)."""
     import torch.distributed._functional_collectives as funcol
+    import torch.distributed._symmetric_memory  # noqa: F401 — register p2p_allreduce op before compile
 
-    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__))))
-    from compile import compile_with_debug
-
+    @torch.compile(options={"_fused_all_reduce_rmsnorm": True})
     def _ar_norm(x, residual, group_name):
         reduced = funcol.all_reduce(x, "sum", group_name)
         return rmsnorm_layer.forward_native(reduced, residual)
 
-    return compile_with_debug(
-        _ar_norm,
-        inductor_kwargs={"_fused_all_reduce_rmsnorm": True},
-    )
+    return _ar_norm
 
 
 def _make_funcol_compiled_ar_norm(eps: float):

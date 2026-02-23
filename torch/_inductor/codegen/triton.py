@@ -5397,18 +5397,41 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
     def _codegen_symm_mem_prologue(self, code: IndentedBuffer) -> None:
         """
         Emit the symmetric memory P2P prologue:
-        1. Copy XBLOCK rows of the local input into this rank's symmetric buffer.
+        1. Copy rows of the local input into this rank's symmetric buffer.
         2. Device-side sync so all peers' data is visible.
+
+        When ``_symm_mem_grid_cap`` is active the copy grid-strides over
+        all rows so that a capped grid still covers the full tensor.
         """
         assert self.symm_mem_input_name is not None
         in_var = self.args.input(self.symm_mem_input_name)
+        grid_cap = config._symm_mem_grid_cap
 
         if config._symm_mem_skip_prologue_copy:
-            # Input is already in symmetric memory (e.g. via mempool).
-            # Skip the copy, just sync.
             code.splice(
                 """
                 # --- symm mem prologue: input already in symm mem, sync only ---
+                _symm_mem_sync(symm_signal_pad_ptrs, None, SYMM_RANK, SYMM_WORLD_SIZE, hasPreviousMemAccess=True, hasSubsequentMemAccess=True)
+                """
+            )
+        elif grid_cap > 0:
+            code.splice(
+                f"""
+                # --- symm mem prologue: grid-stride copy + sync ---
+                _symm_bptrs = symm_buf_ptrs.to(tl.pointer_type(tl.uint64))
+                _symm_local_buf = tl.load(_symm_bptrs + SYMM_RANK).to(tl.pointer_type(tl.bfloat16))
+                _symm_cols = tl.arange(0, R0_BLOCK)
+                _symm_col_mask = _symm_cols < r0_numel
+                _symm_num_tiles = tl.cdiv(xnumel, XBLOCK)
+                for _symm_tile in range(tl.program_id(0), _symm_num_tiles, tl.num_programs(0)):
+                    _symm_x_base = _symm_tile.to(tl.int64) * XBLOCK
+                    for _symm_row in tl.static_range(XBLOCK):
+                        _symm_row_idx = _symm_x_base + _symm_row
+                        _symm_row_mask = _symm_row_idx < xnumel
+                        _symm_idx = _symm_row_idx * r0_numel + _symm_cols
+                        _symm_mask = _symm_col_mask & _symm_row_mask
+                        _symm_val = tl.load({in_var} + _symm_idx, _symm_mask, other=0.0)
+                        tl.store(_symm_local_buf + _symm_idx, _symm_val, _symm_mask)
                 _symm_mem_sync(symm_signal_pad_ptrs, None, SYMM_RANK, SYMM_WORLD_SIZE, hasPreviousMemAccess=True, hasSubsequentMemAccess=True)
                 """
             )
@@ -5440,6 +5463,34 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             _symm_mem_sync(symm_signal_pad_ptrs, None, SYMM_RANK, SYMM_WORLD_SIZE, hasPreviousMemAccess=True)
             """
         )
+
+    def _codegen_grid_stride_body(self, code: IndentedBuffer) -> None:
+        """
+        Wrap the kernel body in a grid-stride loop so a capped grid of
+        CTAs can process all rows.  Rewrites ``xoffset`` from
+        ``program_id(0) * XBLOCK`` to ``_x_tile * XBLOCK`` where
+        ``_x_tile`` iterates over all tiles assigned to this block.
+        """
+        import re
+
+        body_text = self.body.getvalue()
+
+        # Replace the xoffset assignment to use _x_tile instead of
+        # program_id(0).  The header generates one of:
+        #   xoffset = tl.program_id(0) * XBLOCK
+        #   xoffset = tl.program_id(0).to(tl.int64) * XBLOCK
+        body_text = re.sub(
+            r"xoffset = tl\.program_id\(0\)(?:\.to\(tl\.int64\))? \* XBLOCK",
+            "xoffset = _x_tile.to(tl.int64) * XBLOCK",
+            body_text,
+        )
+
+        code.writeline(
+            "for _x_tile in range(tl.program_id(0), tl.cdiv(xnumel, XBLOCK), "
+            "tl.num_programs(0)):"
+        )
+        with code.indent():
+            code.splice(body_text)
 
     def codegen_kernel(self, name=None) -> str:
         """
@@ -5655,6 +5706,13 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         if self.mix_order_reduction:
             inductor_meta["RSPLIT_SIZE"] = self.rsplit_size
 
+        if (
+            self.has_symm_mem_p2p
+            and not self._symm_mem_use_host_barriers
+            and config._symm_mem_grid_cap > 0
+        ):
+            inductor_meta["symm_mem_grid_cap"] = config._symm_mem_grid_cap
+
         if config.deterministic or config.test_configs.force_filter_reduction_configs:
             inductor_meta["has_loadstore_with_contiguous_rdim"] = (
                 self.has_load_with_contiguous_rdim
@@ -5810,7 +5868,14 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 code.writeline(f"{old} = {new}")
             if self.has_symm_mem_p2p and not self._symm_mem_use_host_barriers:
                 self._codegen_symm_mem_prologue(code)
-            code.splice(self.body)
+            if (
+                self.has_symm_mem_p2p
+                and not self._symm_mem_use_host_barriers
+                and config._symm_mem_grid_cap > 0
+            ):
+                self._codegen_grid_stride_body(code)
+            else:
+                code.splice(self.body)
             if self.has_symm_mem_p2p and not self._symm_mem_use_host_barriers:
                 self._codegen_symm_mem_epilogue(code)
             if config.triton.proton_profiling:

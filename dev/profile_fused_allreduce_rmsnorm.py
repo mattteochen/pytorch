@@ -98,20 +98,19 @@ class DummyDecoderLayer(nn.Module):
 
 
 def _make_compiled_ar_norm(eps: float):
-    """Inductor generates a single P2P kernel with host-side barriers."""
-    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__))))
-    from compile import compile_with_debug
+    """Inductor P2P kernel with device-side CAS sync (original, no host barriers)."""
 
+    @torch.compile(options={
+        "_fused_all_reduce_rmsnorm": True,
+        "_symm_mem_host_barrier_threshold": -1,
+    })
     def _ar_norm(x, residual, weight, group_name):
         reduced = funcol.all_reduce(x, "sum", group_name)
         h = reduced + residual
         normed = F.rms_norm(h, weight.shape, weight, eps)
         return normed, h
 
-    return compile_with_debug(
-        _ar_norm,
-        inductor_kwargs={"_fused_all_reduce_rmsnorm": True},
-    )
+    return _ar_norm
 
 
 def _make_compiled_plain_ar_norm(eps: float):
@@ -328,6 +327,75 @@ def main():
             _profile(
                 "compiled",
                 compiled_call,
+                rank,
+                warmup=WARMUP_ITERS + 5,
+                cuda_graph=True,
+                nsys_mode=nsys_mode,
+                timer_mode=timer_mode,
+            ),
+        )
+    )
+
+    # --- Variant 3b: compiled + forced host barriers ---
+    def _make_host_barrier_ar_norm(eps_val):
+        @torch.compile(options={
+            "_fused_all_reduce_rmsnorm": True,
+            "_symm_mem_host_barrier_threshold": 0,
+        })
+        def _fn(x, residual, weight, group_name):
+            reduced = funcol.all_reduce(x, "sum", group_name)
+            h = reduced + residual
+            normed = F.rms_norm(h, weight.shape, weight, eps_val)
+            return normed, h
+        return _fn
+
+    ar_norm_host_barrier = _make_host_barrier_ar_norm(EPS)
+
+    def compiled_host_barrier_call():
+        h = x
+        return ar_norm_host_barrier(h, residual, weight, group_name)
+
+    results.append(
+        (
+            "compiled_host_barrier",
+            _profile(
+                "compiled_host_barrier",
+                compiled_host_barrier_call,
+                rank,
+                warmup=WARMUP_ITERS + 5,
+                cuda_graph=True,
+                nsys_mode=nsys_mode,
+                timer_mode=timer_mode,
+            ),
+        )
+    )
+
+    # --- Variant 3c: compiled + device CAS + grid cap at 36 CTAs ---
+    def _make_grid_cap_ar_norm(eps_val):
+        @torch.compile(options={
+            "_fused_all_reduce_rmsnorm": True,
+            "_symm_mem_host_barrier_threshold": -1,
+            "_symm_mem_grid_cap": 36,
+        })
+        def _fn(x, residual, weight, group_name):
+            reduced = funcol.all_reduce(x, "sum", group_name)
+            h = reduced + residual
+            normed = F.rms_norm(h, weight.shape, weight, eps_val)
+            return normed, h
+        return _fn
+
+    ar_norm_grid_cap = _make_grid_cap_ar_norm(EPS)
+
+    def compiled_grid_cap_call():
+        h = x
+        return ar_norm_grid_cap(h, residual, weight, group_name)
+
+    results.append(
+        (
+            "compiled_gridcap36",
+            _profile(
+                "compiled_gridcap36",
+                compiled_grid_cap_call,
                 rank,
                 warmup=WARMUP_ITERS + 5,
                 cuda_graph=True,
