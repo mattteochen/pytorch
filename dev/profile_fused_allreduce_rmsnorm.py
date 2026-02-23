@@ -667,7 +667,7 @@ def main():
                 scale_out=None,
                 layout_code=None,
                 scale_factor=None,
-                use_oneshot=None,
+                use_oneshot=True,
                 world_rank=rank,
                 world_size=dist.get_world_size(),
                 launch_with_pdl=True,

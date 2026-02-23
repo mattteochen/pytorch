@@ -545,8 +545,10 @@ class TestFusedAllReduceRMSNormDistributed(MultiProcContinuousTest):
                        "Kernel should call _lamport_clear_old_slot (epilogue)")
         self.assertIn("lamport_workspace_setup", code,
                        "Wrapper should call lamport_workspace_setup")
-        self.assertIn("lamport_advance_offsets", code,
-                       "Wrapper should call lamport_advance_offsets")
+        self.assertIn("_lamport_advance_flag_block0", code,
+                       "Kernel should call _lamport_advance_flag_block0 (epilogue)")
+        self.assertNotIn("lamport_advance_offsets", code,
+                          "Wrapper should NOT call lamport_advance_offsets (in-kernel now)")
         self.assertNotIn("_symm_mem_sync", code,
                           "Kernel should NOT use device-side CAS sync")
         self.assertNotIn("symm_mem_host_barrier", code,

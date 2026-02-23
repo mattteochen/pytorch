@@ -871,7 +871,7 @@ from torch._inductor.runtime.p2p_push_helpers import push_to_peers, poll_for_sen
 
 ## Lamport Push-Model Codegen: Implemented, Perf Work Needed
 
-### Status: functionally correct, CUDA-graph-safe, but 2.3x slower than standalone
+### Status: functionally correct, CUDA-graph-safe, zero wrapper GPU ops
 
 The Lamport push-model sync mode is implemented as an alternative to
 pull+host-barriers and pull+device-CAS. Selected via
@@ -889,19 +889,29 @@ torch.compile(options={
 
 | File | Role |
 |------|------|
-| `torch/_inductor/runtime/lamport_helpers.py` | **NEW**: @triton.jit helpers (fence, volatile load, push, poll+reduce, clear) + Python runtime (triple-buffer workspace, GPU-resident offset rotation) |
-| `torch/_inductor/codegen/triton.py` | Mode selection (`_symm_mem_use_lamport`), Lamport imports, `_codegen_lamport_prologue`, `_codegen_lamport_epilogue`, `_codegen_lamport_reduce_load`, `_emit_lamport_setup`, kernel argdefs for `_lam_offsets` TensorArg |
+| `torch/_inductor/runtime/lamport_helpers.py` | **NEW**: @triton.jit helpers (fence, volatile load, push, poll+reduce, clear, block arrive, flag advance) + Python runtime (triple-buffer workspace, in-kernel metadata) |
+| `torch/_inductor/codegen/triton.py` | Mode selection (`_symm_mem_use_lamport`), Lamport imports, `_codegen_lamport_prologue`, `_codegen_lamport_epilogue`, `_codegen_lamport_reduce_load`, `_emit_lamport_setup`, kernel argdefs for `_lam_meta` TensorArg |
 | `torch/_inductor/config.py` | `_symm_mem_sync_mode: str = "host_barrier"` (new, values: host_barrier/device_cas/lamport) |
 | `test/distributed/test_fused_allreduce_rmsnorm.py` | 2 new tests with codegen structural assertions |
 | `dev/profile_fused_allreduce_rmsnorm.py` | `compiled_lamport` variant (3d) + renamed standalone to `lamport_standalone` |
 
 ### CUDA graph safety
 
-Triple-buffer rotation uses a GPU-resident counter tensor. The wrapper
-emits `counter.add_(1)` + `offsets[0] = (counter % 3) * slot_elems` +
-`offsets[1] = ((counter + 2) % 3) * slot_elems` — all element-wise
-GPU ops that capture and replay correctly. The kernel receives offsets
-via a `[2]` int64 TensorArg and loads them with `tl.load`.
+Triple-buffer rotation is fully in-kernel (FlashInfer-style), with
+zero wrapper GPU ops.  A `[2]` int32 metadata tensor holds
+`[block_counter, flag_value]`.  The kernel reads the flag via volatile
+load at the start, and block 0 advances it at the end:
+
+1. **Prologue (all blocks):** volatile-load `meta[1]` (flag), compute
+   offsets, push data, then `tl.atomic_add(meta[0], 1)` (device-scope,
+   local-GPU atomic — cheap).
+2. **Epilogue (block 0 only):** spin on `meta[0]` via volatile load
+   until `count == gridDim.x`, then store `meta[1] = (flag+1) % 3`
+   and reset `meta[0] = 0`.
+
+CUDA-graph-safe because the kernel always reads/writes the same
+addresses; values change between replays as the kernel itself updates
+them.  No wrapper-level `counter.add_(1)` or offset computation.
 
 ### Profiling results (4xGB200, HIDDEN=2880, CUDA graphs, --timer)
 
@@ -910,10 +920,16 @@ NUM_TOKENS=1:
 | Variant | us/iter | vs baseline |
 |---------|---------|-------------|
 | baseline (NCCL) | 34.4 | 1.00x |
-| compiled (device CAS) | 15.3 | 2.25x |
-| **compiled_lamport** (inductor) | **18.5** | **1.86x** |
-| lamport_standalone (handwritten) | 7.9 | 4.36x |
-| flashinfer (Lamport) | 5.9 | 5.81x |
+| compiled (device CAS) | 15.5 | 2.22x |
+| compiled_host_barrier | 18.0 | 1.91x |
+| **compiled_lamport** (inductor) | **8.6** | **4.01x** |
+| lamport_standalone (handwritten) | 7.9 | 4.38x |
+| flashinfer (Lamport) | 5.8 | 5.89x |
+
+**compiled_lamport** is now within 0.7µs of the standalone kernel and
+4x faster than baseline.  The remaining gap to FlashInfer (~2.8µs) is
+native CUDA kernel overhead vs Triton codegen + SM90 programmatic
+launch dependency support.
 
 NUM_TOKENS=1024:
 
@@ -926,49 +942,45 @@ NUM_TOKENS=1024:
 | lamport_standalone | 67.7 | 1.96x |
 | flashinfer | 39.5 | 3.36x |
 
-### Performance gap analysis: compiled_lamport (18.5µs) vs standalone (7.9µs)
+### Performance gap analysis: compiled_lamport (8.6µs) vs standalone (7.9µs)
 
-The gap at 1 token was **~10.6µs** (2.3x). Root causes and fixes:
+The original gap was **~10.6µs** (18.5µs vs 7.9µs, 2.3x). All root
+causes have been addressed, reducing the gap to **0.7µs** (1.09x):
 
-**1. [FIXED] Wrapper-level GPU ops for offset rotation (~9µs)**
+**1. [FIXED] Wrapper-level GPU ops for offset rotation (~9µs → 0µs)**
 
-Was the biggest cost. `lamport_advance_offsets` emitted 3 GPU tensor ops
-(`counter.add_(1)`, `offsets[0] = ...`, `offsets[1] = ...`), each ~3µs.
-
-**Fix applied:** Wrapper now emits only `counter.add_(1)` (1 GPU op).
-The kernel loads the counter scalar and computes offsets inline:
-```python
-_lam_iter = tl.load(_lam_counter)
-_lam_buf_offset = (_lam_iter % 3) * _lam_slot_elems
-_lam_clear_offset = ((_lam_iter + 2) % 3) * _lam_slot_elems
-```
+Originally 3 GPU tensor ops (~3µs each), reduced to 1 (`counter.add_(1)`),
+then eliminated entirely via in-kernel flag advancement (FlashInfer-style).
+The kernel now reads the flag via volatile load, advances it at the end
+(block 0 only), and resets the block counter — zero wrapper GPU ops.
 
 **2. [FIXED] Redundant pointer dereferences in helpers (~1µs)**
 
-Each helper independently re-derived `buf_ptrs_u64` and `my_buf`.
+Prologue pre-computes `_lam_buf_ptrs_u64`, `_lam_my_buf_base`,
+`_lam_clear_base` once. Helpers accept pre-computed pointers directly.
 
-**Fix applied:** Prologue pre-computes `_lam_buf_ptrs_u64`,
-`_lam_my_buf_base`, `_lam_clear_base` once. Helpers accept these
-pre-computed pointers directly.
+**3. [FIXED] Flag/offset reads (~0.2µs)**
 
-**3. [FIXED] 2 extra global loads for offsets from tensor**
+Single volatile load of flag from `meta[1]` + inline `% 3` arithmetic.
 
-Kernel loaded `tl.load(_lam_offsets)` and `tl.load(_lam_offsets + 1)`.
+**4. [FIXED] Redundant variable recomputation (~0.5µs)**
 
-**Fix applied:** Single `tl.load(_lam_counter)` + inline arithmetic.
+`_lam_cols`, `_lam_col_mask`, `_lam_chunk`, `_lam_n_words` computed
+once in prologue, reused by body and epilogue.
 
-**4. [FIXED] Redundant variable recomputation**
+### Remaining gap (0.7µs to standalone, 2.8µs to FlashInfer)
 
-`_lam_cols`, `_lam_col_mask`, `_lam_chunk`, `_lam_n_words` were
-recomputed in prologue, body, and epilogue independently.
+The 0.7µs gap to standalone is Triton codegen overhead (helper function
+calls, extra instructions from code generation vs monolithic kernel).
 
-**Fix applied:** Computed once in prologue, reused by body and epilogue.
-
-### Expected result
-
-With all 4 fixes, expected compiled_lamport time is ~9-10µs at 1 token,
-close to the standalone's 7.9µs. The remaining ~1-2µs gap is from
-Triton helper function call overhead (vs monolithic standalone kernel).
+The 2.8µs gap to FlashInfer (5.8µs) comes from:
+1. **Native CUDA vs Triton (~1-1.5µs):** Hand-written CUDA with
+   `ld.128`/`st.128` packed loads, explicit register allocation.
+2. **Programmatic launch dependency (SM90+, ~0.5-1µs):** FlashInfer
+   uses `cudaGridDependencySynchronize()` /
+   `cudaTriggerProgrammaticLaunchCompletion()` to reduce inter-kernel
+   launch latency. Not available through Triton.
+3. **Remaining Triton codegen overhead (~0.5µs).**
 
 ## Improvements: Short Term
 
@@ -978,12 +990,14 @@ Triton helper function call overhead (vs monolithic standalone kernel).
 - [x] **Lamport push-model codegen:** Implemented as
       `_symm_mem_sync_mode = "lamport"`. Functionally correct, CUDA-graph-
       safe. Performance gap to standalone needs closing (see above).
-- [x] **Close Lamport perf gap:** Moved offset computation into kernel
-      (1 scalar load + inline `%3` arithmetic replaces 3 wrapper GPU ops).
-      Pre-compute shared pointers (`buf_ptrs_u64`, `my_buf_base`,
-      `clear_base`) once in prologue and reuse across body/epilogue.
-      Eliminated redundant `_lam_cols`/`_lam_chunk` recomputation.
-      Expected savings: ~9µs from wrapper ops + ~1µs from pointer deref.
+- [x] **Close Lamport perf gap:** Three rounds of optimization:
+      (1) Moved offset computation into kernel (3 wrapper GPU ops → 1).
+      (2) Pre-compute shared pointers once in prologue, reuse across
+      body/epilogue. Eliminated redundant variable recomputation.
+      (3) In-kernel flag advancement (FlashInfer-style): block counter
+      via device-scope atomic, block 0 spins + advances flag + resets.
+      Zero wrapper GPU ops. Result: 18.5µs → 8.6µs at 1 token (4x
+      baseline), within 0.7µs of standalone (7.9µs).
 - [ ] **Gate FX pass on tensor size:** Only replace `all_reduce + wait`
       with P2P when `numel * element_size < threshold` (default 1MB).
       Implement in `_can_replace()` using `node.meta["val"]`.

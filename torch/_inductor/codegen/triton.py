@@ -5507,8 +5507,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
     def _codegen_lamport_prologue(self, code: IndentedBuffer) -> None:
         """
-        Emit the Lamport push prologue: compute offsets from counter,
-        pre-compute shared pointers, then push data to all peers.
+        Emit the Lamport push prologue: read flag from metadata via
+        volatile load, compute offsets, pre-compute shared pointers,
+        push data to all peers, then signal block arrival.
 
         Variables prefixed with ``_lam_`` are set here and reused by the
         body (``_codegen_lamport_reduce_load``) and epilogue
@@ -5518,12 +5519,13 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         in_var = self.args.input(self.symm_mem_input_name)
         code.splice(
             f"""
-            # --- Lamport prologue: compute offsets + shared pointers + push ---
+            # --- Lamport prologue: read flag + compute offsets + push + arrive ---
+            _lam_meta_i32 = _lam_meta.to(tl.pointer_type(tl.int32))
+            _lam_flag = _lamport_volatile_load_u32(_lam_meta_i32 + 1)
             _lam_chunk = xnumel * r0_numel
             _lam_slot_elems = SYMM_WORLD_SIZE * _lam_chunk
-            _lam_iter = tl.load(_lam_counter)
-            _lam_buf_offset = (_lam_iter % 3) * _lam_slot_elems
-            _lam_clear_offset = ((_lam_iter + 2) % 3) * _lam_slot_elems
+            _lam_buf_offset = (_lam_flag % 3) * _lam_slot_elems
+            _lam_clear_offset = ((_lam_flag + 2) % 3) * _lam_slot_elems
             _lam_buf_ptrs_u64 = symm_buf_ptrs.to(tl.pointer_type(tl.uint64))
             _lam_my_buf = tl.load(_lam_buf_ptrs_u64 + SYMM_RANK).to(tl.pointer_type(tl.bfloat16))
             _lam_my_buf_base = _lam_my_buf + _lam_buf_offset
@@ -5542,27 +5544,34 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 _lam_data = _lamport_remove_neg_zero(_lam_data)
                 _lamport_push_to_peers(_lam_buf_ptrs_u64, _lam_data, _lam_row_offset, _lam_cols, _lam_mask, _lam_chunk, _lam_buf_offset, SYMM_RANK, SYMM_WORLD_SIZE)
             _lamport_fence_sys()
+            _lamport_block_arrive(_lam_meta_i32)
             """
         )
 
     def _codegen_lamport_epilogue(self, code: IndentedBuffer) -> None:
         """
-        Emit the Lamport epilogue: clear the old buffer slot (from 2
-        iterations ago) by writing -0.0 sentinels.  Triple buffering
-        guarantees no rank is still reading from that slot.
+        Emit the Lamport epilogue: clear the old buffer slot, then
+        advance the triple-buffer flag for the next iteration.
 
         Reuses ``_lam_clear_base``, ``_lam_x_base``, ``_lam_cols``,
-        ``_lam_col_mask``, ``_lam_chunk`` from the prologue.
+        ``_lam_col_mask``, ``_lam_chunk``, ``_lam_meta_i32``,
+        ``_lam_flag`` from the prologue.
+
+        Flag advancement (FlashInfer-style): block 0 spins on the
+        block counter until all blocks have arrived, then advances
+        ``meta[1] = (flag + 1) % 3`` and resets ``meta[0] = 0``.
+        Zero wrapper GPU ops.
         """
         code.splice(
             """
-            # --- Lamport epilogue: clear old buffer slot ---
+            # --- Lamport epilogue: clear old buffer slot + advance flag ---
             for _lam_row_e in tl.static_range(XBLOCK):
                 _lam_row_idx_e = _lam_x_base + _lam_row_e
                 _lam_row_mask_e = _lam_row_idx_e < xnumel
                 _lam_row_offset_e = _lam_row_idx_e * r0_numel
                 _lam_mask_e = _lam_col_mask & _lam_row_mask_e
                 _lamport_clear_old_slot(_lam_clear_base, _lam_row_offset_e, _lam_cols, _lam_mask_e, _lam_chunk, SYMM_WORLD_SIZE, R0_BLOCK)
+            _lamport_advance_flag_block0(_lam_meta_i32, _lam_flag)
             """
         )
 
@@ -5656,10 +5665,13 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                     """
                     from torch._inductor.runtime.lamport_helpers import (
                         _fence_sys as _lamport_fence_sys,
+                        _volatile_load_u32_scalar as _lamport_volatile_load_u32,
                         _remove_neg_zero as _lamport_remove_neg_zero,
                         _lamport_push_to_peers,
                         _lamport_poll_and_reduce,
                         _lamport_clear_old_slot,
+                        _lamport_block_arrive,
+                        _lamport_advance_flag_block0,
                     )
                     """
                 )
@@ -5783,12 +5795,12 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             if self._symm_mem_use_lamport:
                 signature.append(
                     TensorArg(
-                        name="_lam_counter",
-                        buffer="_lam_counter",
-                        dtype=torch.int64,
+                        name="_lam_meta",
+                        buffer="_lam_meta",
+                        dtype=torch.int32,
                     )
                 )
-                argdefs.append(ArgName("_lam_counter"))
+                argdefs.append(ArgName("_lam_meta"))
 
         triton_meta_signature = signature_to_meta(
             signature, size_dtype=self.index_dtype, argdefs=argdefs
@@ -6207,10 +6219,10 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
     def _emit_lamport_setup(self, wrapper, call_args: list) -> None:
         """
         Emit wrapper code for Lamport push-model mode: allocate triple-
-        buffered workspace, advance counter on GPU, append to call_args.
+        buffered workspace, append to call_args.
 
-        Only one GPU op (counter.add_(1)) per iteration; the kernel
-        computes triple-buffer offsets inline from the counter value.
+        Zero wrapper GPU ops — the kernel reads the flag, advances it,
+        and resets the block counter entirely in-kernel (FlashInfer-style).
         """
         assert self.symm_mem_input_name is not None
         in_var = self.symm_mem_input_name
@@ -6221,18 +6233,15 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
         wrapper.imports.writeline(
             "from torch._inductor.runtime.lamport_helpers import "
-            "lamport_workspace_setup, lamport_advance_offsets"
+            "lamport_workspace_setup"
         )
         wrapper.writeline(
-            f"_lam_ptrs, _symm_rank, _symm_world_size, _lam_counter = "
+            f"_lam_ptrs, _symm_rank, _symm_world_size, _lam_meta = "
             f'lamport_workspace_setup({in_var}, "{self._symm_group_name}")'
-        )
-        wrapper.writeline(
-            f'lamport_advance_offsets("{self._symm_group_name}")'
         )
 
         call_args.append("_lam_ptrs")
-        call_args.append("_lam_counter")
+        call_args.append("_lam_meta")
 
     def codegen_nan_check(self) -> None:
         wrapper = V.graph.wrapper_code

@@ -160,6 +160,40 @@ def _lamport_clear_old_slot(
 
 
 # ---------------------------------------------------------------------------
+# In-kernel flag advancement (FlashInfer-style, zero wrapper GPU ops)
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _lamport_block_arrive(meta_i32_ptr):
+    """Signal this block has read the flag and finished its push phase.
+
+    Syncs threads within the block, then atomically increments the block
+    counter in ``meta[0]``.  Device-scope atomic (same-GPU, cheap).
+    """
+    tl.debug_barrier()
+    tl.atomic_add(meta_i32_ptr, 1, sem="release", scope="gpu")
+
+
+@triton.jit
+def _lamport_advance_flag_block0(meta_i32_ptr, flag_value):
+    """Block 0 only: wait for all blocks to arrive, advance flag, reset.
+
+    Spins on ``meta[0]`` (block counter) via volatile load until it
+    equals ``gridDim.x``.  Then stores ``(flag + 1) % 3`` to
+    ``meta[1]`` and resets ``meta[0]`` to 0.
+    """
+    if tl.program_id(0) == 0:
+        _lam_expected = tl.num_programs(0)
+        _lam_ready = tl.full([], 0, dtype=tl.int32)
+        while _lam_ready == 0:
+            _lam_cnt = _volatile_load_u32_scalar(meta_i32_ptr)
+            _lam_ready = (_lam_cnt == _lam_expected).to(tl.int32)
+        tl.store(meta_i32_ptr + 1, (flag_value + 1) % 3)
+        tl.store(meta_i32_ptr, tl.full([], 0, dtype=tl.int32))
+
+
+# ---------------------------------------------------------------------------
 # Python runtime helpers (called from generated wrapper code)
 # ---------------------------------------------------------------------------
 
@@ -172,14 +206,18 @@ def lamport_workspace_setup(
 ) -> tuple[torch.Tensor, int, int, torch.Tensor]:
     """
     Allocate (or retrieve cached) triple-buffered symmetric memory workspace
-    and a GPU-resident counter for CUDA-graph-safe buffer rotation.
+    and a GPU-resident metadata tensor for in-kernel flag advancement.
 
-    Returns ``(buf_ptrs, rank, world_size, counter_tensor)``.
+    Returns ``(buf_ptrs, rank, world_size, meta_tensor)``.
 
-    ``counter_tensor`` is a scalar int64 CUDA tensor.  Call
-    :func:`lamport_advance_offsets` before each kernel launch to increment
-    the counter (single GPU op, CUDA-graph-safe).  The kernel computes
-    triple-buffer offsets inline from the counter value.
+    ``meta_tensor`` is a ``[2]`` int32 CUDA tensor:
+      - ``meta[0]``: block counter (for intra-GPU block synchronization)
+      - ``meta[1]``: flag value (triple-buffer index: 0, 1, or 2)
+
+    The kernel reads the flag at the start, advances it at the end
+    (block 0 only), and resets the counter — all inside the kernel.
+    Zero wrapper GPU ops.  CUDA-graph-safe because the kernel always
+    reads/writes the same addresses; values change between replays.
     """
     key = group_name
     if key in _lamport_cache:
@@ -188,7 +226,7 @@ def lamport_workspace_setup(
             cached["buf_ptrs"],
             cached["rank"],
             cached["world_size"],
-            cached["counter"],
+            cached["meta"],
         )
 
     import torch.distributed as dist
@@ -213,9 +251,8 @@ def lamport_workspace_setup(
         device=device,
     )
 
-    # GPU-resident counter (scalar) for CUDA graph safety.
-    # Starts at -1 so the first advance_offsets brings it to 0.
-    counter = torch.tensor(-1, dtype=torch.int64, device=device)
+    # GPU-resident metadata: [block_counter, flag_value], both start at 0.
+    meta = torch.zeros(2, dtype=torch.int32, device=device)
 
     _lamport_cache[key] = {
         "sm": sm,
@@ -223,17 +260,6 @@ def lamport_workspace_setup(
         "buf_ptrs": buf_ptrs,
         "rank": rank,
         "world_size": world_size,
-        "counter": counter,
+        "meta": meta,
     }
-    return (buf_ptrs, rank, world_size, counter)
-
-
-def lamport_advance_offsets(group_name: str) -> None:
-    """
-    Advance the triple-buffer rotation counter.
-
-    Single ``counter.add_(1)`` GPU op -- safely captured in CUDA graphs.
-    The kernel computes ``buf_offset`` and ``clear_offset`` inline from
-    the counter value, avoiding extra wrapper-level GPU ops.
-    """
-    _lamport_cache[group_name]["counter"].add_(1)
+    return (buf_ptrs, rank, world_size, meta)
