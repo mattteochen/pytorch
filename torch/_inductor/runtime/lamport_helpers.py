@@ -87,7 +87,7 @@ def _poll_last_word(slot_u32_ptr, n_words):
 
 @triton.jit
 def _lamport_push_to_peers(
-    buf_ptrs,
+    buf_ptrs_u64,
     data,
     row_offset,
     cols,
@@ -97,8 +97,10 @@ def _lamport_push_to_peers(
     RANK: tl.constexpr,
     WORLD_SIZE: tl.constexpr,
 ):
-    """Push local data to all peers' symmetric memory buffers."""
-    buf_ptrs_u64 = buf_ptrs.to(tl.pointer_type(tl.uint64))
+    """Push local data to all peers' symmetric memory buffers.
+
+    ``buf_ptrs_u64`` must be pre-cast: ``buf_ptrs.to(pointer_type(uint64))``.
+    """
     for peer in tl.static_range(WORLD_SIZE):
         peer_buf = tl.load(buf_ptrs_u64 + peer).to(tl.pointer_type(tl.bfloat16))
         tl.store(
@@ -110,22 +112,19 @@ def _lamport_push_to_peers(
 
 @triton.jit
 def _lamport_poll_and_reduce(
-    buf_ptrs,
+    my_buf_base,
     row_offset,
     cols,
     mask,
     chunk,
     n_words,
-    buf_offset,
-    RANK: tl.constexpr,
     WORLD_SIZE: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    """Poll own local buffer for all peers' data, accumulate into fp32."""
-    buf_ptrs_u64 = buf_ptrs.to(tl.pointer_type(tl.uint64))
-    my_buf = tl.load(buf_ptrs_u64 + RANK).to(tl.pointer_type(tl.bfloat16))
-    my_buf_base = my_buf + buf_offset
+    """Poll own local buffer for all peers' data, accumulate into fp32.
 
+    ``my_buf_base`` must be pre-computed: ``my_buf + buf_offset``.
+    """
     acc = tl.zeros([BLOCK_N], dtype=tl.float32)
     for peer in tl.static_range(WORLD_SIZE):
         slot_bf16 = my_buf_base + peer * chunk + row_offset
@@ -138,20 +137,18 @@ def _lamport_poll_and_reduce(
 
 @triton.jit
 def _lamport_clear_old_slot(
-    buf_ptrs,
+    clear_base,
     row_offset,
     cols,
     mask,
     chunk,
-    clear_offset,
-    RANK: tl.constexpr,
     WORLD_SIZE: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    """Write -0.0 sentinels to the old buffer slot (from 2 iterations ago)."""
-    buf_ptrs_u64 = buf_ptrs.to(tl.pointer_type(tl.uint64))
-    my_buf = tl.load(buf_ptrs_u64 + RANK).to(tl.pointer_type(tl.bfloat16))
-    clear_base = my_buf + clear_offset
+    """Write -0.0 sentinels to the old buffer slot (from 2 iterations ago).
+
+    ``clear_base`` must be pre-computed: ``my_buf + clear_offset``.
+    """
     neg_zero = tl.full([BLOCK_N], _NEG_ZERO, dtype=tl.uint16).to(
         tl.bfloat16, bitcast=True
     )
@@ -175,14 +172,14 @@ def lamport_workspace_setup(
 ) -> tuple[torch.Tensor, int, int, torch.Tensor]:
     """
     Allocate (or retrieve cached) triple-buffered symmetric memory workspace
-    and a GPU-resident offsets tensor for CUDA-graph-safe buffer rotation.
+    and a GPU-resident counter for CUDA-graph-safe buffer rotation.
 
-    Returns ``(buf_ptrs, rank, world_size, offsets_tensor)``.
+    Returns ``(buf_ptrs, rank, world_size, counter_tensor)``.
 
-    ``offsets_tensor`` is a ``[2]`` int64 CUDA tensor holding
-    ``[buf_offset, clear_offset]``.  Call :func:`lamport_advance_offsets`
-    before each kernel launch to rotate the triple buffer -- that call is
-    a pure GPU op and is safely captured in CUDA graphs.
+    ``counter_tensor`` is a scalar int64 CUDA tensor.  Call
+    :func:`lamport_advance_offsets` before each kernel launch to increment
+    the counter (single GPU op, CUDA-graph-safe).  The kernel computes
+    triple-buffer offsets inline from the counter value.
     """
     key = group_name
     if key in _lamport_cache:
@@ -191,7 +188,7 @@ def lamport_workspace_setup(
             cached["buf_ptrs"],
             cached["rank"],
             cached["world_size"],
-            cached["offsets"],
+            cached["counter"],
         )
 
     import torch.distributed as dist
@@ -216,10 +213,9 @@ def lamport_workspace_setup(
         device=device,
     )
 
-    # GPU-resident counter (scalar) and offsets ([2]) for CUDA graph safety.
-    # The counter starts at -1 so the first advance_offsets brings it to 0.
+    # GPU-resident counter (scalar) for CUDA graph safety.
+    # Starts at -1 so the first advance_offsets brings it to 0.
     counter = torch.tensor(-1, dtype=torch.int64, device=device)
-    offsets = torch.zeros(2, dtype=torch.int64, device=device)
 
     _lamport_cache[key] = {
         "sm": sm,
@@ -227,28 +223,17 @@ def lamport_workspace_setup(
         "buf_ptrs": buf_ptrs,
         "rank": rank,
         "world_size": world_size,
-        "slot_elems": slot_elems,
         "counter": counter,
-        "offsets": offsets,
     }
-    return (buf_ptrs, rank, world_size, offsets)
+    return (buf_ptrs, rank, world_size, counter)
 
 
 def lamport_advance_offsets(group_name: str) -> None:
     """
-    Advance the triple-buffer rotation counter and update the offsets tensor.
+    Advance the triple-buffer rotation counter.
 
-    Uses only element-wise arithmetic (add, remainder, mul) on scalar
-    GPU tensors -- no fancy indexing or data-dependent dispatch -- so this
-    is safely captured in CUDA graphs and replays correctly.
+    Single ``counter.add_(1)`` GPU op -- safely captured in CUDA graphs.
+    The kernel computes ``buf_offset`` and ``clear_offset`` inline from
+    the counter value, avoiding extra wrapper-level GPU ops.
     """
-    entry = _lamport_cache[group_name]
-    counter = entry["counter"]
-    offsets = entry["offsets"]
-    slot_elems = entry["slot_elems"]
-
-    counter.add_(1)
-    # buf_offset  = (counter % 3) * slot_elems
-    # clear_offset = ((counter + 2) % 3) * slot_elems
-    offsets[0] = (counter % 3) * slot_elems
-    offsets[1] = ((counter + 2) % 3) * slot_elems
+    _lamport_cache[group_name]["counter"].add_(1)

@@ -3750,19 +3750,19 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
     def _codegen_lamport_reduce_load(
         self, load_buffer, indexing, shape_str: str
     ) -> None:
-        """Emit Lamport push-model reduce: poll local buffer + accumulate."""
+        """Emit Lamport push-model reduce: poll local buffer + accumulate.
+
+        Uses ``_lam_my_buf_base``, ``_lam_cols``, ``_lam_col_mask``,
+        ``_lam_chunk``, ``_lam_n_words`` from the prologue.
+        """
         load_buffer.writeline(
             "_lam_row_offset = xoffset.to(tl.int64) * r0_numel"
         )
-        load_buffer.writeline("_lam_cols = tl.arange(0, R0_BLOCK)")
-        load_buffer.writeline("_lam_col_mask = _lam_cols < r0_numel")
-        load_buffer.writeline("_lam_chunk = xnumel * r0_numel")
-        load_buffer.writeline("_lam_n_words = r0_numel // 2")
         load_buffer.writeline(
             "_symm_acc = _lamport_poll_and_reduce("
-            "symm_buf_ptrs, _lam_row_offset, _lam_cols, _lam_col_mask, "
-            "_lam_chunk, _lam_n_words, _lam_buf_offset, "
-            "SYMM_RANK, SYMM_WORLD_SIZE, R0_BLOCK)"
+            "_lam_my_buf_base, _lam_row_offset, _lam_cols, _lam_col_mask, "
+            "_lam_chunk, _lam_n_words, "
+            "SYMM_WORLD_SIZE, R0_BLOCK)"
         )
         # The helper returns [R0_BLOCK] (1D). If the kernel body uses 2D
         # indexing [XBLOCK, R0_BLOCK], reshape to match.
@@ -5507,22 +5507,31 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
     def _codegen_lamport_prologue(self, code: IndentedBuffer) -> None:
         """
-        Emit the Lamport push prologue: load offsets from the GPU tensor,
-        then for each row in this CTA's tile, strip -0.0 sentinels from
-        the input data and push it to all peers' local buffers, then
-        issue a system-scope fence.
+        Emit the Lamport push prologue: compute offsets from counter,
+        pre-compute shared pointers, then push data to all peers.
+
+        Variables prefixed with ``_lam_`` are set here and reused by the
+        body (``_codegen_lamport_reduce_load``) and epilogue
+        (``_codegen_lamport_epilogue``), avoiding redundant computation.
         """
         assert self.symm_mem_input_name is not None
         in_var = self.args.input(self.symm_mem_input_name)
         code.splice(
             f"""
-            # --- Lamport prologue: load offsets + push local data to all peers ---
-            _lam_buf_offset = tl.load(_lam_offsets)
-            _lam_clear_offset = tl.load(_lam_offsets + 1)
+            # --- Lamport prologue: compute offsets + shared pointers + push ---
+            _lam_chunk = xnumel * r0_numel
+            _lam_slot_elems = SYMM_WORLD_SIZE * _lam_chunk
+            _lam_iter = tl.load(_lam_counter)
+            _lam_buf_offset = (_lam_iter % 3) * _lam_slot_elems
+            _lam_clear_offset = ((_lam_iter + 2) % 3) * _lam_slot_elems
+            _lam_buf_ptrs_u64 = symm_buf_ptrs.to(tl.pointer_type(tl.uint64))
+            _lam_my_buf = tl.load(_lam_buf_ptrs_u64 + SYMM_RANK).to(tl.pointer_type(tl.bfloat16))
+            _lam_my_buf_base = _lam_my_buf + _lam_buf_offset
+            _lam_clear_base = _lam_my_buf + _lam_clear_offset
             _lam_x_base = tl.program_id(0).to(tl.int64) * XBLOCK
             _lam_cols = tl.arange(0, R0_BLOCK)
             _lam_col_mask = _lam_cols < r0_numel
-            _lam_chunk = xnumel * r0_numel
+            _lam_n_words = r0_numel // 2
             for _lam_row in tl.static_range(XBLOCK):
                 _lam_row_idx = _lam_x_base + _lam_row
                 _lam_row_mask = _lam_row_idx < xnumel
@@ -5531,7 +5540,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 _lam_mask = _lam_col_mask & _lam_row_mask
                 _lam_data = tl.load({in_var} + _lam_idx, _lam_mask, other=0.0)
                 _lam_data = _lamport_remove_neg_zero(_lam_data)
-                _lamport_push_to_peers(symm_buf_ptrs, _lam_data, _lam_row_offset, _lam_cols, _lam_mask, _lam_chunk, _lam_buf_offset, SYMM_RANK, SYMM_WORLD_SIZE)
+                _lamport_push_to_peers(_lam_buf_ptrs_u64, _lam_data, _lam_row_offset, _lam_cols, _lam_mask, _lam_chunk, _lam_buf_offset, SYMM_RANK, SYMM_WORLD_SIZE)
             _lamport_fence_sys()
             """
         )
@@ -5542,22 +5551,18 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         iterations ago) by writing -0.0 sentinels.  Triple buffering
         guarantees no rank is still reading from that slot.
 
-        ``_lam_clear_offset`` was loaded from the offsets tensor in the
-        prologue and is still in scope.
+        Reuses ``_lam_clear_base``, ``_lam_x_base``, ``_lam_cols``,
+        ``_lam_col_mask``, ``_lam_chunk`` from the prologue.
         """
         code.splice(
             """
             # --- Lamport epilogue: clear old buffer slot ---
-            _lam_x_base_e = tl.program_id(0).to(tl.int64) * XBLOCK
-            _lam_cols_e = tl.arange(0, R0_BLOCK)
-            _lam_col_mask_e = _lam_cols_e < r0_numel
-            _lam_chunk_e = xnumel * r0_numel
             for _lam_row_e in tl.static_range(XBLOCK):
-                _lam_row_idx_e = _lam_x_base_e + _lam_row_e
+                _lam_row_idx_e = _lam_x_base + _lam_row_e
                 _lam_row_mask_e = _lam_row_idx_e < xnumel
                 _lam_row_offset_e = _lam_row_idx_e * r0_numel
-                _lam_mask_e = _lam_col_mask_e & _lam_row_mask_e
-                _lamport_clear_old_slot(symm_buf_ptrs, _lam_row_offset_e, _lam_cols_e, _lam_mask_e, _lam_chunk_e, _lam_clear_offset, SYMM_RANK, SYMM_WORLD_SIZE, R0_BLOCK)
+                _lam_mask_e = _lam_col_mask & _lam_row_mask_e
+                _lamport_clear_old_slot(_lam_clear_base, _lam_row_offset_e, _lam_cols, _lam_mask_e, _lam_chunk, SYMM_WORLD_SIZE, R0_BLOCK)
             """
         )
 
@@ -5778,12 +5783,12 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             if self._symm_mem_use_lamport:
                 signature.append(
                     TensorArg(
-                        name="_lam_offsets",
-                        buffer="_lam_offsets",
+                        name="_lam_counter",
+                        buffer="_lam_counter",
                         dtype=torch.int64,
                     )
                 )
-                argdefs.append(ArgName("_lam_offsets"))
+                argdefs.append(ArgName("_lam_counter"))
 
         triton_meta_signature = signature_to_meta(
             signature, size_dtype=self.index_dtype, argdefs=argdefs
@@ -6202,9 +6207,10 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
     def _emit_lamport_setup(self, wrapper, call_args: list) -> None:
         """
         Emit wrapper code for Lamport push-model mode: allocate triple-
-        buffered workspace, advance rotation offsets on GPU, append to
-        call_args.  All offset ops are GPU tensor ops so they are safely
-        captured in CUDA graphs.
+        buffered workspace, advance counter on GPU, append to call_args.
+
+        Only one GPU op (counter.add_(1)) per iteration; the kernel
+        computes triple-buffer offsets inline from the counter value.
         """
         assert self.symm_mem_input_name is not None
         in_var = self.symm_mem_input_name
@@ -6218,7 +6224,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             "lamport_workspace_setup, lamport_advance_offsets"
         )
         wrapper.writeline(
-            f"_lam_ptrs, _symm_rank, _symm_world_size, _lam_offsets = "
+            f"_lam_ptrs, _symm_rank, _symm_world_size, _lam_counter = "
             f'lamport_workspace_setup({in_var}, "{self._symm_group_name}")'
         )
         wrapper.writeline(
@@ -6226,7 +6232,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         )
 
         call_args.append("_lam_ptrs")
-        call_args.append("_lam_offsets")
+        call_args.append("_lam_counter")
 
     def codegen_nan_check(self) -> None:
         wrapper = V.graph.wrapper_code
