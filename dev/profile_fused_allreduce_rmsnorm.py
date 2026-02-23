@@ -13,6 +13,7 @@ Profiles nine variants:
   7. kraken            – kraken handwritten single kernel (one-shot, device-side sync)
   8. kraken_2shot      – kraken handwritten single kernel (two-shot, device-side sync)
   9. flashinfer        – FlashInfer trtllm_allreduce_fusion one-shot (no quant)
+ 10. lamport           – Lamport push-model Triton kernel (zero barriers, zero atomics)
 
 Launch (torch profiler):
     torchrun --nproc_per_node=NUM_GPUS dev/profile_fused_allreduce_rmsnorm.py
@@ -43,7 +44,8 @@ from torch.distributed._symmetric_memory._fused_allreduce_rmsnorm_triton import 
 )
 
 
-# Add kraken (third_party submodule) to import path
+# Add dev/ and kraken to import path
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(
     0,
     os.path.join(
@@ -657,6 +659,44 @@ def main():
     except (ImportError, AttributeError, RuntimeError) as e:
         if rank == 0:
             print(f"\nSkipping FlashInfer variant: {e}")
+
+    # --- Variant 10: Lamport push-model (zero barriers, zero atomics) ---
+    try:
+        from lamport_allreduce_rmsnorm import (
+            lamport_allreduce_rmsnorm,
+            setup_lamport_workspace,
+        )
+
+        _lam_sm, _lam_buf, _lam_buf_ptrs, _lam_slot_elems = setup_lamport_workspace(
+            device, num_tokens, HIDDEN, dist.get_world_size(), dist.group.WORLD,
+        )
+        _lam_iter = [0]
+
+        def lamport_call():
+            h = x
+            r = lamport_allreduce_rmsnorm(
+                h, weight, _lam_buf_ptrs, _lam_slot_elems, _lam_iter[0],
+                rank, dist.get_world_size(), residual=residual, eps=EPS,
+            )
+            _lam_iter[0] += 1
+            return r
+
+        results.append(
+            (
+                "lamport",
+                _profile(
+                    "lamport",
+                    lamport_call,
+                    rank,
+                    cuda_graph=True,
+                    nsys_mode=nsys_mode,
+                    timer_mode=timer_mode,
+                ),
+            )
+        )
+    except (ImportError, RuntimeError) as e:
+        if rank == 0:
+            print(f"\nSkipping Lamport variant: {e}")
 
     # --- Summary table ---
     if rank == 0 and results:

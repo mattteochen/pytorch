@@ -25,9 +25,13 @@ import os
 import time
 from typing import Optional
 
+import sys
+
 import torch  # type: ignore
 import torch.distributed as dist  # type: ignore
 import torch.distributed._symmetric_memory  # noqa: F401 — register p2p_allreduce op before any torch.compile
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__))))
 
 from sglang.srt.distributed import get_tp_group, tensor_model_parallel_all_reduce
 from sglang.srt.distributed.parallel_state import (
@@ -797,6 +801,37 @@ def run_benchmarks(
                 )
                 results["flashinfer_fused_allreduce_rmsnorm_twoshot"] = float("inf")
 
+        # Lamport push-model AllReduce + RMSNorm (zero barriers, zero atomics)
+        try:
+            from lamport_allreduce_rmsnorm import (
+                lamport_allreduce_rmsnorm,
+                setup_lamport_workspace,
+            )
+            import torch.distributed._symmetric_memory as symm_mem_mod
+
+            group_name = dist.group.WORLD.group_name
+            symm_mem_mod.enable_symm_mem_for_group(group_name)
+            _lam_sm, _lam_buf, _lam_buf_ptrs, _lam_slot_elems = setup_lamport_workspace(
+                input_tensor.device, seq_len, hidden_dim,
+                dist.get_world_size(), dist.group.WORLD,
+            )
+            _lam_iter = [0]
+
+            def _lamport_call():
+                r = lamport_allreduce_rmsnorm(
+                    input_tensor, rms_gamma, _lam_buf_ptrs, _lam_slot_elems,
+                    _lam_iter[0], dist.get_rank(), dist.get_world_size(),
+                    residual=residual, eps=rms_eps,
+                )
+                _lam_iter[0] += 1
+                return r
+
+            time_ms = benchmark_operation(_lamport_call)
+            results["lamport_fused_allreduce_rmsnorm"] = time_ms
+        except Exception as e:
+            logger.error("Lamport Fused AllReduce+RMSNorm failed: %s", e)
+            results["lamport_fused_allreduce_rmsnorm"] = float("inf")
+
     if quant_mode in ["all", "fp8_only"]:
         # Standard AllReduce + RMSNorm + FP8 Quant
         try:
@@ -1029,6 +1064,7 @@ def prepare_results_with_speedups(results_dict):
         if (
             op_name.startswith("flashinfer_")
             or op_name.startswith("inductor_")
+            or op_name.startswith("lamport_")
             or op_name.startswith("standard_")
             and not op_name.endswith("_native_compiled")
         ):
