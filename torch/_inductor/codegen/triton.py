@@ -2575,6 +2575,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         self.symm_mem_input_name: str | None = None
         self._symm_group_name: str = ""
         self._symm_mem_use_host_barriers: bool = False
+        self._symm_mem_use_lamport: bool = False
 
     @staticmethod
     def _has_stride1_on_rdim(index) -> bool:
@@ -3667,9 +3668,15 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
     ) -> TritonCSEVariable:
         """
         Generate a P2P reduce load: sum values from all peer symmetric memory
-        buffers.  Uses the pointer-to-pointer pattern matching kraken: the
-        kernel receives ``symm_buf_ptrs`` (a tensor of uint64 peer addresses)
-        and dereferences each entry to perform a P2P load.
+        buffers.
+
+        In pull mode (host_barrier / device_cas), each rank reads from all
+        peers' symmetric memory buffers over NVLink.
+
+        In Lamport push mode, the prologue already pushed data to all peers'
+        local buffers.  This method emits a call to the external
+        ``_lamport_poll_and_reduce`` helper which polls the local buffer via
+        volatile loads until the sentinel clears, then loads and accumulates.
         """
         self.has_symm_mem_p2p = True
         self.symm_mem_world_size = world_size
@@ -3700,36 +3707,70 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         shape = indexing.expand_shape or TritonSymbols.get_block_shape(indexing.index)
         shape_str = ", ".join(str(s) for s in shape) if shape else "1"
 
-        acc_var = self.cse.newvar(dtype=torch.float32, shape=shape)
-        load_buffer.writeline(f"{acc_var} = tl.zeros([{shape_str}], dtype=tl.float32)")
-        peer_var = self.cse.newvar(dtype=torch.int64, shape=())
+        if config._symm_mem_sync_mode == "lamport":
+            self._codegen_lamport_reduce_load(load_buffer, indexing, shape_str)
+        else:
+            self._codegen_pull_reduce_load(load_buffer, indexing, shape_str)
+
+        acc_var = self.cse.generate(
+            load_buffer,
+            "_symm_acc",
+            dtype=torch.float32,
+            shape=shape,
+        )
+        self.cse.put(cse_key, acc_var)
+
+        if not self.inside_reduction or not indexing.has_rmask():
+            self.outside_loop_vars.add(acc_var)
+
+        return acc_var
+
+    def _codegen_pull_reduce_load(
+        self, load_buffer, indexing, shape_str: str
+    ) -> None:
+        """Emit pull-model P2P reduce: loop over peers, NVLink loads."""
+        load_buffer.writeline(
+            f"_symm_acc = tl.zeros([{shape_str}], dtype=tl.float32)"
+        )
         load_buffer.writeline(
             "_symm_buf_ptrs_u64 = symm_buf_ptrs.to(tl.pointer_type(tl.uint64))"
         )
         load_buffer.writeline("for _symm_i in tl.static_range(SYMM_WORLD_SIZE):")
         with load_buffer.indent():
             load_buffer.writeline(
-                f"{peer_var} = tl.load(_symm_buf_ptrs_u64 + _symm_i)"
-                f".to(tl.pointer_type(tl.bfloat16))"
+                "_symm_peer = tl.load(_symm_buf_ptrs_u64 + _symm_i)"
+                ".to(tl.pointer_type(tl.bfloat16))"
             )
             load_buffer.writeline(
-                f"{acc_var} = {acc_var} + tl.load("
-                f"{peer_var} + ({indexing.index_str}), "
+                f"_symm_acc = _symm_acc + tl.load("
+                f"_symm_peer + ({indexing.index_str}), "
                 f"{indexing.mask_str}, other=0.0).to(tl.float32)"
             )
 
-        result_var = self.cse.generate(
-            load_buffer,
-            str(acc_var),
-            dtype=torch.float32,
-            shape=shape,
+    def _codegen_lamport_reduce_load(
+        self, load_buffer, indexing, shape_str: str
+    ) -> None:
+        """Emit Lamport push-model reduce: poll local buffer + accumulate."""
+        load_buffer.writeline(
+            "_lam_row_offset = xoffset.to(tl.int64) * r0_numel"
         )
-        self.cse.put(cse_key, result_var)
-
-        if not self.inside_reduction or not indexing.has_rmask():
-            self.outside_loop_vars.add(result_var)
-
-        return result_var
+        load_buffer.writeline("_lam_cols = tl.arange(0, R0_BLOCK)")
+        load_buffer.writeline("_lam_col_mask = _lam_cols < r0_numel")
+        load_buffer.writeline("_lam_chunk = xnumel * r0_numel")
+        load_buffer.writeline("_lam_n_words = r0_numel // 2")
+        load_buffer.writeline(
+            "_symm_acc = _lamport_poll_and_reduce("
+            "symm_buf_ptrs, _lam_row_offset, _lam_cols, _lam_col_mask, "
+            "_lam_chunk, _lam_n_words, _lam_buf_offset, "
+            "SYMM_RANK, SYMM_WORLD_SIZE, R0_BLOCK)"
+        )
+        # The helper returns [R0_BLOCK] (1D). If the kernel body uses 2D
+        # indexing [XBLOCK, R0_BLOCK], reshape to match.
+        shape = indexing.expand_shape or TritonSymbols.get_block_shape(indexing.index)
+        if shape and len(shape) > 1:
+            load_buffer.writeline(
+                f"_symm_acc = tl.reshape(_symm_acc, [{shape_str}])"
+            )
 
     def store(
         self, name: str, index: sympy.Expr, value: CSEVariable, mode: StoreMode = None
@@ -5464,6 +5505,62 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             """
         )
 
+    def _codegen_lamport_prologue(self, code: IndentedBuffer) -> None:
+        """
+        Emit the Lamport push prologue: load offsets from the GPU tensor,
+        then for each row in this CTA's tile, strip -0.0 sentinels from
+        the input data and push it to all peers' local buffers, then
+        issue a system-scope fence.
+        """
+        assert self.symm_mem_input_name is not None
+        in_var = self.args.input(self.symm_mem_input_name)
+        code.splice(
+            f"""
+            # --- Lamport prologue: load offsets + push local data to all peers ---
+            _lam_buf_offset = tl.load(_lam_offsets)
+            _lam_clear_offset = tl.load(_lam_offsets + 1)
+            _lam_x_base = tl.program_id(0).to(tl.int64) * XBLOCK
+            _lam_cols = tl.arange(0, R0_BLOCK)
+            _lam_col_mask = _lam_cols < r0_numel
+            _lam_chunk = xnumel * r0_numel
+            for _lam_row in tl.static_range(XBLOCK):
+                _lam_row_idx = _lam_x_base + _lam_row
+                _lam_row_mask = _lam_row_idx < xnumel
+                _lam_row_offset = _lam_row_idx * r0_numel
+                _lam_idx = _lam_row_offset + _lam_cols
+                _lam_mask = _lam_col_mask & _lam_row_mask
+                _lam_data = tl.load({in_var} + _lam_idx, _lam_mask, other=0.0)
+                _lam_data = _lamport_remove_neg_zero(_lam_data)
+                _lamport_push_to_peers(symm_buf_ptrs, _lam_data, _lam_row_offset, _lam_cols, _lam_mask, _lam_chunk, _lam_buf_offset, SYMM_RANK, SYMM_WORLD_SIZE)
+            _lamport_fence_sys()
+            """
+        )
+
+    def _codegen_lamport_epilogue(self, code: IndentedBuffer) -> None:
+        """
+        Emit the Lamport epilogue: clear the old buffer slot (from 2
+        iterations ago) by writing -0.0 sentinels.  Triple buffering
+        guarantees no rank is still reading from that slot.
+
+        ``_lam_clear_offset`` was loaded from the offsets tensor in the
+        prologue and is still in scope.
+        """
+        code.splice(
+            """
+            # --- Lamport epilogue: clear old buffer slot ---
+            _lam_x_base_e = tl.program_id(0).to(tl.int64) * XBLOCK
+            _lam_cols_e = tl.arange(0, R0_BLOCK)
+            _lam_col_mask_e = _lam_cols_e < r0_numel
+            _lam_chunk_e = xnumel * r0_numel
+            for _lam_row_e in tl.static_range(XBLOCK):
+                _lam_row_idx_e = _lam_x_base_e + _lam_row_e
+                _lam_row_mask_e = _lam_row_idx_e < xnumel
+                _lam_row_offset_e = _lam_row_idx_e * r0_numel
+                _lam_mask_e = _lam_col_mask_e & _lam_row_mask_e
+                _lamport_clear_old_slot(symm_buf_ptrs, _lam_row_offset_e, _lam_cols_e, _lam_mask_e, _lam_chunk_e, _lam_clear_offset, SYMM_RANK, SYMM_WORLD_SIZE, R0_BLOCK)
+            """
+        )
+
     def _codegen_grid_stride_body(self, code: IndentedBuffer) -> None:
         """
         Wrap the kernel body in a grid-stride loop so a capped grid of
@@ -5524,17 +5621,22 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             size_hints[prefix] = size_hint
 
         if self.has_symm_mem_p2p:
-            threshold = config._symm_mem_host_barrier_threshold
-            if threshold == -1:
+            sync_mode = config._symm_mem_sync_mode
+            if sync_mode == "lamport":
+                self._symm_mem_use_lamport = True
                 self._symm_mem_use_host_barriers = False
-            elif threshold == 0:
-                self._symm_mem_use_host_barriers = True
             else:
-                xnumel = V.graph.sizevars.simplify(self.numels["x"])
-                is_static = isinstance(xnumel, (sympy.Integer, int))
-                self._symm_mem_use_host_barriers = (
-                    not is_static or int(xnumel) > threshold
-                )
+                threshold = config._symm_mem_host_barrier_threshold
+                if threshold == -1:
+                    self._symm_mem_use_host_barriers = False
+                elif threshold == 0:
+                    self._symm_mem_use_host_barriers = True
+                else:
+                    xnumel = V.graph.sizevars.simplify(self.numels["x"])
+                    is_static = isinstance(xnumel, (sympy.Integer, int))
+                    self._symm_mem_use_host_barriers = (
+                        not is_static or int(xnumel) > threshold
+                    )
 
         if name is None:
             code.splice(self.gen_common_triton_imports())
@@ -5544,7 +5646,19 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             else:
                 code.splice("triton_helpers.set_driver_to_gpu()")
 
-            if self.has_symm_mem_p2p and not self._symm_mem_use_host_barriers:
+            if self.has_symm_mem_p2p and self._symm_mem_use_lamport:
+                code.splice(
+                    """
+                    from torch._inductor.runtime.lamport_helpers import (
+                        _fence_sys as _lamport_fence_sys,
+                        _remove_neg_zero as _lamport_remove_neg_zero,
+                        _lamport_push_to_peers,
+                        _lamport_poll_and_reduce,
+                        _lamport_clear_old_slot,
+                    )
+                    """
+                )
+            elif self.has_symm_mem_p2p and not self._symm_mem_use_host_barriers:
                 import pathlib
 
                 kraken_dir = str(
@@ -5648,14 +5762,12 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             add_constexpr_arg("NUM_STAGES")
 
         if self.has_symm_mem_p2p:
-            # Symmetric memory P2P allreduce pointer args.  These are
-            # int64 CUDA tensors wrapping the SymmetricMemory device
-            # pointers.  The wrapper creates them via symm_mem_setup.
-            _symm_args = (
-                ("symm_buf_ptrs",)
-                if self._symm_mem_use_host_barriers
-                else ("symm_buf_ptrs", "symm_signal_pad_ptrs")
-            )
+            if self._symm_mem_use_lamport:
+                _symm_args = ("symm_buf_ptrs",)
+            elif self._symm_mem_use_host_barriers:
+                _symm_args = ("symm_buf_ptrs",)
+            else:
+                _symm_args = ("symm_buf_ptrs", "symm_signal_pad_ptrs")
             for _symm_arg in _symm_args:
                 signature.append(
                     TensorArg(name=_symm_arg, buffer=_symm_arg, dtype=torch.int64)
@@ -5663,6 +5775,15 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 argdefs.append(ArgName(_symm_arg))
             add_constexpr_arg("SYMM_RANK")
             add_constexpr_arg("SYMM_WORLD_SIZE")
+            if self._symm_mem_use_lamport:
+                signature.append(
+                    TensorArg(
+                        name="_lam_offsets",
+                        buffer="_lam_offsets",
+                        dtype=torch.int64,
+                    )
+                )
+                argdefs.append(ArgName("_lam_offsets"))
 
         triton_meta_signature = signature_to_meta(
             signature, size_dtype=self.index_dtype, argdefs=argdefs
@@ -5866,17 +5987,22 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             self.codegen_static_numels(code)
             for old, new in self.args.aliases():
                 code.writeline(f"{old} = {new}")
-            if self.has_symm_mem_p2p and not self._symm_mem_use_host_barriers:
+            if self.has_symm_mem_p2p and self._symm_mem_use_lamport:
+                self._codegen_lamport_prologue(code)
+            elif self.has_symm_mem_p2p and not self._symm_mem_use_host_barriers:
                 self._codegen_symm_mem_prologue(code)
             if (
                 self.has_symm_mem_p2p
                 and not self._symm_mem_use_host_barriers
+                and not self._symm_mem_use_lamport
                 and config._symm_mem_grid_cap > 0
             ):
                 self._codegen_grid_stride_body(code)
             else:
                 code.splice(self.body)
-            if self.has_symm_mem_p2p and not self._symm_mem_use_host_barriers:
+            if self.has_symm_mem_p2p and self._symm_mem_use_lamport:
+                self._codegen_lamport_epilogue(code)
+            elif self.has_symm_mem_p2p and not self._symm_mem_use_host_barriers:
                 self._codegen_symm_mem_epilogue(code)
             if config.triton.proton_profiling:
                 code.writeline(f'pl.exit_scope("{kernel_name}")')
@@ -5994,7 +6120,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         self.add_numel_to_call_args(name, call_args, arg_types)
 
         if self.has_symm_mem_p2p:
-            if self._symm_mem_use_host_barriers:
+            if self._symm_mem_use_lamport:
+                self._emit_lamport_setup(wrapper, call_args)
+            elif self._symm_mem_use_host_barriers:
                 self._emit_symm_mem_host_barrier_setup(wrapper, call_args)
             else:
                 self._emit_symm_mem_setup(wrapper, call_args)
@@ -6070,6 +6198,35 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
     def _emit_symm_mem_host_barrier_epilogue(self, wrapper) -> None:
         """Emit post-kernel host-side barrier in the wrapper."""
         wrapper.writeline(f'symm_mem_host_barrier("{self._symm_group_name}")')
+
+    def _emit_lamport_setup(self, wrapper, call_args: list) -> None:
+        """
+        Emit wrapper code for Lamport push-model mode: allocate triple-
+        buffered workspace, advance rotation offsets on GPU, append to
+        call_args.  All offset ops are GPU tensor ops so they are safely
+        captured in CUDA graphs.
+        """
+        assert self.symm_mem_input_name is not None
+        in_var = self.symm_mem_input_name
+        for outer in self.args.input_buffers.keys():
+            if outer == self.symm_mem_input_name:
+                in_var = outer
+                break
+
+        wrapper.imports.writeline(
+            "from torch._inductor.runtime.lamport_helpers import "
+            "lamport_workspace_setup, lamport_advance_offsets"
+        )
+        wrapper.writeline(
+            f"_lam_ptrs, _symm_rank, _symm_world_size, _lam_offsets = "
+            f'lamport_workspace_setup({in_var}, "{self._symm_group_name}")'
+        )
+        wrapper.writeline(
+            f'lamport_advance_offsets("{self._symm_group_name}")'
+        )
+
+        call_args.append("_lam_ptrs")
+        call_args.append("_lam_offsets")
 
     def codegen_nan_check(self) -> None:
         wrapper = V.graph.wrapper_code

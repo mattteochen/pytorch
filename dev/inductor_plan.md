@@ -869,11 +869,156 @@ from torch._inductor.runtime.p2p_push_helpers import push_to_peers, poll_for_sen
 4. **(Optional):** Push model with sentinels. Only worthwhile if host
    barrier latency (~6µs) is a bottleneck for the target workload.
 
+## Lamport Push-Model Codegen: Implemented, Perf Work Needed
+
+### Status: functionally correct, CUDA-graph-safe, but 2.3x slower than standalone
+
+The Lamport push-model sync mode is implemented as an alternative to
+pull+host-barriers and pull+device-CAS. Selected via
+`config._symm_mem_sync_mode = "lamport"`. All 24 tests pass (including
+2 new Lamport-specific tests with codegen structural assertions).
+
+```
+torch.compile(options={
+    "_fused_all_reduce_rmsnorm": True,
+    "_symm_mem_sync_mode": "lamport",
+})
+```
+
+### Files added/modified
+
+| File | Role |
+|------|------|
+| `torch/_inductor/runtime/lamport_helpers.py` | **NEW**: @triton.jit helpers (fence, volatile load, push, poll+reduce, clear) + Python runtime (triple-buffer workspace, GPU-resident offset rotation) |
+| `torch/_inductor/codegen/triton.py` | Mode selection (`_symm_mem_use_lamport`), Lamport imports, `_codegen_lamport_prologue`, `_codegen_lamport_epilogue`, `_codegen_lamport_reduce_load`, `_emit_lamport_setup`, kernel argdefs for `_lam_offsets` TensorArg |
+| `torch/_inductor/config.py` | `_symm_mem_sync_mode: str = "host_barrier"` (new, values: host_barrier/device_cas/lamport) |
+| `test/distributed/test_fused_allreduce_rmsnorm.py` | 2 new tests with codegen structural assertions |
+| `dev/profile_fused_allreduce_rmsnorm.py` | `compiled_lamport` variant (3d) + renamed standalone to `lamport_standalone` |
+
+### CUDA graph safety
+
+Triple-buffer rotation uses a GPU-resident counter tensor. The wrapper
+emits `counter.add_(1)` + `offsets[0] = (counter % 3) * slot_elems` +
+`offsets[1] = ((counter + 2) % 3) * slot_elems` — all element-wise
+GPU ops that capture and replay correctly. The kernel receives offsets
+via a `[2]` int64 TensorArg and loads them with `tl.load`.
+
+### Profiling results (4xGB200, HIDDEN=2880, CUDA graphs, --timer)
+
+NUM_TOKENS=1:
+
+| Variant | us/iter | vs baseline |
+|---------|---------|-------------|
+| baseline (NCCL) | 34.4 | 1.00x |
+| compiled (device CAS) | 15.3 | 2.25x |
+| **compiled_lamport** (inductor) | **18.5** | **1.86x** |
+| lamport_standalone (handwritten) | 7.9 | 4.36x |
+| flashinfer (Lamport) | 5.9 | 5.81x |
+
+NUM_TOKENS=1024:
+
+| Variant | us/iter | vs baseline |
+|---------|---------|-------------|
+| baseline (NCCL) | 132.6 | 1.00x |
+| compiled (device CAS) | 85.2 | 1.56x |
+| compiled_host_barrier | 48.5 | 2.74x |
+| **compiled_lamport** | **74.4** | **1.78x** |
+| lamport_standalone | 67.7 | 1.96x |
+| flashinfer | 39.5 | 3.36x |
+
+### Performance gap analysis: compiled_lamport (18.5µs) vs standalone (7.9µs)
+
+The gap at 1 token is **~10.6µs** (2.3x). Root causes identified:
+
+**1. Wrapper-level GPU ops for offset rotation (~9µs)**
+
+The biggest cost. `lamport_advance_offsets` emits 3 GPU tensor ops
+before the kernel launch:
+```python
+counter.add_(1)                           # GPU op
+offsets[0] = (counter % 3) * slot_elems   # GPU op
+offsets[1] = ((counter + 2) % 3) * slot_elems  # GPU op
+```
+These are captured in the CUDA graph and replay on every iteration —
+~3µs each × 3 ops = ~9µs. The standalone kernel has zero wrapper ops
+(offsets are baked in as constexpr).
+
+**Fix options:**
+- **(a) Move offset computation INTO the Triton kernel.** Pass just the
+  counter tensor; the kernel computes `buf_offset = (counter % 3) *
+  chunk` inline. This eliminates all 3 wrapper GPU ops. The kernel reads
+  one scalar instead of two. The counter increment can also happen inside
+  the kernel (single `tl.atomic_add` on the counter, or have the wrapper
+  emit a single `counter.add_(1)` — 1 GPU op instead of 3).
+- **(b) Use constexpr offsets with 3 compiled kernel variants.** Pre-
+  compile the kernel for each of the 3 (buf_offset, clear_offset) pairs.
+  The wrapper selects which variant to call based on `counter % 3`. This
+  eliminates all runtime offset computation but requires 3x Triton
+  compilations. CUDA graph capture would need to capture all 3 variants
+  in a round-robin pattern.
+- **(c) Accept the overhead for CUDA graph safety.** The 3 GPU ops are
+  the price of correct triple-buffer rotation under CUDA graph replay.
+  Focus optimization effort on the in-kernel overhead instead.
+
+**2. Redundant pointer dereferences in helpers (~1µs)**
+
+Each of `_lamport_push_to_peers`, `_lamport_poll_and_reduce`, and
+`_lamport_clear_old_slot` independently re-derives `buf_ptrs_u64`:
+```python
+buf_ptrs_u64 = buf_ptrs.to(tl.pointer_type(tl.uint64))
+my_buf = tl.load(buf_ptrs_u64 + RANK).to(tl.pointer_type(tl.bfloat16))
+```
+The standalone kernel does this once and reuses across all phases.
+
+**Fix:** Compute `buf_ptrs_u64` and `my_buf` in the prologue and pass
+as arguments to the helpers. Or inline the push/poll/clear logic
+directly in the generated code (matching the standalone structure).
+
+**3. 2 extra global loads for offsets from tensor**
+
+The kernel loads `tl.load(_lam_offsets)` and `tl.load(_lam_offsets + 1)`
+at the top of the prologue. The standalone uses constexpr offsets (zero
+load cost). This is probably <0.1µs but adds to the gap.
+
+**Fix:** Solved by option (a) or (b) above.
+
+**4. Redundant variable recomputation**
+
+`_lam_cols`, `_lam_col_mask`, `_lam_chunk` are computed independently
+in the prologue, body, and epilogue. The Triton compiler may or may
+not CSE these across phases.
+
+**Fix:** Share variables across phases (codegen restructuring).
+
+### Recommended next step
+
+Option **(a)** from item 1: move offset computation into the kernel.
+This is the highest-impact fix (~9µs savings, closing most of the
+10.6µs gap) and keeps the CUDA-graph-safe design. The wrapper would
+emit just `counter.add_(1)` (1 GPU op) and pass the counter tensor
+to the kernel. The kernel computes offsets inline:
+```python
+_lam_iter = tl.load(_lam_counter)
+_lam_buf_offset = (_lam_iter % 3) * _lam_chunk
+_lam_clear_offset = ((_lam_iter + 2) % 3) * _lam_chunk
+```
+
+After this fix, the expected compiled_lamport time is ~9-10µs,
+close to the standalone's 7.9µs. The remaining ~1-2µs gap from
+redundant pointer dereferences can be addressed by inlining the
+helper logic.
+
 ## Improvements: Short Term
 
 - [x] **Switch to host-side barriers:** Remove device-side CAS from
       kernel, emit `symm_mem.barrier()` in wrapper before/after kernel.
       Result: 2.2x speedup at 2048 tokens (154→71µs), parity with fused_op.
+- [x] **Lamport push-model codegen:** Implemented as
+      `_symm_mem_sync_mode = "lamport"`. Functionally correct, CUDA-graph-
+      safe. Performance gap to standalone needs closing (see above).
+- [ ] **Close Lamport perf gap:** Move offset computation into kernel
+      (eliminate 3 wrapper GPU ops). Inline helper logic to avoid
+      redundant pointer dereferences. Target: <10µs at 1 token.
 - [ ] **Gate FX pass on tensor size:** Only replace `all_reduce + wait`
       with P2P when `numel * element_size < threshold` (default 1MB).
       Implement in `_can_replace()` using `node.meta["val"]`.
@@ -892,14 +1037,6 @@ from torch._inductor.runtime.p2p_push_helpers import push_to_peers, poll_for_sen
       beats both fused_op host barriers (73µs) and FlashInfer (65µs)
       at 2048 tokens with 4 GPUs. Combined with host barriers (instead
       of kraken's device-side CAS), two-shot should be even faster.
-- [ ] **Push model with sentinel sync:** Replace pull (NVLink reads
-      from peers) with push (NVLink writes to peers + local polling).
-      Implement via external `@triton.jit` helpers using
-      `tl.inline_asm_elementwise` for `fence.sc.sys` and
-      `ld.volatile.global`. Eliminates all barrier overhead.
-      Lower priority now that two-shot is confirmed faster at large
-      sizes — Lamport's advantage is primarily at small/medium sizes
-      where it eliminates barrier launches.
 - [ ] **LayerNorm variant:** FX pass already general (replaces all_reduce+wait).
       Inductor generates LayerNorm kernels automatically.
 - [ ] **Training support:** Currently inference-only. Training needs
@@ -914,5 +1051,4 @@ from torch._inductor.runtime.p2p_push_helpers import push_to_peers, poll_for_sen
 - [ ] **Generalize beyond allreduce:** reduce_scatter, all_gather.
 - [ ] **Multi-node via NVSHMEM:** `nvshmem.get()` instead of `tl.load`.
 - [ ] **Double buffering:** Eliminate epilogue sync.
-- [ ] **CUDA graph capture:** Test under `torch.cuda.graph()`.
 - [ ] **Upstream to PyTorch.**

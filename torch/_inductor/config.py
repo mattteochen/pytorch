@@ -1010,6 +1010,13 @@ _symm_mem_host_barrier_threshold: int = 0
 # Only effective when device-side CAS is active (host_barrier_threshold=-1).
 _symm_mem_grid_cap: int = 0
 
+# Synchronization mode for P2P allreduce kernels.
+# "host_barrier" = host-side sm.barrier() before/after kernel (default).
+# "device_cas"   = device-side per-block CAS atomics (kraken).
+# "lamport"      = Lamport push-model with -0.0 sentinel, zero barriers.
+# When set to "lamport", _symm_mem_host_barrier_threshold is ignored.
+_symm_mem_sync_mode: str = "host_barrier"
+
 
 # Enable/disable partitioned scatter optimization for atomic add kernels
 # this will improve kernel performance at cost of memory usage.

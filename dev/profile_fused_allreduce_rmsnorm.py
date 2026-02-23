@@ -3,17 +3,20 @@ Profile fused allreduce + RMSNorm: end-to-end SGLang-style repro.
 
 Simulates a decoder layer: linear (MoE stand-in) → allreduce → residual add → RMSNorm.
 
-Profiles nine variants:
-  1. baseline          – NCCL all_reduce + eager F.rms_norm
-  2. fused_op          – torch.ops.symm_mem.fused_all_reduce_rmsnorm (direct, host-side barriers)
-  3. compiled          – torch.compile with inductor P2P codegen (kraken device-side sync)
-  4. compiled_plain    – torch.compile default settings (no fused allreduce+rmsnorm option)
-  5. compiled_mempool  – compiled + mempool zero-copy (matmul → symm mem, single kernel)
-  6. mempool           – mem pool zero-copy with handwritten kernel (host-side barriers)
-  7. kraken            – kraken handwritten single kernel (one-shot, device-side sync)
-  8. kraken_2shot      – kraken handwritten single kernel (two-shot, device-side sync)
-  9. flashinfer        – FlashInfer trtllm_allreduce_fusion one-shot (no quant)
- 10. lamport           – Lamport push-model Triton kernel (zero barriers, zero atomics)
+Profiles variants:
+  1. baseline            – NCCL all_reduce + eager F.rms_norm
+  2. fused_op            – torch.ops.symm_mem.fused_all_reduce_rmsnorm (direct, host-side barriers)
+  3. compiled            – torch.compile with inductor P2P codegen (kraken device-side sync)
+  3b. compiled_host_barrier – compiled + forced host barriers
+  3c. compiled_gridcap36 – compiled + device CAS + grid cap at 36 CTAs
+  3d. compiled_lamport   – compiled + Lamport push-model (zero barriers, inductor codegen)
+  4. compiled_plain      – torch.compile default settings (no fused allreduce+rmsnorm option)
+  5. compiled_mempool    – compiled + mempool zero-copy (matmul → symm mem, single kernel)
+  6. mempool             – mem pool zero-copy with handwritten kernel (host-side barriers)
+  7. kraken              – kraken handwritten single kernel (one-shot, device-side sync)
+  8. kraken_2shot        – kraken handwritten single kernel (two-shot, device-side sync)
+  9. flashinfer          – FlashInfer trtllm_allreduce_fusion one-shot (no quant)
+ 10. lamport_standalone  – Lamport push-model standalone Triton kernel (reference)
 
 Launch (torch profiler):
     torchrun --nproc_per_node=NUM_GPUS dev/profile_fused_allreduce_rmsnorm.py
@@ -407,6 +410,40 @@ def main():
         )
     )
 
+    # --- Variant 3d: compiled + Lamport push-model (zero barriers) ---
+    def _make_lamport_ar_norm(eps_val):
+        @torch.compile(options={
+            "_fused_all_reduce_rmsnorm": True,
+            "_symm_mem_sync_mode": "lamport",
+        })
+        def _fn(x, residual, weight, group_name):
+            reduced = funcol.all_reduce(x, "sum", group_name)
+            h = reduced + residual
+            normed = F.rms_norm(h, weight.shape, weight, eps_val)
+            return normed, h
+        return _fn
+
+    ar_norm_lamport = _make_lamport_ar_norm(EPS)
+
+    def compiled_lamport_call():
+        h = x
+        return ar_norm_lamport(h, residual, weight, group_name)
+
+    results.append(
+        (
+            "compiled_lamport",
+            _profile(
+                "compiled_lamport",
+                compiled_lamport_call,
+                rank,
+                warmup=WARMUP_ITERS + 5,
+                cuda_graph=True,
+                nsys_mode=nsys_mode,
+                timer_mode=timer_mode,
+            ),
+        )
+    )
+
     # --- Variant 4: torch.compile plain (default options) ---
     ar_norm_compiled_plain = _make_compiled_plain_ar_norm(EPS)
 
@@ -660,7 +697,7 @@ def main():
         if rank == 0:
             print(f"\nSkipping FlashInfer variant: {e}")
 
-    # --- Variant 10: Lamport push-model (zero barriers, zero atomics) ---
+    # --- Variant 10: Lamport push-model standalone (reference, not inductor) ---
     try:
         from lamport_allreduce_rmsnorm import (
             lamport_allreduce_rmsnorm,
@@ -672,7 +709,7 @@ def main():
         )
         _lam_iter = [0]
 
-        def lamport_call():
+        def lamport_standalone_call():
             h = x
             r = lamport_allreduce_rmsnorm(
                 h, weight, _lam_buf_ptrs, _lam_slot_elems, _lam_iter[0],
@@ -683,10 +720,10 @@ def main():
 
         results.append(
             (
-                "lamport",
+                "lamport_standalone",
                 _profile(
-                    "lamport",
-                    lamport_call,
+                    "lamport_standalone",
+                    lamport_standalone_call,
                     rank,
                     cuda_graph=True,
                     nsys_mode=nsys_mode,
@@ -696,7 +733,7 @@ def main():
         )
     except (ImportError, RuntimeError) as e:
         if rank == 0:
-            print(f"\nSkipping Lamport variant: {e}")
+            print(f"\nSkipping Lamport standalone variant: {e}")
 
     # --- Summary table ---
     if rank == 0 and results:
