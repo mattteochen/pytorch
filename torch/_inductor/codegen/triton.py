@@ -2574,6 +2574,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         self.symm_mem_world_size: int | None = None
         self.symm_mem_input_name: str | None = None
         self._symm_group_name: str = ""
+        self._symm_mem_use_host_barriers: bool = False
 
     @staticmethod
     def _has_stride1_on_rdim(index) -> bool:
@@ -3680,12 +3681,21 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         self.args.input(name)
 
         indexing = self.indexing(index, block_ptr=False)
-        load_buffer = self.get_load_buffer(indexing)
 
         if not isinstance(indexing, IndexingOptions):
             raise NotImplementedError(
                 "symm_mem_p2p_reduce_load only supports IndexingOptions"
             )
+
+        cse_key = (
+            f"symm_mem_p2p_reduce_load({name}, {indexing.index_str}, {world_size})"
+        )
+        cached = self.cse.try_get(cse_key)
+        if cached is not None:
+            cached.use_count += 1
+            return cached
+
+        load_buffer = self.get_load_buffer(indexing)
 
         shape = indexing.expand_shape or TritonSymbols.get_block_shape(indexing.index)
         shape_str = ", ".join(str(s) for s in shape) if shape else "1"
@@ -3714,6 +3724,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             dtype=torch.float32,
             shape=shape,
         )
+        self.cse.put(cse_key, result_var)
 
         if not self.inside_reduction or not indexing.has_rmask():
             self.outside_loop_vars.add(result_var)
@@ -5461,6 +5472,19 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 size_hint = next_power_of_2(int(numel_hint))
             size_hints[prefix] = size_hint
 
+        if self.has_symm_mem_p2p:
+            threshold = config._symm_mem_host_barrier_threshold
+            if threshold == -1:
+                self._symm_mem_use_host_barriers = False
+            elif threshold == 0:
+                self._symm_mem_use_host_barriers = True
+            else:
+                xnumel = V.graph.sizevars.simplify(self.numels["x"])
+                is_static = isinstance(xnumel, (sympy.Integer, int))
+                self._symm_mem_use_host_barriers = (
+                    not is_static or int(xnumel) > threshold
+                )
+
         if name is None:
             code.splice(self.gen_common_triton_imports())
             device_type = V.graph.get_current_device_or_throw().type
@@ -5469,7 +5493,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             else:
                 code.splice("triton_helpers.set_driver_to_gpu()")
 
-            if self.has_symm_mem_p2p:
+            if self.has_symm_mem_p2p and not self._symm_mem_use_host_barriers:
                 import pathlib
 
                 kraken_dir = str(
@@ -5576,7 +5600,12 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             # Symmetric memory P2P allreduce pointer args.  These are
             # int64 CUDA tensors wrapping the SymmetricMemory device
             # pointers.  The wrapper creates them via symm_mem_setup.
-            for _symm_arg in ("symm_buf_ptrs", "symm_signal_pad_ptrs"):
+            _symm_args = (
+                ("symm_buf_ptrs",)
+                if self._symm_mem_use_host_barriers
+                else ("symm_buf_ptrs", "symm_signal_pad_ptrs")
+            )
+            for _symm_arg in _symm_args:
                 signature.append(
                     TensorArg(name=_symm_arg, buffer=_symm_arg, dtype=torch.int64)
                 )
@@ -5779,10 +5808,10 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             self.codegen_static_numels(code)
             for old, new in self.args.aliases():
                 code.writeline(f"{old} = {new}")
-            if self.has_symm_mem_p2p:
+            if self.has_symm_mem_p2p and not self._symm_mem_use_host_barriers:
                 self._codegen_symm_mem_prologue(code)
             code.splice(self.body)
-            if self.has_symm_mem_p2p:
+            if self.has_symm_mem_p2p and not self._symm_mem_use_host_barriers:
                 self._codegen_symm_mem_epilogue(code)
             if config.triton.proton_profiling:
                 code.writeline(f'pl.exit_scope("{kernel_name}")')
@@ -5900,7 +5929,10 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         self.add_numel_to_call_args(name, call_args, arg_types)
 
         if self.has_symm_mem_p2p:
-            self._emit_symm_mem_setup(wrapper, call_args)
+            if self._symm_mem_use_host_barriers:
+                self._emit_symm_mem_host_barrier_setup(wrapper, call_args)
+            else:
+                self._emit_symm_mem_setup(wrapper, call_args)
 
         for ws in self.args.workspace_args:
             wrapper.generate_workspace_allocation(ws)
@@ -5914,23 +5946,25 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             inductor_meta=self.inductor_meta,
         )
 
+        if self.has_symm_mem_p2p and self._symm_mem_use_host_barriers:
+            self._emit_symm_mem_host_barrier_epilogue(wrapper)
+
         if deallocate_ws:
             self.deallocate_workspaces()
 
     def _emit_symm_mem_setup(self, wrapper, call_args: list) -> None:
         """
         Emit wrapper code that sets up symmetric memory pointers and
-        appends them to *call_args*.
+        appends them to *call_args*.  (Device-side CAS path.)
         """
         assert self.symm_mem_input_name is not None
-        # Resolve the input buffer's call-site variable name.
         in_var = self.symm_mem_input_name
-        for outer, inner in self.args.input_buffers.items():
+        for outer in self.args.input_buffers.keys():
             if outer == self.symm_mem_input_name:
                 in_var = outer
                 break
 
-        wrapper.writeline(
+        wrapper.imports.writeline(
             "from torch._inductor.runtime.symm_mem_helpers import symm_mem_setup"
         )
         wrapper.writeline(
@@ -5938,10 +5972,39 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             f'symm_mem_setup({in_var}, "{self._symm_group_name}")'
         )
 
-        # Append the symm mem pointer tensors (matching the order in the
-        # kernel signature added by codegen_kernel).
         call_args.append("_symm_buf_ptrs")
         call_args.append("_symm_signal_pad_ptrs")
+
+    def _emit_symm_mem_host_barrier_setup(self, wrapper, call_args: list) -> None:
+        """
+        Emit wrapper code for host-barrier mode: copy input to symmetric
+        memory workspace, pre-kernel barrier, and append buf_ptrs to
+        *call_args*.
+        """
+        assert self.symm_mem_input_name is not None
+        in_var = self.symm_mem_input_name
+        for outer in self.args.input_buffers.keys():
+            if outer == self.symm_mem_input_name:
+                in_var = outer
+                break
+
+        skip_copy = "True" if config._symm_mem_skip_prologue_copy else "False"
+        wrapper.imports.writeline(
+            "from torch._inductor.runtime.symm_mem_helpers import "
+            "symm_mem_host_barrier_setup, symm_mem_host_barrier"
+        )
+        wrapper.writeline(
+            f"_symm_buf_ptrs, _symm_rank, _symm_world_size = "
+            f"symm_mem_host_barrier_setup("
+            f'{in_var}, "{self._symm_group_name}", skip_copy={skip_copy})'
+        )
+        wrapper.writeline(f'symm_mem_host_barrier("{self._symm_group_name}")')
+
+        call_args.append("_symm_buf_ptrs")
+
+    def _emit_symm_mem_host_barrier_epilogue(self, wrapper) -> None:
+        """Emit post-kernel host-side barrier in the wrapper."""
+        wrapper.writeline(f'symm_mem_host_barrier("{self._symm_group_name}")')
 
     def codegen_nan_check(self) -> None:
         wrapper = V.graph.wrapper_code

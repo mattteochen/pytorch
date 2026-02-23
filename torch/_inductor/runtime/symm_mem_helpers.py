@@ -13,18 +13,11 @@ import torch
 _symm_mem_cache: dict[str, Any] = {}
 
 
-def symm_mem_setup(
+def _get_cached(
     input_tensor: torch.Tensor,
     group_name: str,
-) -> tuple[torch.Tensor, torch.Tensor, int, int]:
-    """
-    Return cached symm-mem pointer tensors for *group_name*.
-
-    The first call performs the workspace allocation and rendezvous (a
-    collective).  Subsequent calls return cached CUDA int64 tensors.
-
-    Returns ``(buf_ptrs_tensor, signal_pad_ptrs_tensor, rank, world_size)``.
-    """
+) -> tuple[Any, torch.Tensor, torch.Tensor, int, int]:
+    """Return ``(sm_handle, buf_ptrs, sig_ptrs, rank, world_size)``, cached."""
     key = group_name
     if key in _symm_mem_cache:
         return _symm_mem_cache[key]
@@ -50,6 +43,53 @@ def symm_mem_setup(
         device=device,
     )
 
-    result = (buf_ptrs, sig_ptrs, rank, world_size)
+    result = (sm, buf_ptrs, sig_ptrs, rank, world_size)
     _symm_mem_cache[key] = result
     return result
+
+
+def symm_mem_setup(
+    input_tensor: torch.Tensor,
+    group_name: str,
+) -> tuple[torch.Tensor, torch.Tensor, int, int]:
+    """
+    Return cached symm-mem pointer tensors for *group_name*.
+
+    The first call performs the workspace allocation and rendezvous (a
+    collective).  Subsequent calls return cached CUDA int64 tensors.
+
+    Returns ``(buf_ptrs_tensor, signal_pad_ptrs_tensor, rank, world_size)``.
+    """
+    _sm, buf_ptrs, sig_ptrs, rank, world_size = _get_cached(input_tensor, group_name)
+    return (buf_ptrs, sig_ptrs, rank, world_size)
+
+
+def symm_mem_host_barrier_setup(
+    input_tensor: torch.Tensor,
+    group_name: str,
+    skip_copy: bool = False,
+) -> tuple[torch.Tensor, int, int]:
+    """
+    Pre-kernel setup for host-barrier mode.
+
+    Copies *input_tensor* into the symmetric memory workspace (unless
+    *skip_copy*).  The caller is responsible for issuing
+    ``symm_mem_host_barrier`` before and after the kernel.
+
+    Returns ``(buf_ptrs_tensor, rank, world_size)`` for the kernel call.
+    """
+    sm, buf_ptrs, _sig_ptrs, rank, world_size = _get_cached(input_tensor, group_name)
+
+    if not skip_copy:
+        local_buf = sm.get_buffer(rank, input_tensor.shape, input_tensor.dtype)
+        local_buf.copy_(input_tensor)
+
+    return (buf_ptrs, rank, world_size)
+
+
+def symm_mem_host_barrier(
+    group_name: str,
+) -> None:
+    """Post-kernel host-side barrier using the cached SymmetricMemory handle."""
+    sm = _symm_mem_cache[group_name][0]
+    sm.barrier(channel=0)

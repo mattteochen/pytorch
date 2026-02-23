@@ -998,6 +998,12 @@ _fused_all_reduce_rmsnorm: bool = False
 # in symmetric memory (e.g. via symm_mem.get_mem_pool()).
 _symm_mem_skip_prologue_copy: bool = False
 
+# xnumel threshold for host-side barriers in P2P allreduce kernels.
+# 0 = always use host barriers (recommended default).
+# -1 = never use host barriers (always device-side CAS).
+# N > 0 = use host barriers when xnumel > N or xnumel is dynamic.
+_symm_mem_host_barrier_threshold: int = 0
+
 
 # Enable/disable partitioned scatter optimization for atomic add kernels
 # this will improve kernel performance at cost of memory usage.
