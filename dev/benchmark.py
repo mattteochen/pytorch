@@ -22,12 +22,9 @@ import contextlib
 import itertools
 import logging
 import os
+import sys
 import time
 from typing import Optional
-
-import torch  # type: ignore
-import torch.distributed as dist  # type: ignore
-import torch.distributed._symmetric_memory  # register symm_mem ops before torch.compile
 
 from sglang.srt.distributed import get_tp_group, tensor_model_parallel_all_reduce
 from sglang.srt.distributed.parallel_state import (
@@ -37,13 +34,22 @@ from sglang.srt.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from sglang.srt.layers.layernorm import RMSNorm  # noqa
-from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype as SGLANG_FP8_DTYPE
-from sglang.srt.layers.quantization.fp8_kernel import static_quant_fp8
+from sglang.srt.layers.quantization.fp8_kernel import (
+    fp8_dtype as SGLANG_FP8_DTYPE,
+    static_quant_fp8,
+)
+
+import torch  # type: ignore
+import torch.distributed as dist  # type: ignore
+import torch.distributed._symmetric_memory  # register symm_mem ops before torch.compile
+
 
 try:
-    from sgl_kernel import fused_add_rmsnorm as SGL_FUSED_ADD_RMS_NORM
-    from sgl_kernel import rmsnorm as SGL_RMS_NORM
-    from sgl_kernel import scaled_fp4_quant as SGL_SCALED_FP4_QUANT
+    from sgl_kernel import (
+        fused_add_rmsnorm as SGL_FUSED_ADD_RMS_NORM,
+        rmsnorm as SGL_RMS_NORM,
+        scaled_fp4_quant as SGL_SCALED_FP4_QUANT,
+    )
 except Exception:  # pragma: no cover - fallback on non-supported platforms
     SGL_FUSED_ADD_RMS_NORM = None
     SGL_RMS_NORM = None
@@ -54,6 +60,7 @@ FP8_DTYPE = SGLANG_FP8_DTYPE
 logger = logging.getLogger(__name__)
 
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+
 
 set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
 
@@ -483,28 +490,36 @@ def _make_inductor_fused_ar_norm(eps: float):
     import torch.distributed._functional_collectives as funcol
     import torch.nn.functional as F
 
-    @torch.compile(
-        options={"_fused_all_reduce_rmsnorm": True},
-    )
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__))))
+    from compile import compile_with_debug
+
     def _ar_norm(x, residual, weight, group_name):
         reduced = funcol.all_reduce(x, "sum", group_name)
         h = reduced + residual
         normed = F.rms_norm(h, weight.shape, weight, eps)
         return normed, h
 
-    return _ar_norm
+    return compile_with_debug(
+        _ar_norm,
+        inductor_kwargs={"_fused_all_reduce_rmsnorm": True},
+    )
 
 
 def _make_inductor_p2p_sglang_norm(rmsnorm_layer: RMSNorm):
     """Compiled P2P allreduce + SGLang RMSNorm.forward_native (fused into one kernel)."""
     import torch.distributed._functional_collectives as funcol
 
-    @torch.compile(options={"_fused_all_reduce_rmsnorm": True})
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__))))
+    from compile import compile_with_debug
+
     def _ar_norm(x, residual, group_name):
         reduced = funcol.all_reduce(x, "sum", group_name)
         return rmsnorm_layer.forward_native(reduced, residual)
 
-    return _ar_norm
+    return compile_with_debug(
+        _ar_norm,
+        inductor_kwargs={"_fused_all_reduce_rmsnorm": True},
+    )
 
 
 def _make_funcol_compiled_ar_norm(eps: float):
@@ -651,7 +666,6 @@ def benchmark_operation(
     return avg_time_ms
 
 
-
 def run_benchmarks(
     seq_len: int,
     hidden_dim: int,
@@ -721,9 +735,7 @@ def run_benchmarks(
             funcol_ar_norm = _make_funcol_compiled_ar_norm(rms_eps)
 
             def _funcol_compiled_call():
-                return funcol_ar_norm(
-                    input_tensor, residual, rms_gamma, group_name
-                )
+                return funcol_ar_norm(input_tensor, residual, rms_gamma, group_name)
 
             time_ms = benchmark_operation(_funcol_compiled_call)
             results["funcol_compiled_allreduce_rmsnorm"] = time_ms
@@ -744,9 +756,7 @@ def run_benchmarks(
             inductor_ar_norm = _make_inductor_fused_ar_norm(rms_eps)
 
             def _inductor_fused_call():
-                return inductor_ar_norm(
-                    input_tensor, residual, rms_gamma, group_name
-                )
+                return inductor_ar_norm(input_tensor, residual, rms_gamma, group_name)
 
             time_ms = benchmark_operation(_inductor_fused_call)
             results["inductor_fused_p2p_allreduce_rmsnorm"] = time_ms

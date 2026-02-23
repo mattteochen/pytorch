@@ -98,18 +98,20 @@ class DummyDecoderLayer(nn.Module):
 
 
 def _make_compiled_ar_norm(eps: float):
-    """Inductor generates a single P2P kernel with kraken device-side sync."""
+    """Inductor generates a single P2P kernel with host-side barriers."""
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__))))
+    from compile import compile_with_debug
 
-    @torch.compile(
-        options={"_fused_all_reduce_rmsnorm": True},
-    )
     def _ar_norm(x, residual, weight, group_name):
         reduced = funcol.all_reduce(x, "sum", group_name)
         h = reduced + residual
         normed = F.rms_norm(h, weight.shape, weight, eps)
         return normed, h
 
-    return _ar_norm
+    return compile_with_debug(
+        _ar_norm,
+        inductor_kwargs={"_fused_all_reduce_rmsnorm": True},
+    )
 
 
 def _make_compiled_plain_ar_norm(eps: float):
@@ -126,8 +128,14 @@ def _make_compiled_plain_ar_norm(eps: float):
 
 
 def _profile(
-    name, fn, rank, warmup=WARMUP_ITERS, iters=PROFILE_ITERS, cuda_graph=False,
-    nsys_mode=False, timer_mode=False,
+    name,
+    fn,
+    rank,
+    warmup=WARMUP_ITERS,
+    iters=PROFILE_ITERS,
+    cuda_graph=False,
+    nsys_mode=False,
+    timer_mode=False,
 ) -> float | None:
     """Returns avg_us when timer_mode is True, else None."""
     import time
@@ -203,11 +211,13 @@ def _profile(
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--nsys", action="store_true",
+        "--nsys",
+        action="store_true",
         help="NVTX-only mode: skip torch profiler, emit NVTX ranges for nsys",
     )
     parser.add_argument(
-        "--timer", action="store_true",
+        "--timer",
+        action="store_true",
         help="Wall-clock timer only: no profiler, no NVTX, just elapsed time",
     )
     parser.add_argument(
@@ -236,9 +246,15 @@ def main():
     results: list[tuple[str, float | None]] = []
 
     if rank == 0:
-        mode_str = "timer" if timer_mode else ("nsys (NVTX only)" if nsys_mode else "torch profiler")
+        mode_str = (
+            "timer"
+            if timer_mode
+            else ("nsys (NVTX only)" if nsys_mode else "torch profiler")
+        )
         print(f"Mode: {mode_str}")
-        print(f"Config: NUM_TOKENS={num_tokens}, HIDDEN={HIDDEN}, world_size={dist.get_world_size()}")
+        print(
+            f"Config: NUM_TOKENS={num_tokens}, HIDDEN={HIDDEN}, world_size={dist.get_world_size()}"
+        )
         print(f"Symmetric memory workspace pre-allocated: {workspace_bytes} bytes")
 
     # --- Build dummy model ---
@@ -255,13 +271,19 @@ def main():
     )
 
     # --- Variant 1: baseline (NCCL + eager) ---
-    results.append(("baseline", _profile(
-        "baseline",
-        lambda: layer.forward_baseline(x, residual, group_name),
-        rank,
-        cuda_graph=True,
-        nsys_mode=nsys_mode, timer_mode=timer_mode,
-    )))
+    results.append(
+        (
+            "baseline",
+            _profile(
+                "baseline",
+                lambda: layer.forward_baseline(x, residual, group_name),
+                rank,
+                cuda_graph=True,
+                nsys_mode=nsys_mode,
+                timer_mode=timer_mode,
+            ),
+        )
+    )
 
     # --- Variant 2: fused op (direct call, no torch.compile) ---
     __import__("torch.distributed._symmetric_memory._fused_all_reduce_rmsnorm")
@@ -278,7 +300,19 @@ def main():
             eps=EPS,
         )
 
-    results.append(("fused_op", _profile("fused_op", fused_op_call, rank, cuda_graph=True, nsys_mode=nsys_mode, timer_mode=timer_mode)))
+    results.append(
+        (
+            "fused_op",
+            _profile(
+                "fused_op",
+                fused_op_call,
+                rank,
+                cuda_graph=True,
+                nsys_mode=nsys_mode,
+                timer_mode=timer_mode,
+            ),
+        )
+    )
 
     # --- Variant 3: torch.compile (inductor P2P codegen, kraken sync) ---
     ar_norm_compiled = _make_compiled_ar_norm(EPS)
@@ -288,10 +322,20 @@ def main():
         h = x
         return ar_norm_compiled(h, residual, weight, group_name)
 
-    results.append(("compiled", _profile(
-        "compiled", compiled_call, rank,
-        warmup=WARMUP_ITERS + 5, cuda_graph=True, nsys_mode=nsys_mode, timer_mode=timer_mode,
-    )))
+    results.append(
+        (
+            "compiled",
+            _profile(
+                "compiled",
+                compiled_call,
+                rank,
+                warmup=WARMUP_ITERS + 5,
+                cuda_graph=True,
+                nsys_mode=nsys_mode,
+                timer_mode=timer_mode,
+            ),
+        )
+    )
 
     # --- Variant 4: torch.compile plain (default options) ---
     ar_norm_compiled_plain = _make_compiled_plain_ar_norm(EPS)
@@ -300,16 +344,25 @@ def main():
         h = x
         return ar_norm_compiled_plain(h, residual, weight, group_name)
 
-    results.append(("compiled_plain", _profile(
-        "compiled_plain", compiled_plain_call, rank,
-        warmup=WARMUP_ITERS + 5, cuda_graph=True, nsys_mode=nsys_mode, timer_mode=timer_mode,
-    )))
+    results.append(
+        (
+            "compiled_plain",
+            _profile(
+                "compiled_plain",
+                compiled_plain_call,
+                rank,
+                warmup=WARMUP_ITERS + 5,
+                cuda_graph=True,
+                nsys_mode=nsys_mode,
+                timer_mode=timer_mode,
+            ),
+        )
+    )
 
     # --- Variant 5: compiled + mempool (zero-copy matmul → symm mem) ---
     # The matmul output lands directly in symmetric memory via the mem pool.
     # _symm_mem_skip_prologue_copy tells the codegen to skip the copy
     # (input is already where peers can read it) and just sync.
-    import torch._inductor.config as inductor_config
 
     mempool_for_compiled = symm_mem.get_mem_pool(device)
     with torch.cuda.use_mem_pool(mempool_for_compiled):
@@ -319,6 +372,7 @@ def main():
     symm_mem.rendezvous(h_symm_compiled, dist.group.WORLD)
 
     ar_norm_compiled_mp = _make_compiled_ar_norm(EPS)
+
     # Compile with skip_prologue_copy so the kernel omits the copy.
     # We need to trigger recompilation with the new config, so we
     # create a fresh compiled function.
@@ -344,10 +398,20 @@ def main():
         h_symm_compiled.copy_(x)
         return _ar_norm_mp(h_symm_compiled, residual, weight, group_name)
 
-    results.append(("compiled_mempool", _profile(
-        "compiled_mempool", compiled_mempool_call, rank,
-        warmup=WARMUP_ITERS + 5, cuda_graph=True, nsys_mode=nsys_mode, timer_mode=timer_mode,
-    )))
+    results.append(
+        (
+            "compiled_mempool",
+            _profile(
+                "compiled_mempool",
+                compiled_mempool_call,
+                rank,
+                warmup=WARMUP_ITERS + 5,
+                cuda_graph=True,
+                nsys_mode=nsys_mode,
+                timer_mode=timer_mode,
+            ),
+        )
+    )
 
     # --- Variant 6: mem pool (zero-copy with handwritten kernel) ---
     # (Uses the old handwritten Triton kernel with host-side barriers)
@@ -374,7 +438,19 @@ def main():
         )
         return output.view(x.shape), residual_out.view(x.shape)
 
-    results.append(("mempool", _profile("mempool", mempool_call, rank, cuda_graph=True, nsys_mode=nsys_mode, timer_mode=timer_mode)))
+    results.append(
+        (
+            "mempool",
+            _profile(
+                "mempool",
+                mempool_call,
+                rank,
+                cuda_graph=True,
+                nsys_mode=nsys_mode,
+                timer_mode=timer_mode,
+            ),
+        )
+    )
 
     # --- Variant 7: kraken (device-side sync, single kernel launch) ---
     # Kraken needs a pre-allocated symmetric memory buffer + pre-allocated output.
@@ -399,7 +475,19 @@ def main():
         )
         return kraken_output
 
-    results.append(("kraken", _profile("kraken", kraken_call, rank, cuda_graph=True, nsys_mode=nsys_mode, timer_mode=timer_mode)))
+    results.append(
+        (
+            "kraken",
+            _profile(
+                "kraken",
+                kraken_call,
+                rank,
+                cuda_graph=True,
+                nsys_mode=nsys_mode,
+                timer_mode=timer_mode,
+            ),
+        )
+    )
 
     # --- Variant 8: kraken two-shot (device-side sync, single kernel launch) ---
     kraken_2shot_symm_buf = symm_mem.empty(
@@ -422,7 +510,19 @@ def main():
         )
         return kraken_2shot_output
 
-    results.append(("kraken_2shot", _profile("kraken_2shot", kraken_2shot_call, rank, cuda_graph=True, nsys_mode=nsys_mode, timer_mode=timer_mode)))
+    results.append(
+        (
+            "kraken_2shot",
+            _profile(
+                "kraken_2shot",
+                kraken_2shot_call,
+                rank,
+                cuda_graph=True,
+                nsys_mode=nsys_mode,
+                timer_mode=timer_mode,
+            ),
+        )
+    )
 
     # --- Variant 9: FlashInfer trtllm_allreduce_fusion (one-shot, no quant) ---
     try:
@@ -469,7 +569,19 @@ def main():
             )
             return fi_norm_out
 
-        results.append(("flashinfer", _profile("flashinfer", flashinfer_call, rank, cuda_graph=True, nsys_mode=nsys_mode, timer_mode=timer_mode)))
+        results.append(
+            (
+                "flashinfer",
+                _profile(
+                    "flashinfer",
+                    flashinfer_call,
+                    rank,
+                    cuda_graph=True,
+                    nsys_mode=nsys_mode,
+                    timer_mode=timer_mode,
+                ),
+            )
+        )
 
         flashinfer_comm.trtllm_destroy_ipc_workspace_for_all_reduce(
             fi_ipc_handles, dist.group.WORLD
@@ -480,13 +592,17 @@ def main():
 
     # --- Summary table ---
     if rank == 0 and results:
-        baseline_us = next((us for name, us in results if name == "baseline" and us), None)
+        baseline_us = next(
+            (us for name, us in results if name == "baseline" and us), None
+        )
         print(f"\n{'=' * 65}")
-        print(f"  SUMMARY  (NUM_TOKENS={num_tokens}, HIDDEN={HIDDEN}, "
-              f"world_size={dist.get_world_size()})")
+        print(
+            f"  SUMMARY  (NUM_TOKENS={num_tokens}, HIDDEN={HIDDEN}, "
+            f"world_size={dist.get_world_size()})"
+        )
         print(f"{'=' * 65}")
         print(f"  {'Variant':<25s} {'us/iter':>10s} {'vs baseline':>12s}")
-        print(f"  {'-'*25} {'-'*10} {'-'*12}")
+        print(f"  {'-' * 25} {'-' * 10} {'-' * 12}")
         for name, avg_us in results:
             if avg_us is None:
                 continue
@@ -500,7 +616,7 @@ def main():
     dist.destroy_process_group()
     if rank == 0:
         print("Done. Compare traces in /tmp/fused_ar_rmsnorm_*.json")
-    
+
     torch.cuda.cudart().cudaProfilerStop()
 
 
