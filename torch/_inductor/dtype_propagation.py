@@ -264,7 +264,7 @@ class DtypePropagationOpsHandler:
     def symm_mem_p2p_reduce_load(
         name: str, index, world_size: int, group_name: str = ""
     ) -> torch.dtype:
-        return torch.float32
+        return upcast_compute_type(V.graph.get_dtype(name))
 
     @staticmethod
     def floor(x: DTypeArg) -> torch.dtype:

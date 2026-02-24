@@ -82,6 +82,15 @@ def _can_replace(all_reduce_node: fx.Node, wait_node: fx.Node) -> bool:
     except ImportError:
         log.debug("Cannot replace: symmetric memory module not available")
         return False
+
+    # Guard on supported dtypes — the codegen only supports float types.
+    # Lamport mode further requires 2-byte types (bf16/fp16) for the
+    # sentinel protocol; that is checked at codegen time.
+    val = wait_node.meta.get("val")
+    if val is not None and not val.dtype.is_floating_point:
+        log.debug("Cannot replace: non-floating-point dtype %s", val.dtype)
+        return False
+
     return True
 
 

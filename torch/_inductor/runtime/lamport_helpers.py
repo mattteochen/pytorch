@@ -235,6 +235,12 @@ def lamport_workspace_setup(
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     M, N = input_tensor.shape[-2], input_tensor.shape[-1]
+    if N % 2 != 0:
+        raise ValueError(
+            f"Lamport allreduce requires even reduction dim, got {N}. "
+            "The sentinel protocol packs 2 bf16 elements per u32 word; "
+            "an odd dim causes _poll_last_word to deadlock."
+        )
     device = input_tensor.device
 
     slot_elems = world_size * M * N

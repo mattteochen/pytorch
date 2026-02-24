@@ -2573,6 +2573,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         self.has_symm_mem_p2p = False
         self.symm_mem_world_size: int | None = None
         self.symm_mem_input_name: str | None = None
+        self.symm_mem_input_dtype: torch.dtype | None = None
         self._symm_group_name: str = ""
         self._symm_mem_use_host_barriers: bool = False
         self._symm_mem_use_lamport: bool = False
@@ -3681,6 +3682,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         self.has_symm_mem_p2p = True
         self.symm_mem_world_size = world_size
         self.symm_mem_input_name = name
+        self.symm_mem_input_dtype = V.graph.get_dtype(name)
         self._symm_group_name = group_name
 
         # Ensure the original input buffer is a kernel arg (the prologue
@@ -3729,6 +3731,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         self, load_buffer, indexing, shape_str: str
     ) -> None:
         """Emit pull-model P2P reduce: loop over peers, NVLink loads."""
+        tl_dtype = triton_type(self.symm_mem_input_dtype)
         load_buffer.writeline(
             f"_symm_acc = tl.zeros([{shape_str}], dtype=tl.float32)"
         )
@@ -3739,7 +3742,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         with load_buffer.indent():
             load_buffer.writeline(
                 "_symm_peer = tl.load(_symm_buf_ptrs_u64 + _symm_i)"
-                ".to(tl.pointer_type(tl.bfloat16))"
+                f".to(tl.pointer_type({tl_dtype}))"
             )
             load_buffer.writeline(
                 f"_symm_acc = _symm_acc + tl.load("
@@ -5446,6 +5449,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         """
         assert self.symm_mem_input_name is not None
         in_var = self.args.input(self.symm_mem_input_name)
+        tl_dtype = triton_type(self.symm_mem_input_dtype)
         grid_cap = config._symm_mem_grid_cap
 
         if config._symm_mem_skip_prologue_copy:
@@ -5460,7 +5464,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 f"""
                 # --- symm mem prologue: grid-stride copy + sync ---
                 _symm_bptrs = symm_buf_ptrs.to(tl.pointer_type(tl.uint64))
-                _symm_local_buf = tl.load(_symm_bptrs + SYMM_RANK).to(tl.pointer_type(tl.bfloat16))
+                _symm_local_buf = tl.load(_symm_bptrs + SYMM_RANK).to(tl.pointer_type({tl_dtype}))
                 _symm_cols = tl.arange(0, R0_BLOCK)
                 _symm_col_mask = _symm_cols < r0_numel
                 _symm_num_tiles = tl.cdiv(xnumel, XBLOCK)
@@ -5481,7 +5485,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 f"""
                 # --- symm mem prologue: copy local input -> symm buffer ---
                 _symm_bptrs = symm_buf_ptrs.to(tl.pointer_type(tl.uint64))
-                _symm_local_buf = tl.load(_symm_bptrs + SYMM_RANK).to(tl.pointer_type(tl.bfloat16))
+                _symm_local_buf = tl.load(_symm_bptrs + SYMM_RANK).to(tl.pointer_type({tl_dtype}))
                 _symm_x_base = tl.program_id(0).to(tl.int64) * XBLOCK
                 _symm_cols = tl.arange(0, R0_BLOCK)
                 _symm_col_mask = _symm_cols < r0_numel
@@ -5516,7 +5520,25 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         (``_codegen_lamport_epilogue``), avoiding redundant computation.
         """
         assert self.symm_mem_input_name is not None
+        assert self.symm_mem_input_dtype is not None
         in_var = self.args.input(self.symm_mem_input_name)
+        tl_dtype = triton_type(self.symm_mem_input_dtype)
+        elem_bytes = torch.tensor([], dtype=self.symm_mem_input_dtype).element_size()
+        assert (
+            elem_bytes == 2
+        ), f"Lamport protocol requires 2-byte dtype, got {self.symm_mem_input_dtype}"
+        # The Lamport sentinel packs 2 bf16 elements per u32 word. An odd
+        # reduction dim leaves the last word half-empty, causing deadlock in
+        # _poll_last_word. Check statically when possible; the Python-level
+        # guard in lamport_workspace_setup catches dynamic shapes at runtime.
+        r0 = self.numels.get("r0_")
+        if r0 is not None:
+            r0_hint = V.graph.sizevars.symbolic_hint(r0)
+            if isinstance(r0_hint, (int, sympy.Integer)) and int(r0_hint) % 2 != 0:
+                raise RuntimeError(
+                    f"Lamport allreduce requires even reduction dim, got {int(r0_hint)}. "
+                    "The sentinel protocol packs 2 bf16 elements per u32 word."
+                )
         code.splice(
             f"""
             # --- Lamport prologue: read flag + compute offsets + push + arrive ---
@@ -5527,7 +5549,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             _lam_buf_offset = (_lam_flag % 3) * _lam_slot_elems
             _lam_clear_offset = ((_lam_flag + 2) % 3) * _lam_slot_elems
             _lam_buf_ptrs_u64 = symm_buf_ptrs.to(tl.pointer_type(tl.uint64))
-            _lam_my_buf = tl.load(_lam_buf_ptrs_u64 + SYMM_RANK).to(tl.pointer_type(tl.bfloat16))
+            _lam_my_buf = tl.load(_lam_buf_ptrs_u64 + SYMM_RANK).to(tl.pointer_type({tl_dtype}))
             _lam_my_buf_base = _lam_my_buf + _lam_buf_offset
             _lam_clear_base = _lam_my_buf + _lam_clear_offset
             _lam_x_base = tl.program_id(0).to(tl.int64) * XBLOCK
@@ -6169,10 +6191,6 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         """
         assert self.symm_mem_input_name is not None
         in_var = self.symm_mem_input_name
-        for outer in self.args.input_buffers.keys():
-            if outer == self.symm_mem_input_name:
-                in_var = outer
-                break
 
         wrapper.imports.writeline(
             "from torch._inductor.runtime.symm_mem_helpers import symm_mem_setup"
@@ -6193,10 +6211,6 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         """
         assert self.symm_mem_input_name is not None
         in_var = self.symm_mem_input_name
-        for outer in self.args.input_buffers.keys():
-            if outer == self.symm_mem_input_name:
-                in_var = outer
-                break
 
         skip_copy = "True" if config._symm_mem_skip_prologue_copy else "False"
         wrapper.imports.writeline(
@@ -6226,10 +6240,6 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         """
         assert self.symm_mem_input_name is not None
         in_var = self.symm_mem_input_name
-        for outer in self.args.input_buffers.keys():
-            if outer == self.symm_mem_input_name:
-                in_var = outer
-                break
 
         wrapper.imports.writeline(
             "from torch._inductor.runtime.lamport_helpers import "

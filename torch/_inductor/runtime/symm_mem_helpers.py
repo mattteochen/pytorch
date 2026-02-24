@@ -19,13 +19,21 @@ def _get_cached(
 ) -> tuple[Any, torch.Tensor, torch.Tensor, int, int]:
     """Return ``(sm_handle, buf_ptrs, sig_ptrs, rank, world_size)``, cached."""
     key = group_name
+    workspace_bytes = input_tensor.numel() * input_tensor.element_size()
     if key in _symm_mem_cache:
-        return _symm_mem_cache[key]
+        cached = _symm_mem_cache[key]
+        sm = cached[0]
+        cached_bytes = sm.buffer_size
+        assert cached_bytes >= workspace_bytes, (
+            f"Cached symmetric memory workspace for group '{group_name}' is too "
+            f"small ({cached_bytes} bytes) for input ({workspace_bytes} bytes). "
+            f"Allocate a larger workspace with get_symm_mem_workspace(min_size=...)."
+        )
+        return cached
 
     import torch.distributed as dist
     import torch.distributed._symmetric_memory as symm_mem_mod
 
-    workspace_bytes = input_tensor.numel() * input_tensor.element_size()
     sm = symm_mem_mod.get_symm_mem_workspace(group_name, min_size=workspace_bytes)
 
     rank = dist.get_rank()
