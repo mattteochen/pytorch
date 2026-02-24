@@ -157,6 +157,8 @@ def fused_allreduce_rmsnorm_symm_mem(
         raise ValueError(f"Only 'sum' reduce_op is supported, got '{reduce_op}'")
     if not input.is_contiguous():
         raise ValueError("input must be contiguous")
+    if residual is not None and not residual.is_contiguous():
+        raise ValueError("residual must be contiguous")
 
     input_2d = input.reshape(-1, input.shape[-1])
     workspace_bytes = input_2d.numel() * input_2d.element_size()

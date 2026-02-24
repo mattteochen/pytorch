@@ -28,10 +28,14 @@ import torch.fx as fx
 
 
 log = logging.getLogger(__name__)
-c10d = torch.ops._c10d_functional
+
+
+def _c10d():
+    return torch.ops._c10d_functional
 
 
 def _is_all_reduce(node: fx.Node) -> bool:
+    c10d = _c10d()
     return node.target in (
         c10d.all_reduce.default,
         c10d.all_reduce_.default,
@@ -39,7 +43,7 @@ def _is_all_reduce(node: fx.Node) -> bool:
 
 
 def _is_wait_tensor(node: fx.Node) -> bool:
-    return node.target == c10d.wait_tensor.default
+    return node.target == _c10d().wait_tensor.default
 
 
 def _get_reduce_op(node: fx.Node) -> str:
@@ -89,6 +93,11 @@ def _can_replace(all_reduce_node: fx.Node, wait_node: fx.Node) -> bool:
     val = wait_node.meta.get("val")
     if val is not None and not val.dtype.is_floating_point:
         log.debug("Cannot replace: non-floating-point dtype %s", val.dtype)
+        return False
+
+    reduce_op = _get_reduce_op(all_reduce_node)
+    if reduce_op != "sum":
+        log.debug("Cannot replace: unsupported reduce_op '%s' (only 'sum')", reduce_op)
         return False
 
     return True

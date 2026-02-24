@@ -5612,10 +5612,14 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         # program_id(0).  The header generates one of:
         #   xoffset = tl.program_id(0) * XBLOCK
         #   xoffset = tl.program_id(0).to(tl.int64) * XBLOCK
-        body_text = re.sub(
+        new_body_text = re.sub(
             r"xoffset = tl\.program_id\(0\)(?:\.to\(tl\.int64\))? \* XBLOCK",
             "xoffset = _x_tile.to(tl.int64) * XBLOCK",
             body_text,
+        )
+        assert new_body_text != body_text, (
+            "Grid-stride body rewrite failed: could not find "
+            "'xoffset = tl.program_id(0) * XBLOCK' in kernel body"
         )
 
         code.writeline(
@@ -5623,7 +5627,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             "tl.num_programs(0)):"
         )
         with code.indent():
-            code.splice(body_text)
+            code.splice(new_body_text)
 
     def codegen_kernel(self, name=None) -> str:
         """
@@ -5660,6 +5664,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             sync_mode = config._symm_mem_sync_mode
             if sync_mode == "lamport":
                 self._symm_mem_use_lamport = True
+                self._symm_mem_use_host_barriers = False
+            elif sync_mode == "device_cas":
+                self._symm_mem_use_lamport = False
                 self._symm_mem_use_host_barriers = False
             else:
                 threshold = config._symm_mem_host_barrier_threshold

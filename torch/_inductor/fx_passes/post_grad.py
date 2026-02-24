@@ -209,7 +209,11 @@ def post_grad_passes(gm: torch.fx.GraphModule, is_inference: bool):
         micro_pipeline_tp_pass(gm.graph)
 
     if config._fused_all_reduce_rmsnorm:
-        fused_all_reduce_rmsnorm_pass(gm.graph, is_inference)
+        GraphTransformObserver(
+            gm, "fused_all_reduce_rmsnorm"
+        ).apply_graph_pass(
+            lambda graph: fused_all_reduce_rmsnorm_pass(graph, is_inference)
+        )
 
     if config._fuse_ddp_communication:
         GraphTransformObserver(gm, "fuse_ddp_communication").apply_graph_pass(

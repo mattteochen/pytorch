@@ -247,7 +247,7 @@ def lamport_workspace_setup(
     total_elems = 3 * slot_elems
 
     buf = symm_mem_mod.empty(total_elems, dtype=torch.bfloat16, device=device)
-    sm = symm_mem_mod.rendezvous(buf, dist.group.WORLD)
+    sm = symm_mem_mod.rendezvous(buf, group_name)
     buf.view(torch.uint16).fill_(NEG_ZERO_U16)
     sm.barrier(channel=0)
 
