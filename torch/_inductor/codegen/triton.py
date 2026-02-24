@@ -3675,9 +3675,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         peers' symmetric memory buffers over NVLink.
 
         In Lamport push mode, the prologue already pushed data to all peers'
-        local buffers.  This method emits a call to the external
-        ``_lamport_poll_and_reduce`` helper which polls the local buffer via
-        volatile loads until the sentinel clears, then loads and accumulates.
+        local buffers.  This method polls via ``_lamport_poll_rows`` then
+        accumulates from the local buffer using 2D-native indexing.
         """
         self.has_symm_mem_p2p = True
         self.symm_mem_world_size = world_size
@@ -3755,24 +3754,32 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
     ) -> None:
         """Emit Lamport push-model reduce: poll local buffer + accumulate.
 
-        Uses ``_lam_my_buf_base``, ``_lam_cols``, ``_lam_col_mask``,
-        ``_lam_chunk``, ``_lam_n_words`` from the prologue.
+        Uses 2D-native addressing via ``indexing.index_str`` to handle
+        XBLOCK > 1 correctly. Polls all rows for all peers first via
+        ``_lamport_poll_rows``, then accumulates with standard 2D loads.
+
+        Uses ``_lam_my_buf_base``, ``_lam_x_base``, ``_lam_chunk``,
+        ``_lam_n_words`` from the prologue.
         """
+        tl_dtype = triton_type(self.symm_mem_input_dtype)
         load_buffer.writeline(
-            "_lam_row_offset = xoffset.to(tl.int64) * r0_numel"
+            f"_symm_acc = tl.zeros([{shape_str}], dtype=tl.float32)"
         )
         load_buffer.writeline(
-            "_symm_acc = _lamport_poll_and_reduce("
-            "_lam_my_buf_base, _lam_row_offset, _lam_cols, _lam_col_mask, "
-            "_lam_chunk, _lam_n_words, "
-            "SYMM_WORLD_SIZE, R0_BLOCK)"
+            "_lamport_poll_rows("
+            "_lam_my_buf_base, _lam_x_base, r0_numel, _lam_chunk, _lam_n_words, "
+            "SYMM_WORLD_SIZE, XBLOCK, xnumel)"
         )
-        # The helper returns [R0_BLOCK] (1D). If the kernel body uses 2D
-        # indexing [XBLOCK, R0_BLOCK], reshape to match.
-        shape = indexing.expand_shape or TritonSymbols.get_block_shape(indexing.index)
-        if shape and len(shape) > 1:
+        load_buffer.writeline("for _symm_i in tl.static_range(SYMM_WORLD_SIZE):")
+        with load_buffer.indent():
             load_buffer.writeline(
-                f"_symm_acc = tl.reshape(_symm_acc, [{shape_str}])"
+                f"_symm_peer = (_lam_my_buf_base + _symm_i * _lam_chunk)"
+                f".to(tl.pointer_type({tl_dtype}))"
+            )
+            load_buffer.writeline(
+                f"_symm_acc = _symm_acc + tl.load("
+                f"_symm_peer + ({indexing.index_str}), "
+                f"{indexing.mask_str}, other=0.0).to(tl.float32)"
             )
 
     def store(
@@ -5697,7 +5704,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                         _volatile_load_u32_scalar as _lamport_volatile_load_u32,
                         _remove_neg_zero as _lamport_remove_neg_zero,
                         _lamport_push_to_peers,
-                        _lamport_poll_and_reduce,
+                        _lamport_poll_rows,
                         _lamport_clear_old_slot,
                         _lamport_block_arrive,
                         _lamport_advance_flag_block0,

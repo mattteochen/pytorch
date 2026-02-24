@@ -136,6 +136,28 @@ def _lamport_poll_and_reduce(
 
 
 @triton.jit
+def _lamport_poll_rows(
+    my_buf_base,
+    x_base,
+    r0_numel,
+    chunk,
+    n_words,
+    WORLD_SIZE: tl.constexpr,
+    XBLOCK: tl.constexpr,
+    xnumel,
+):
+    """Poll sentinel words for all rows in the XBLOCK tile, all peers."""
+    for row in tl.static_range(XBLOCK):
+        row_idx = x_base + row
+        if row_idx < xnumel:
+            row_offset = row_idx * r0_numel
+            for peer in tl.static_range(WORLD_SIZE):
+                slot_bf16 = my_buf_base + peer * chunk + row_offset
+                slot_u32 = slot_bf16.to(tl.pointer_type(tl.uint32))
+                _poll_last_word(slot_u32, n_words)
+
+
+@triton.jit
 def _lamport_clear_old_slot(
     clear_base,
     row_offset,
