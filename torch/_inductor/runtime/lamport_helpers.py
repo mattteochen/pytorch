@@ -102,12 +102,13 @@ def _lamport_push_to_peers(
     ``buf_ptrs_u64`` must be pre-cast: ``buf_ptrs.to(pointer_type(uint64))``.
     """
     for peer in tl.static_range(WORLD_SIZE):
-        peer_buf = tl.load(buf_ptrs_u64 + peer).to(tl.pointer_type(tl.bfloat16))
-        tl.store(
-            peer_buf + buf_offset + RANK * chunk + row_offset + cols,
-            data,
-            mask=mask,
-        )
+        if peer != RANK:
+            peer_buf = tl.load(buf_ptrs_u64 + peer).to(tl.pointer_type(tl.bfloat16))
+            tl.store(
+                peer_buf + buf_offset + RANK * chunk + row_offset + cols,
+                data,
+                mask=mask,
+            )
 
 
 @triton.jit
@@ -142,19 +143,21 @@ def _lamport_poll_rows(
     r0_numel,
     chunk,
     n_words,
+    RANK: tl.constexpr,
     WORLD_SIZE: tl.constexpr,
     XBLOCK: tl.constexpr,
     xnumel,
 ):
-    """Poll sentinel words for all rows in the XBLOCK tile, all peers."""
+    """Poll sentinel words for all rows in the XBLOCK tile, non-self peers."""
     for row in tl.static_range(XBLOCK):
         row_idx = x_base + row
         if row_idx < xnumel:
             row_offset = row_idx * r0_numel
             for peer in tl.static_range(WORLD_SIZE):
-                slot_bf16 = my_buf_base + peer * chunk + row_offset
-                slot_u32 = slot_bf16.to(tl.pointer_type(tl.uint32))
-                _poll_last_word(slot_u32, n_words)
+                if peer != RANK:
+                    slot_bf16 = my_buf_base + peer * chunk + row_offset
+                    slot_u32 = slot_bf16.to(tl.pointer_type(tl.uint32))
+                    _poll_last_word(slot_u32, n_words)
 
 
 @triton.jit
@@ -164,6 +167,7 @@ def _lamport_clear_old_slot(
     cols,
     mask,
     chunk,
+    RANK: tl.constexpr,
     WORLD_SIZE: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
@@ -175,10 +179,11 @@ def _lamport_clear_old_slot(
         tl.bfloat16, bitcast=True
     )
     for peer in tl.static_range(WORLD_SIZE):
-        clear_bf16 = (clear_base + peer * chunk + row_offset).to(
-            tl.pointer_type(tl.bfloat16)
-        )
-        tl.store(clear_bf16 + cols, neg_zero, mask=mask)
+        if peer != RANK:
+            clear_bf16 = (clear_base + peer * chunk + row_offset).to(
+                tl.pointer_type(tl.bfloat16)
+            )
+            tl.store(clear_bf16 + cols, neg_zero, mask=mask)
 
 
 # ---------------------------------------------------------------------------

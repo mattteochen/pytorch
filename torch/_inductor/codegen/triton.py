@@ -3755,32 +3755,38 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         """Emit Lamport push-model reduce: poll local buffer + accumulate.
 
         Uses 2D-native addressing via ``indexing.index_str`` to handle
-        XBLOCK > 1 correctly. Polls all rows for all peers first via
+        XBLOCK > 1 correctly. Polls all rows for non-self peers via
         ``_lamport_poll_rows``, then accumulates with standard 2D loads.
+        Self-contribution is loaded directly from HBM (L2-warm from the
+        prologue read), skipping the symmetric memory round-trip.
 
         Uses ``_lam_my_buf_base``, ``_lam_x_base``, ``_lam_chunk``,
         ``_lam_n_words`` from the prologue.
         """
         tl_dtype = triton_type(self.symm_mem_input_dtype)
+        in_var = self.args.input(self.symm_mem_input_name)
         load_buffer.writeline(
-            f"_symm_acc = tl.zeros([{shape_str}], dtype=tl.float32)"
+            f"_symm_acc = tl.load({in_var} + ({indexing.index_str}), "
+            f"{indexing.mask_str}, other=0.0).to(tl.float32)"
         )
         load_buffer.writeline(
             "_lamport_poll_rows("
             "_lam_my_buf_base, _lam_x_base, r0_numel, _lam_chunk, _lam_n_words, "
-            "SYMM_WORLD_SIZE, XBLOCK, xnumel)"
+            "SYMM_RANK, SYMM_WORLD_SIZE, XBLOCK, xnumel)"
         )
         load_buffer.writeline("for _symm_i in tl.static_range(SYMM_WORLD_SIZE):")
         with load_buffer.indent():
-            load_buffer.writeline(
-                f"_symm_peer = (_lam_my_buf_base + _symm_i * _lam_chunk)"
-                f".to(tl.pointer_type({tl_dtype}))"
-            )
-            load_buffer.writeline(
-                f"_symm_acc = _symm_acc + tl.load("
-                f"_symm_peer + ({indexing.index_str}), "
-                f"{indexing.mask_str}, other=0.0).to(tl.float32)"
-            )
+            load_buffer.writeline("if _symm_i != SYMM_RANK:")
+            with load_buffer.indent():
+                load_buffer.writeline(
+                    f"_symm_peer = (_lam_my_buf_base + _symm_i * _lam_chunk)"
+                    f".to(tl.pointer_type({tl_dtype}))"
+                )
+                load_buffer.writeline(
+                    f"_symm_acc = _symm_acc + tl.load("
+                    f"_symm_peer + ({indexing.index_str}), "
+                    f"{indexing.mask_str}, other=0.0).to(tl.float32)"
+                )
 
     def store(
         self, name: str, index: sympy.Expr, value: CSEVariable, mode: StoreMode = None
@@ -5599,7 +5605,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 _lam_row_mask_e = _lam_row_idx_e < xnumel
                 _lam_row_offset_e = _lam_row_idx_e * r0_numel
                 _lam_mask_e = _lam_col_mask & _lam_row_mask_e
-                _lamport_clear_old_slot(_lam_clear_base, _lam_row_offset_e, _lam_cols, _lam_mask_e, _lam_chunk, SYMM_WORLD_SIZE, R0_BLOCK)
+                _lamport_clear_old_slot(_lam_clear_base, _lam_row_offset_e, _lam_cols, _lam_mask_e, _lam_chunk, SYMM_RANK, SYMM_WORLD_SIZE, R0_BLOCK)
             _lamport_advance_flag_block0(_lam_meta_i32, _lam_flag)
             """
         )
