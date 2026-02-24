@@ -45,6 +45,26 @@ def _fence_sys():
 
 
 @triton.jit
+def _fence_acquire_sys():
+    """System-scope acquire fence pairing with writer's fence.sc.sys (release).
+
+    Must be called after polling volatile sentinel loads and before reading
+    the actual data via regular (non-volatile) loads. Without this, the GPU
+    may serve subsequent tl.load from stale L2 cache entries — the sentinel
+    word propagated via NVLink but the data words may not yet be visible
+    to non-volatile loads.
+    """
+    tl.inline_asm_elementwise(
+        "fence.acquire.sys;",
+        "=r",
+        [],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
 def _volatile_load_u32_scalar(addr):
     """Single scalar volatile load bypassing L1 cache."""
     return tl.inline_asm_elementwise(
@@ -148,7 +168,11 @@ def _lamport_poll_rows(
     XBLOCK: tl.constexpr,
     xnumel,
 ):
-    """Poll sentinel words for all rows in the XBLOCK tile, non-self peers."""
+    """Poll sentinel words for all rows in the XBLOCK tile, non-self peers.
+
+    Ends with fence.acquire.sys to pair with the writer's fence.sc.sys,
+    ensuring subsequent non-volatile data loads see the writer's stores.
+    """
     for row in tl.static_range(XBLOCK):
         row_idx = x_base + row
         if row_idx < xnumel:
@@ -158,6 +182,48 @@ def _lamport_poll_rows(
                     slot_bf16 = my_buf_base + peer * chunk + row_offset
                     slot_u32 = slot_bf16.to(tl.pointer_type(tl.uint32))
                     _poll_last_word(slot_u32, n_words)
+    _fence_acquire_sys()
+
+
+@triton.jit
+def _lamport_poll_all_peers(
+    my_buf_base,
+    x_base,
+    r0_numel,
+    chunk,
+    n_words,
+    RANK: tl.constexpr,
+    WORLD_SIZE: tl.constexpr,
+    XBLOCK: tl.constexpr,
+    xnumel,
+):
+    """Poll all non-self peers simultaneously per row, overlapping latency.
+
+    Instead of sequential per-peer spin loops, uses a single while-loop
+    that checks all peers each iteration, breaking when all are ready.
+    Ends with fence.acquire.sys for the same reason as _lamport_poll_rows.
+    """
+    for row in tl.static_range(XBLOCK):
+        row_idx = x_base + row
+        if row_idx < xnumel:
+            row_offset = row_idx * r0_numel
+            _lam_done = tl.full([], 0, dtype=tl.int32)
+            while _lam_done == 0:
+                _lam_cnt = tl.full([], 0, dtype=tl.int32)
+                for peer in tl.static_range(WORLD_SIZE):
+                    if peer != RANK:
+                        slot_bf16 = my_buf_base + peer * chunk + row_offset
+                        slot_u32 = slot_bf16.to(tl.pointer_type(tl.uint32))
+                        last_addr = slot_u32 + (n_words - 1)
+                        w = _volatile_load_u32_scalar(last_addr)
+                        lo = w & 0xFFFF
+                        hi = (w >> 16) & 0xFFFF
+                        peer_ready = ((lo != _NEG_ZERO) & (hi != _NEG_ZERO)).to(
+                            tl.int32
+                        )
+                        _lam_cnt = _lam_cnt + peer_ready
+                _lam_done = (_lam_cnt == WORLD_SIZE - 1).to(tl.int32)
+    _fence_acquire_sys()
 
 
 @triton.jit

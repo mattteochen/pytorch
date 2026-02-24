@@ -3675,7 +3675,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         peers' symmetric memory buffers over NVLink.
 
         In Lamport push mode, the prologue already pushed data to all peers'
-        local buffers.  This method polls via ``_lamport_poll_rows`` then
+        local buffers.  This method polls via ``_lamport_poll_all_peers`` then
         accumulates from the local buffer using 2D-native indexing.
         """
         self.has_symm_mem_p2p = True
@@ -3756,7 +3756,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
         Uses 2D-native addressing via ``indexing.index_str`` to handle
         XBLOCK > 1 correctly. Polls all rows for non-self peers via
-        ``_lamport_poll_rows``, then accumulates with standard 2D loads.
+        ``_lamport_poll_all_peers``, then accumulates with standard 2D loads.
         Self-contribution is loaded directly from HBM (L2-warm from the
         prologue read), skipping the symmetric memory round-trip.
 
@@ -3770,7 +3770,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             f"{indexing.mask_str}, other=0.0).to(tl.float32)"
         )
         load_buffer.writeline(
-            "_lamport_poll_rows("
+            "_lamport_poll_all_peers("
             "_lam_my_buf_base, _lam_x_base, r0_numel, _lam_chunk, _lam_n_words, "
             "SYMM_RANK, SYMM_WORLD_SIZE, XBLOCK, xnumel)"
         )
@@ -5711,6 +5711,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                         _remove_neg_zero as _lamport_remove_neg_zero,
                         _lamport_push_to_peers,
                         _lamport_poll_rows,
+                        _lamport_poll_all_peers,
                         _lamport_clear_old_slot,
                         _lamport_block_arrive,
                         _lamport_advance_flag_block0,

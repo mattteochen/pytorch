@@ -1,11 +1,12 @@
 # Inductor-Generated Fused AllReduce via Kraken PTX
 
-## Status: Host barriers implemented, compiled matches fused_op at all sizes
+## Status: Lamport push-model with simultaneous poll, 7.8µs at 1 token (4.4x baseline)
 
-All 22 tests pass (14 single-process + 6 multi-GPU distributed + 2 torch.compile e2e).
-The `torch.compile` path generates a single fused Triton kernel that does
-P2P allreduce + residual add + RMSNorm with host-side `sm.barrier()` sync
-(configurable via `_symm_mem_host_barrier_threshold`, default: always host barriers).
+All 28 tests pass (14 single-process + 8 multi-GPU distributed + 6 torch.compile e2e).
+Three sync modes: host barriers (default), device-side CAS, Lamport push-model.
+Lamport mode (`_symm_mem_sync_mode = "lamport"`) uses simultaneous all-peer
+polling with `fence.acquire.sys` for proper memory ordering, achieving 7.8µs
+at 1 token on 4xGB200 — within 2µs of FlashInfer's native CUDA kernel.
 
 Profiled on 4xGB200 with NUM_TOKENS=32, HIDDEN=2880:
 - **compiled** (inductor P2P): 1.008ms total — matches kraken (1.002ms)
@@ -710,8 +711,8 @@ remaining optimization. At 4 GPUs with 2048 tokens, kraken_2shot
 
 | Tensor size | GPU count | Best strategy | Status |
 |-------------|-----------|---------------|--------|
-| Small (decode, 1-32 tokens) | Any | One-shot P2P + device-side sync | Available (threshold=-1) |
-| Medium-large (32+ tokens) | Any | One-shot P2P + host barriers | **Default (threshold=0)** |
+| Small (decode, 1-32 tokens) | Any | **Lamport push-model** | **Default for decode** |
+| Medium-large (32+ tokens) | Any | One-shot P2P + host barriers | Available (threshold=0) |
 | Large (128+ tokens) | 4+ | Two-shot P2P + host barriers | Planned |
 
 ### Implementation: switch codegen from CAS to host barriers
@@ -775,18 +776,43 @@ symm_mem_barrier(workspace, group_name)                   # epilogue barrier
 - Buffer pointer arrays (`buffer_ptrs_dev`)
 - The fusion with downstream compute (add + RMSNorm)
 
-## Push Model Plan: External Triton Helpers
+## Push Model: Implemented via Lamport Codegen
 
-A future optimization: replace the current pull model (each rank reads
-from all peers over NVLink) with a push model (each rank writes its
-data to all peers' local buffers). The receiver then reads from its own
-local memory (cheap L2 hit) instead of remote NVLink reads.
+The push model is now fully implemented as the Lamport sync mode.
+See "Lamport Push-Model Codegen" section above for details.
 
-This is what FlashInfer's Lamport protocol does. It avoids both
-per-block atomics AND explicit barriers by using sentinel values
-(`-0.0`) to signal completion.
+The codegen emits imports from `lamport_helpers.py` and calls the
+JIT helpers inside the generated kernel:
 
-### Why push can be faster than pull
+```python
+from torch._inductor.runtime.lamport_helpers import (
+    _lamport_push_to_peers,       # push data to all peers' local buffers
+    _lamport_poll_all_peers,      # simultaneous sentinel poll + acquire fence
+    _lamport_clear_old_slot,      # re-arm sentinels for triple-buffer rotation
+    _fence_sys as _lamport_fence_sys,  # system-scope release fence after push
+    _lamport_block_arrive,        # device-scope atomic for block sync
+    _lamport_advance_flag_block0, # in-kernel flag advancement (block 0 only)
+)
+```
+
+### Key design decisions
+
+- **Simultaneous poll** (`_lamport_poll_all_peers`): Single while-loop
+  checking all non-self peers each iteration. Overlaps NVLink latency
+  across peers. Beats sequential per-peer polls at small token counts.
+
+- **`fence.acquire.sys` after poll**: Required to pair with writer's
+  `fence.sc.sys` (release). Without it, `ld.volatile` (relaxed only)
+  doesn't guarantee non-volatile data loads see the writer's stores.
+  The sequential poll masked this bug via accidental LLVM optimization
+  barriers at `@triton.jit` function-call boundaries.
+
+- **Triple-buffer rotation in-kernel**: Zero wrapper GPU ops.
+  `meta[0]` = block counter (device-scope atomic), `meta[1]` = flag
+  value (0/1/2). Block 0 advances flag after all blocks arrive.
+  CUDA-graph-safe.
+
+### Why push beats pull at small sizes
 
 - **NVLink write is fire-and-forget:** The writer doesn't stall waiting
   for data to return. With pull, every `tl.load` from a peer blocks
@@ -797,68 +823,6 @@ per-block atomics AND explicit barriers by using sentinel values
   non-sentinel values, which acts as an implicit sync. No CAS atomics,
   no barrier kernel launches.
 
-### Implementation approach: external Triton JIT helpers
-
-The codegen already imports and calls external `@triton.jit` functions
-(kraken's `_symm_mem_sync`). The same pattern works for push helpers.
-
-Create `torch/_inductor/runtime/p2p_push_helpers.py`:
-
-```python
-@triton.jit
-def push_to_peers(buffer_ptrs, data, offset, mask, rank, world_size):
-    """Write local data to all peers' symmetric memory buffers."""
-    for peer in tl.static_range(world_size):
-        peer_buf = tl.load(buffer_ptrs + peer).to(tl.pointer_type(tl.bfloat16))
-        tl.store(peer_buf + offset, data, mask=mask)
-    # System-scope fence: make all stores visible to other GPUs
-    _fence_sys()
-
-@triton.jit
-def _fence_sys():
-    tl.inline_asm_elementwise(
-        "fence.sc.sys;", "=r", [], dtype=tl.int32, is_pure=False, pack=1,
-    )
-
-@triton.jit
-def poll_for_sentinel(addr, mask):
-    """Spin until value at addr is not -0.0 (Lamport sentinel)."""
-    val = tl.load(addr, mask=mask)
-    while _is_neg_zero(val):
-        val = _volatile_load(addr, mask)
-    return val
-
-@triton.jit
-def _volatile_load(addr, mask):
-    """Bypass cache to see latest write from peer."""
-    tl.inline_asm_elementwise(
-        "ld.volatile.global.b16 $0, [$1];",
-        "=h, l", [addr], dtype=tl.bfloat16, is_pure=False, pack=1,
-    )
-```
-
-The codegen would emit:
-```python
-from torch._inductor.runtime.p2p_push_helpers import push_to_peers, poll_for_sentinel
-```
-
-### Challenges
-
-- **Buffer layout:** Each peer pushes to a distinct region of the
-  receiver's buffer (to avoid write collisions), requiring
-  `world_size × data_size` symmetric memory per rank. Or use the
-  sentinel approach where all peers write to the same location and
-  data replaces the sentinel in-place.
-- **Sentinel stripping:** Buffer must be initialized to `-0.0` before
-  each iteration. During reduction, sentinel values must be excluded.
-  This adds per-element overhead during the poll loop.
-- **Volatile loads:** Needed to bypass L2 cache and see fresh data from
-  peers. `ld.volatile.global` is more expensive than normal loads but
-  cheaper than NVLink reads.
-- **Correctness with CUDA graphs:** The sentinel init must happen
-  inside the graph. Double buffering (alternating two buffers with
-  opposite sentinels) avoids the init step.
-
 ### Ordering of improvements
 
 1. ~~**First:** Switch to host barriers.~~ **DONE.** 2.2x improvement
@@ -866,17 +830,19 @@ from torch._inductor.runtime.p2p_push_helpers import push_to_peers, poll_for_sen
 2. **Next:** Gate FX pass on tensor size. Quick config change.
 3. **Then:** Two-shot P2P allreduce for large tensors (~14% remaining
    gap to kraken_2shot / FlashInfer at 2048 tokens, 4 GPUs).
-4. **(Optional):** Push model with sentinels. Only worthwhile if host
-   barrier latency (~6µs) is a bottleneck for the target workload.
+4. ~~**(Optional):** Push model with sentinels.~~ **DONE.** Lamport
+   push-model with simultaneous poll achieves 7.8µs at 1 token (4.4x
+   baseline), beating all other inductor variants and the standalone
+   reference. Best sync mode for small token counts (decode).
 
-## Lamport Push-Model Codegen: Implemented, Perf Work Needed
+## Lamport Push-Model Codegen: Simultaneous Poll + Acquire Fence
 
-### Status: functionally correct, CUDA-graph-safe, zero wrapper GPU ops
+### Status: production-ready, CUDA-graph-safe, zero wrapper GPU ops
 
 The Lamport push-model sync mode is implemented as an alternative to
 pull+host-barriers and pull+device-CAS. Selected via
-`config._symm_mem_sync_mode = "lamport"`. All 24 tests pass (including
-2 new Lamport-specific tests with codegen structural assertions).
+`config._symm_mem_sync_mode = "lamport"`. All 28 tests pass (including
+6 torch.compile e2e tests with codegen structural assertions).
 
 ```
 torch.compile(options={
@@ -889,10 +855,10 @@ torch.compile(options={
 
 | File | Role |
 |------|------|
-| `torch/_inductor/runtime/lamport_helpers.py` | **NEW**: @triton.jit helpers (fence, volatile load, push, poll+reduce, clear, block arrive, flag advance) + Python runtime (triple-buffer workspace, in-kernel metadata) |
+| `torch/_inductor/runtime/lamport_helpers.py` | **NEW**: @triton.jit helpers (fence, acquire fence, volatile load, push, simultaneous poll, sequential poll, clear, block arrive, flag advance) + Python runtime (triple-buffer workspace, in-kernel metadata) |
 | `torch/_inductor/codegen/triton.py` | Mode selection (`_symm_mem_use_lamport`), Lamport imports, `_codegen_lamport_prologue`, `_codegen_lamport_epilogue`, `_codegen_lamport_reduce_load`, `_emit_lamport_setup`, kernel argdefs for `_lam_meta` TensorArg |
 | `torch/_inductor/config.py` | `_symm_mem_sync_mode: str = "host_barrier"` (new, values: host_barrier/device_cas/lamport) |
-| `test/distributed/test_fused_allreduce_rmsnorm.py` | 2 new tests with codegen structural assertions |
+| `test/distributed/test_fuse_symm_mem_comms.py` | 6 torch.compile e2e tests (2 per sync mode) with codegen structural assertions |
 | `dev/profile_fused_allreduce_rmsnorm.py` | `compiled_lamport` variant (3d) + renamed standalone to `lamport_standalone` |
 
 ### CUDA graph safety
@@ -919,33 +885,40 @@ NUM_TOKENS=1:
 
 | Variant | us/iter | vs baseline |
 |---------|---------|-------------|
-| baseline (NCCL) | 34.4 | 1.00x |
-| compiled (device CAS) | 15.5 | 2.22x |
-| compiled_host_barrier | 18.0 | 1.91x |
-| **compiled_lamport** (inductor) | **8.6** | **4.01x** |
-| lamport_standalone (handwritten) | 7.9 | 4.38x |
-| flashinfer (Lamport) | 5.8 | 5.89x |
+| baseline (NCCL) | 34.3 | 1.00x |
+| compiled (device CAS) | 15.5 | 2.21x |
+| compiled_host_barrier | 18.1 | 1.90x |
+| **compiled_lamport** (inductor) | **7.8** | **4.40x** |
+| lamport_standalone (handwritten) | 8.2 | 4.20x |
+| kraken (device CAS) | 11.0 | 3.12x |
+| flashinfer (Lamport) | 5.8 | 5.86x |
 
-**compiled_lamport** is now within 0.7µs of the standalone kernel and
-4x faster than baseline.  The remaining gap to FlashInfer (~2.8µs) is
-native CUDA kernel overhead vs Triton codegen + SM90 programmatic
-launch dependency support.
+**compiled_lamport** now beats the standalone kernel (7.8 vs 8.2µs) thanks
+to the simultaneous all-peer poll that overlaps NVLink latency.  4.4x faster
+than baseline, within 2.0µs of FlashInfer.
 
 NUM_TOKENS=1024:
 
 | Variant | us/iter | vs baseline |
 |---------|---------|-------------|
-| baseline (NCCL) | 132.6 | 1.00x |
-| compiled (device CAS) | 85.2 | 1.56x |
-| compiled_host_barrier | 48.5 | 2.74x |
-| **compiled_lamport** | **74.4** | **1.78x** |
-| lamport_standalone | 67.7 | 1.96x |
-| flashinfer | 39.5 | 3.36x |
+| baseline (NCCL) | 133.8 | 1.00x |
+| compiled (device CAS) | 85.9 | 1.56x |
+| compiled_host_barrier | 48.8 | 2.74x |
+| **compiled_lamport** | **63.4** | **2.11x** |
+| lamport_standalone | 66.7 | 2.01x |
+| kraken_2shot | 44.3 | 3.02x |
+| flashinfer | 39.5 | 3.39x |
 
-### Performance gap analysis: compiled_lamport (8.6µs) vs standalone (7.9µs)
+At large token counts, Lamport is slower than host barriers (63.4 vs 48.8µs)
+because the Lamport protocol has higher per-row overhead (push to all peers,
+volatile poll loop, sentinel clearing) that scales with token count. Host
+barriers have O(1) sync cost. FlashInfer and kraken_2shot are fastest at
+large sizes thanks to two-shot's halved NVLink traffic.
 
-The original gap was **~10.6µs** (18.5µs vs 7.9µs, 2.3x). All root
-causes have been addressed, reducing the gap to **0.7µs** (1.09x):
+### Performance gap analysis: compiled_lamport (7.8µs) vs FlashInfer (5.8µs)
+
+The original gap was **~10.6µs** (18.5µs vs 7.9µs standalone, 2.3x).
+Five rounds of optimization closed the gap to the standalone and beyond:
 
 **1. [FIXED] Wrapper-level GPU ops for offset rotation (~9µs → 0µs)**
 
@@ -968,19 +941,50 @@ Single volatile load of flag from `meta[1]` + inline `% 3` arithmetic.
 `_lam_cols`, `_lam_col_mask`, `_lam_chunk`, `_lam_n_words` computed
 once in prologue, reused by body and epilogue.
 
-### Remaining gap (0.7µs to standalone, 2.8µs to FlashInfer)
+**5. [FIXED] Simultaneous all-peer poll + acquire fence**
 
-The 0.7µs gap to standalone is Triton codegen overhead (helper function
-calls, extra instructions from code generation vs monolithic kernel).
+Replaced sequential per-peer `_poll_last_word` spin loops with a single
+while-loop (`_lamport_poll_all_peers`) that checks all non-self peers
+each iteration, overlapping NVLink latency across peers. Added
+`fence.acquire.sys` after the poll loop to pair with the writer's
+`fence.sc.sys` (release), ensuring non-volatile data loads see the
+writer's stores. Result: compiled_lamport (7.8µs) now beats the
+standalone (8.2µs) which still uses sequential per-peer polls.
 
-The 2.8µs gap to FlashInfer (5.8µs) comes from:
+### Memory ordering fix: fence.acquire.sys
+
+The Lamport protocol's reader side was missing a proper acquire fence.
+The writer does `tl.store(data) → fence.sc.sys → tl.store(sentinel)`.
+The reader polls with `ld.volatile.global.b32`, which provides **cache
+bypass only** (maps to `ld.relaxed.sys` per PTX ISA) — NOT acquire
+semantics. Without an explicit `fence.acquire.sys` after the poll,
+subsequent non-volatile `tl.load` calls could be served from stale L2
+cache entries.
+
+The sequential poll (`_lamport_poll_rows`) masked this bug because each
+peer's `_poll_last_word` is a separate `@triton.jit` function whose
+`scf.while` loop creates accidental optimization barriers in LLVM IR.
+The simultaneous poll (`_lamport_poll_all_peers`) exposed it because all
+peers' volatile loads are in a single `scf.while` body, allowing LLVM
+to schedule data loads before the poll loop completes.
+
+FlashInfer avoids this entirely because it loads **data itself** via
+`load_global_volatile` during the poll — the data is consumed directly
+from registers, with no separate non-volatile load needed.
+
+Both `_lamport_poll_rows` and `_lamport_poll_all_peers` now end with
+`_fence_acquire_sys()`. This is the same pattern NCCL uses after
+polling loops.
+
+### Remaining gap (2.0µs to FlashInfer)
+
+The 2.0µs gap to FlashInfer (5.8µs) comes from:
 1. **Native CUDA vs Triton (~1-1.5µs):** Hand-written CUDA with
    `ld.128`/`st.128` packed loads, explicit register allocation.
 2. **Programmatic launch dependency (SM90+, ~0.5-1µs):** FlashInfer
    uses `cudaGridDependencySynchronize()` /
    `cudaTriggerProgrammaticLaunchCompletion()` to reduce inter-kernel
    launch latency. Not available through Triton.
-3. **Remaining Triton codegen overhead (~0.5µs).**
 
 ## Improvements: Short Term
 
@@ -990,14 +994,22 @@ The 2.8µs gap to FlashInfer (5.8µs) comes from:
 - [x] **Lamport push-model codegen:** Implemented as
       `_symm_mem_sync_mode = "lamport"`. Functionally correct, CUDA-graph-
       safe. Performance gap to standalone needs closing (see above).
-- [x] **Close Lamport perf gap:** Three rounds of optimization:
+- [x] **Close Lamport perf gap:** Five rounds of optimization:
       (1) Moved offset computation into kernel (3 wrapper GPU ops → 1).
       (2) Pre-compute shared pointers once in prologue, reuse across
       body/epilogue. Eliminated redundant variable recomputation.
       (3) In-kernel flag advancement (FlashInfer-style): block counter
       via device-scope atomic, block 0 spins + advances flag + resets.
-      Zero wrapper GPU ops. Result: 18.5µs → 8.6µs at 1 token (4x
-      baseline), within 0.7µs of standalone (7.9µs).
+      Zero wrapper GPU ops.
+      (4) Simultaneous all-peer poll (`_lamport_poll_all_peers`):
+      single while-loop checking all non-self peers each iteration,
+      overlapping NVLink latency. Replaces sequential per-peer polls.
+      (5) Added `fence.acquire.sys` after poll loop to pair with
+      writer's `fence.sc.sys`. Fixed latent memory ordering bug where
+      `ld.volatile` (relaxed semantics only) didn't guarantee visibility
+      of non-volatile data loads.
+      Result: 18.5µs → 7.8µs at 1 token (4.4x baseline), now beats
+      standalone (8.2µs).
 - [ ] **Gate FX pass on tensor size:** Only replace `all_reduce + wait`
       with P2P when `numel * element_size < threshold` (default 1MB).
       Implement in `_can_replace()` using `node.meta["val"]`.

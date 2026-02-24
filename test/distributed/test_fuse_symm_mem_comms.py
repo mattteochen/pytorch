@@ -537,8 +537,8 @@ class TestFusedAllReduceRMSNormDistributed(MultiProcContinuousTest):
     def _assert_lamport_codegen(self, code_list):
         """Verify the generated code uses Lamport helpers, not pull model."""
         code = "\n".join(code_list)
-        self.assertIn("_lamport_poll_rows", code,
-                       "Kernel should call _lamport_poll_rows")
+        self.assertIn("_lamport_poll_all_peers", code,
+                       "Kernel should call _lamport_poll_all_peers")
         self.assertIn("_lamport_push_to_peers", code,
                        "Kernel should call _lamport_push_to_peers (prologue)")
         self.assertIn("_lamport_clear_old_slot", code,
@@ -565,7 +565,7 @@ class TestFusedAllReduceRMSNormDistributed(MultiProcContinuousTest):
                           "Wrapper should NOT use host barriers")
         self.assertNotIn("lamport_workspace_setup", code,
                           "Wrapper should NOT use Lamport setup")
-        self.assertNotIn("_lamport_poll_rows", code,
+        self.assertNotIn("_lamport_poll_all_peers", code,
                           "Kernel should NOT use Lamport reduce")
 
     def _assert_host_barrier_codegen(self, code_list):
@@ -579,7 +579,7 @@ class TestFusedAllReduceRMSNormDistributed(MultiProcContinuousTest):
                           "Kernel should NOT use device-side CAS sync")
         self.assertNotIn("lamport_workspace_setup", code,
                           "Wrapper should NOT use Lamport setup")
-        self.assertNotIn("_lamport_poll_rows", code,
+        self.assertNotIn("_lamport_poll_all_peers", code,
                           "Kernel should NOT use Lamport reduce")
 
     @skip_if_lt_x_gpu(2)
