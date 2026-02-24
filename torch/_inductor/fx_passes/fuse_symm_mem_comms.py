@@ -1,9 +1,12 @@
 # Owner(s): ["oncall: distributed"]
 """
-FX pass to replace all_reduce + wait_tensor with a P2P allreduce via
-symmetric memory.
+FX pass to replace symmetric-memory-eligible collectives with P2P
+implementations.
 
-When ``torch._inductor.config._fused_all_reduce_rmsnorm`` is enabled this
+**Currently supported:** ``all_reduce + wait_tensor`` → ``p2p_allreduce``.
+Other collectives (all_gather, reduce_scatter, etc.) are not yet handled.
+
+When ``torch._inductor.config._fuse_symm_mem_comms`` is enabled this
 pass detects::
 
     reduced = all_reduce(x)
@@ -55,7 +58,14 @@ def _get_reduce_op(node: fx.Node) -> str:
 def _get_group_name(node: fx.Node) -> str:
     if len(node.args) >= 3:
         return node.args[2]
-    return node.kwargs.get("group_name", "")
+    group_name = node.kwargs.get("group_name", "")
+    if not group_name:
+        log.warning(
+            "all_reduce node %s has no group_name; this likely indicates a "
+            "malformed graph. Defaulting to empty string.",
+            node.name,
+        )
+    return group_name
 
 
 def _find_all_reduce_wait_patterns(
@@ -103,7 +113,7 @@ def _can_replace(all_reduce_node: fx.Node, wait_node: fx.Node) -> bool:
     return True
 
 
-def fused_all_reduce_rmsnorm_pass(graph: fx.Graph, is_inference: bool = True) -> None:
+def fuse_symm_mem_comms_pass(graph: fx.Graph, is_inference: bool = True) -> None:
     """
     Main pass entry point.
 
@@ -111,16 +121,16 @@ def fused_all_reduce_rmsnorm_pass(graph: fx.Graph, is_inference: bool = True) ->
     Only runs during inference (training needs intermediates for autograd).
     """
     if not is_inference:
-        log.debug("fused_all_reduce_rmsnorm_pass: skipped (training mode)")
+        log.debug("fuse_symm_mem_comms_pass: skipped (training mode)")
         return
 
     patterns = _find_all_reduce_wait_patterns(graph)
     if not patterns:
-        log.debug("fused_all_reduce_rmsnorm_pass: no all_reduce->wait patterns found")
+        log.debug("fuse_symm_mem_comms_pass: no all_reduce->wait patterns found")
         return
 
     log.debug(
-        "fused_all_reduce_rmsnorm_pass: found %d all_reduce->wait patterns",
+        "fuse_symm_mem_comms_pass: found %d all_reduce->wait patterns",
         len(patterns),
     )
 
@@ -153,5 +163,5 @@ def fused_all_reduce_rmsnorm_pass(graph: fx.Graph, is_inference: bool = True) ->
         replaced += 1
 
     if replaced > 0:
-        log.debug("fused_all_reduce_rmsnorm_pass: replaced %d patterns", replaced)
+        log.debug("fuse_symm_mem_comms_pass: replaced %d patterns", replaced)
         graph.lint()

@@ -6203,7 +6203,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             "from torch._inductor.runtime.symm_mem_helpers import symm_mem_setup"
         )
         wrapper.writeline(
-            f"_symm_buf_ptrs, _symm_signal_pad_ptrs, _symm_rank, _symm_world_size = "
+            f"_symm_buf_ptrs, _symm_signal_pad_ptrs, _, _ = "
             f'symm_mem_setup({in_var}, "{self._symm_group_name}")'
         )
 
@@ -6225,7 +6225,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             "symm_mem_host_barrier_setup, symm_mem_host_barrier"
         )
         wrapper.writeline(
-            f"_symm_buf_ptrs, _symm_rank, _symm_world_size = "
+            f"_symm_buf_ptrs, _, _ = "
             f"symm_mem_host_barrier_setup("
             f'{in_var}, "{self._symm_group_name}", skip_copy={skip_copy})'
         )
@@ -6253,7 +6253,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             "lamport_workspace_setup"
         )
         wrapper.writeline(
-            f"_lam_ptrs, _symm_rank, _symm_world_size, _lam_meta = "
+            f"_lam_ptrs, _, _, _lam_meta = "
             f'lamport_workspace_setup({in_var}, "{self._symm_group_name}")'
         )
 

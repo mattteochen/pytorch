@@ -988,10 +988,11 @@ _fuse_ddp_communication_passes: list[Union[Callable[..., None], str]] = [
 
 _micro_pipeline_tp: bool = False
 
-# Enable fused all_reduce + RMSNorm pass. When enabled, detects patterns of
-# all_reduce -> wait_tensor -> [add] -> RMSNorm and replaces them with a
-# single fused kernel using symmetric memory.
-_fused_all_reduce_rmsnorm: bool = False
+# Enable symmetric-memory communication fusion pass. Replaces eligible
+# collectives with P2P implementations via symmetric memory. Currently
+# only handles all_reduce -> wait_tensor -> p2p_allreduce; downstream
+# compute (RMSNorm, add, etc.) is fused by inductor's scheduler.
+_fuse_symm_mem_comms: bool = False
 
 # When True, the inductor-generated P2P allreduce kernel skips the
 # prologue copy (input → symmetric memory) because the input is already

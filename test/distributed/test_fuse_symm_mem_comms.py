@@ -15,11 +15,11 @@ import torch.distributed._symmetric_memory as symm_mem
 import torch.nn.functional as F
 from functorch import make_fx
 from torch._inductor.decomposition import decompositions
-from torch._inductor.fx_passes.fused_allreduce_rmsnorm import (
+from torch._inductor.fx_passes.fuse_symm_mem_comms import (
     _find_all_reduce_wait_patterns,
     _is_all_reduce,
     _is_wait_tensor,
-    fused_all_reduce_rmsnorm_pass,
+    fuse_symm_mem_comms_pass,
 )
 from torch._inductor.fx_passes.post_grad import remove_noop_ops, view_to_reshape
 from torch._inductor.utils import run_and_get_code
@@ -122,7 +122,7 @@ class TestP2PAllReducePatternDetection(TestCase):
         )
 
         with _test_mode():
-            fused_all_reduce_rmsnorm_pass(gm.graph)
+            fuse_symm_mem_comms_pass(gm.graph)
 
         # p2p_allreduce should be in the graph
         p2p_nodes = [
@@ -156,7 +156,7 @@ class TestP2PAllReducePatternDetection(TestCase):
         )
 
         with _test_mode():
-            fused_all_reduce_rmsnorm_pass(gm.graph)
+            fuse_symm_mem_comms_pass(gm.graph)
 
         # The add and rmsnorm decomposition ops should still be present
         add_nodes = [
@@ -180,7 +180,7 @@ class TestP2PAllReducePatternDetection(TestCase):
         )
 
         with _test_mode():
-            fused_all_reduce_rmsnorm_pass(gm.graph, is_inference=False)
+            fuse_symm_mem_comms_pass(gm.graph, is_inference=False)
 
         # all_reduce should still be present
         ar_nodes = [n for n in gm.graph.nodes if _is_all_reduce(n)]
@@ -489,7 +489,7 @@ class TestFusedAllReduceRMSNormDistributed(MultiProcContinuousTest):
             residual=residual,
         )
 
-        @torch.compile(options={"_fused_all_reduce_rmsnorm": True})
+        @torch.compile(options={"_fuse_symm_mem_comms": True})
         def ar_norm(inp, res, w, gn):
             reduced = all_reduce(inp, "sum", group=gn)
             h = reduced + res
@@ -522,7 +522,7 @@ class TestFusedAllReduceRMSNormDistributed(MultiProcContinuousTest):
 
         expected_normed, _ = self._reference_allreduce_rmsnorm(x, weight, eps)
 
-        @torch.compile(options={"_fused_all_reduce_rmsnorm": True})
+        @torch.compile(options={"_fuse_symm_mem_comms": True})
         def ar_norm(inp, w, gn):
             reduced = all_reduce(inp, "sum", group=gn)
             normed = F.rms_norm(reduced, w.shape, w, eps)
@@ -554,6 +554,34 @@ class TestFusedAllReduceRMSNormDistributed(MultiProcContinuousTest):
         self.assertNotIn("symm_mem_host_barrier", code,
                           "Wrapper should NOT use host barriers")
 
+    def _assert_device_cas_codegen(self, code_list):
+        """Verify the generated code uses device-side CAS sync, not Lamport or host barriers."""
+        code = "\n".join(code_list)
+        self.assertIn("_symm_mem_sync", code,
+                       "Kernel should use device-side CAS sync")
+        self.assertIn("symm_signal_pad_ptrs", code,
+                       "Kernel should receive signal pad pointers")
+        self.assertNotIn("symm_mem_host_barrier", code,
+                          "Wrapper should NOT use host barriers")
+        self.assertNotIn("lamport_workspace_setup", code,
+                          "Wrapper should NOT use Lamport setup")
+        self.assertNotIn("_lamport_poll_and_reduce", code,
+                          "Kernel should NOT use Lamport reduce")
+
+    def _assert_host_barrier_codegen(self, code_list):
+        """Verify the generated code uses host barriers, not device CAS or Lamport."""
+        code = "\n".join(code_list)
+        self.assertIn("symm_mem_host_barrier_setup", code,
+                       "Wrapper should call host barrier setup")
+        self.assertIn("symm_mem_host_barrier", code,
+                       "Wrapper should call host barrier")
+        self.assertNotIn("_symm_mem_sync", code,
+                          "Kernel should NOT use device-side CAS sync")
+        self.assertNotIn("lamport_workspace_setup", code,
+                          "Wrapper should NOT use Lamport setup")
+        self.assertNotIn("_lamport_poll_and_reduce", code,
+                          "Kernel should NOT use Lamport reduce")
+
     @skip_if_lt_x_gpu(2)
     def test_torch_compile_lamport_allreduce_rmsnorm(self):
         """
@@ -583,7 +611,7 @@ class TestFusedAllReduceRMSNormDistributed(MultiProcContinuousTest):
         )
 
         @torch.compile(options={
-            "_fused_all_reduce_rmsnorm": True,
+            "_fuse_symm_mem_comms": True,
             "_symm_mem_sync_mode": "lamport",
         })
         def ar_norm(inp, res, w, gn):
@@ -625,7 +653,7 @@ class TestFusedAllReduceRMSNormDistributed(MultiProcContinuousTest):
         expected_normed, _ = self._reference_allreduce_rmsnorm(x, weight, eps)
 
         @torch.compile(options={
-            "_fused_all_reduce_rmsnorm": True,
+            "_fuse_symm_mem_comms": True,
             "_symm_mem_sync_mode": "lamport",
         })
         def ar_norm(inp, w, gn):
@@ -638,6 +666,174 @@ class TestFusedAllReduceRMSNormDistributed(MultiProcContinuousTest):
 
         torch.testing.assert_close(normed, expected_normed, atol=2e-2, rtol=2e-2)
         self._assert_lamport_codegen(code)
+
+    @skip_if_lt_x_gpu(2)
+    def test_torch_compile_device_cas_allreduce_rmsnorm(self):
+        """
+        End-to-end torch.compile with device-side CAS sync:
+        all_reduce -> add residual -> rms_norm.
+
+        Verifies both numerical correctness AND that the generated Triton
+        kernel uses device-side CAS sync (not Lamport or host barriers).
+        """
+        self._init_process()
+        hidden = 64
+        eps = 1e-5
+
+        x = torch.randn(4, hidden, device=self.device, dtype=torch.bfloat16)
+        residual = torch.randn(4, hidden, device=self.device, dtype=torch.bfloat16)
+        weight = torch.ones(hidden, device=self.device, dtype=torch.float32)
+
+        group_name = dist.group.WORLD.group_name
+        symm_mem.enable_symm_mem_for_group(group_name)
+        symm_mem.get_symm_mem_workspace(
+            group_name, min_size=x.numel() * x.element_size()
+        )
+
+        expected_normed, expected_pre_norm = self._reference_allreduce_rmsnorm(
+            x, weight, eps, residual=residual,
+        )
+
+        @torch.compile(options={
+            "_fuse_symm_mem_comms": True,
+            "_symm_mem_sync_mode": "device_cas",
+        })
+        def ar_norm(inp, res, w, gn):
+            reduced = all_reduce(inp, "sum", group=gn)
+            h = reduced + res
+            normed = F.rms_norm(h, w.shape, w, eps)
+            return normed, h
+
+        with torch.inference_mode():
+            (normed, pre_norm), code = run_and_get_code(
+                ar_norm, x, residual, weight, group_name
+            )
+
+        torch.testing.assert_close(normed, expected_normed, atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(pre_norm, expected_pre_norm, atol=2e-2, rtol=2e-2)
+        self._assert_device_cas_codegen(code)
+
+    @skip_if_lt_x_gpu(2)
+    def test_torch_compile_device_cas_no_residual(self):
+        """
+        End-to-end torch.compile with device-side CAS sync:
+        all_reduce -> rms_norm (no residual).
+
+        Verifies both numerical correctness AND codegen structure.
+        """
+        self._init_process()
+        hidden = 64
+        eps = 1e-5
+
+        x = torch.randn(4, hidden, device=self.device, dtype=torch.bfloat16)
+        weight = torch.ones(hidden, device=self.device, dtype=torch.float32)
+
+        group_name = dist.group.WORLD.group_name
+        symm_mem.enable_symm_mem_for_group(group_name)
+        symm_mem.get_symm_mem_workspace(
+            group_name, min_size=x.numel() * x.element_size()
+        )
+
+        expected_normed, _ = self._reference_allreduce_rmsnorm(x, weight, eps)
+
+        @torch.compile(options={
+            "_fuse_symm_mem_comms": True,
+            "_symm_mem_sync_mode": "device_cas",
+        })
+        def ar_norm(inp, w, gn):
+            reduced = all_reduce(inp, "sum", group=gn)
+            normed = F.rms_norm(reduced, w.shape, w, eps)
+            return normed
+
+        with torch.inference_mode():
+            normed, code = run_and_get_code(ar_norm, x, weight, group_name)
+
+        torch.testing.assert_close(normed, expected_normed, atol=2e-2, rtol=2e-2)
+        self._assert_device_cas_codegen(code)
+
+    @skip_if_lt_x_gpu(2)
+    def test_torch_compile_host_barrier_allreduce_rmsnorm(self):
+        """
+        End-to-end torch.compile with host barrier sync:
+        all_reduce -> add residual -> rms_norm.
+
+        Verifies both numerical correctness AND that the generated code
+        uses host barriers (not device CAS or Lamport).
+        """
+        self._init_process()
+        hidden = 64
+        eps = 1e-5
+
+        x = torch.randn(4, hidden, device=self.device, dtype=torch.bfloat16)
+        residual = torch.randn(4, hidden, device=self.device, dtype=torch.bfloat16)
+        weight = torch.ones(hidden, device=self.device, dtype=torch.float32)
+
+        group_name = dist.group.WORLD.group_name
+        symm_mem.enable_symm_mem_for_group(group_name)
+        symm_mem.get_symm_mem_workspace(
+            group_name, min_size=x.numel() * x.element_size()
+        )
+
+        expected_normed, expected_pre_norm = self._reference_allreduce_rmsnorm(
+            x, weight, eps, residual=residual,
+        )
+
+        @torch.compile(options={
+            "_fuse_symm_mem_comms": True,
+            "_symm_mem_sync_mode": "host_barrier",
+        })
+        def ar_norm(inp, res, w, gn):
+            reduced = all_reduce(inp, "sum", group=gn)
+            h = reduced + res
+            normed = F.rms_norm(h, w.shape, w, eps)
+            return normed, h
+
+        with torch.inference_mode():
+            (normed, pre_norm), code = run_and_get_code(
+                ar_norm, x, residual, weight, group_name
+            )
+
+        torch.testing.assert_close(normed, expected_normed, atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(pre_norm, expected_pre_norm, atol=2e-2, rtol=2e-2)
+        self._assert_host_barrier_codegen(code)
+
+    @skip_if_lt_x_gpu(2)
+    def test_torch_compile_host_barrier_no_residual(self):
+        """
+        End-to-end torch.compile with host barrier sync:
+        all_reduce -> rms_norm (no residual).
+
+        Verifies both numerical correctness AND codegen structure.
+        """
+        self._init_process()
+        hidden = 64
+        eps = 1e-5
+
+        x = torch.randn(4, hidden, device=self.device, dtype=torch.bfloat16)
+        weight = torch.ones(hidden, device=self.device, dtype=torch.float32)
+
+        group_name = dist.group.WORLD.group_name
+        symm_mem.enable_symm_mem_for_group(group_name)
+        symm_mem.get_symm_mem_workspace(
+            group_name, min_size=x.numel() * x.element_size()
+        )
+
+        expected_normed, _ = self._reference_allreduce_rmsnorm(x, weight, eps)
+
+        @torch.compile(options={
+            "_fuse_symm_mem_comms": True,
+            "_symm_mem_sync_mode": "host_barrier",
+        })
+        def ar_norm(inp, w, gn):
+            reduced = all_reduce(inp, "sum", group=gn)
+            normed = F.rms_norm(reduced, w.shape, w, eps)
+            return normed
+
+        with torch.inference_mode():
+            normed, code = run_and_get_code(ar_norm, x, weight, group_name)
+
+        torch.testing.assert_close(normed, expected_normed, atol=2e-2, rtol=2e-2)
+        self._assert_host_barrier_codegen(code)
 
 
 if __name__ == "__main__":

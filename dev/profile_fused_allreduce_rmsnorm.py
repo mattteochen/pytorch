@@ -106,7 +106,7 @@ def _make_compiled_ar_norm(eps: float):
     """Inductor P2P kernel with device-side CAS sync (original, no host barriers)."""
 
     @torch.compile(options={
-        "_fused_all_reduce_rmsnorm": True,
+        "_fuse_symm_mem_comms": True,
         "_symm_mem_host_barrier_threshold": -1,
     })
     def _ar_norm(x, residual, weight, group_name):
@@ -344,7 +344,7 @@ def main():
     # --- Variant 3b: compiled + forced host barriers ---
     def _make_host_barrier_ar_norm(eps_val):
         @torch.compile(options={
-            "_fused_all_reduce_rmsnorm": True,
+            "_fuse_symm_mem_comms": True,
             "_symm_mem_host_barrier_threshold": 0,
         })
         def _fn(x, residual, weight, group_name):
@@ -378,7 +378,7 @@ def main():
     # --- Variant 3c: compiled + device CAS + grid cap at 36 CTAs ---
     def _make_grid_cap_ar_norm(eps_val):
         @torch.compile(options={
-            "_fused_all_reduce_rmsnorm": True,
+            "_fuse_symm_mem_comms": True,
             "_symm_mem_host_barrier_threshold": -1,
             "_symm_mem_grid_cap": 36,
         })
@@ -413,7 +413,7 @@ def main():
     # --- Variant 3d: compiled + Lamport push-model (zero barriers) ---
     def _make_lamport_ar_norm(eps_val):
         @torch.compile(options={
-            "_fused_all_reduce_rmsnorm": True,
+            "_fuse_symm_mem_comms": True,
             "_symm_mem_sync_mode": "lamport",
         })
         def _fn(x, residual, weight, group_name):
@@ -485,7 +485,7 @@ def main():
     # create a fresh compiled function.
     @torch.compile(
         options={
-            "_fused_all_reduce_rmsnorm": True,
+            "_fuse_symm_mem_comms": True,
             "_symm_mem_skip_prologue_copy": True,
         },
     )

@@ -2220,6 +2220,11 @@ class Kernel(CodeGen, Generic[CSEVariableType]):
     def load(self, name: str, index: sympy.Expr) -> CSEVariable:
         raise NotImplementedError
 
+    def symm_mem_p2p_reduce_load(
+        self, name: str, index: sympy.Expr, world_size: int, group_name: str = ""
+    ) -> CSEVariable:
+        raise NotImplementedError
+
     def indirect_load(self, name: str, index: sympy.Expr) -> CSEVariable:
         """A load the depends on an index we have read"""
         prior = self.loads

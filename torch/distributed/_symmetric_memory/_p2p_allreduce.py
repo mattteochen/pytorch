@@ -2,7 +2,7 @@
 """
 P2P allreduce op designed for fusion into inductor-generated Triton kernels.
 
-Unlike ``fused_all_reduce_rmsnorm`` which is a monolithic fused op, this op
+Unlike ``fused_all_reduce_rmsnorm`` (the monolithic fused op), this op
 **only** performs the allreduce.  The downstream compute (RMSNorm, add, etc.)
 is left in the FX graph so that inductor's scheduler fuses it naturally into
 the same Triton kernel.
