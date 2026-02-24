@@ -61,6 +61,7 @@ from kraken.fused.one_shot_all_reduce_bias_rms_norm import (
 from kraken.fused.two_shot_all_reduce_bias_rms_norm import (
     two_shot_all_reduce_bias_rms_norm,
 )
+from compile import compile_with_debug
 
 
 HIDDEN = 2880
@@ -412,16 +413,15 @@ def main():
 
     # --- Variant 3d: compiled + Lamport push-model (zero barriers) ---
     def _make_lamport_ar_norm(eps_val):
-        @torch.compile(options={
-            "_fuse_symm_mem_comms": True,
-            "_symm_mem_sync_mode": "lamport",
-        })
         def _fn(x, residual, weight, group_name):
             reduced = funcol.all_reduce(x, "sum", group_name)
             h = reduced + residual
             normed = F.rms_norm(h, weight.shape, weight, eps_val)
             return normed, h
-        return _fn
+        return compile_with_debug(_fn, inductor_kwargs={
+            "_fuse_symm_mem_comms": True,
+            "_symm_mem_sync_mode": "lamport",
+        })
 
     ar_norm_lamport = _make_lamport_ar_norm(EPS)
 
