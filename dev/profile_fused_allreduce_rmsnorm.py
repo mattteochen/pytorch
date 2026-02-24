@@ -248,7 +248,7 @@ def main():
     symm_mem.enable_symm_mem_for_group(group_name)
     workspace_bytes = num_tokens * HIDDEN * 2  # bf16 = 2 bytes
     symm_mem.get_symm_mem_workspace(group_name, min_size=workspace_bytes)
-    results: list[tuple[str, float | None]] = []
+    results: list[tuple[str, float | None, str]] = []  # (name, avg_us, correctness)
 
     if rank == 0:
         mode_str = (
@@ -275,7 +275,36 @@ def main():
         logging.DEBUG
     )
 
+    # --- Correctness checking infrastructure ---
+    def _extract_normed(result):
+        """Extract the normed output tensor from a variant's return value."""
+        if isinstance(result, tuple):
+            return result[0]
+        return result
+
+    def _check_correctness(fn, ref_normed, label):
+        """Run fn once and compare normed output against reference.
+
+        Returns a status string: "PASS", "FAIL (atol=X)", or "ERROR: ...".
+        """
+        try:
+            out = fn()
+            normed = _extract_normed(out)
+            if normed is None:
+                return "SKIP"
+            if torch.allclose(normed, ref_normed, atol=1e-2, rtol=1e-2):
+                return "PASS"
+            diff = (normed.float() - ref_normed.float()).abs()
+            return f"FAIL (max={diff.max().item():.4f}, mean={diff.mean().item():.4f})"
+        except Exception as e:
+            return f"ERROR: {e}"
+
     # --- Variant 1: baseline (NCCL + eager) ---
+    # Run once to get reference output for correctness checks.
+    ref_out = layer.forward_baseline(x, residual, group_name)
+    torch.cuda.synchronize()
+    ref_normed = _extract_normed(ref_out).clone()
+
     results.append(
         (
             "baseline",
@@ -287,6 +316,7 @@ def main():
                 nsys_mode=nsys_mode,
                 timer_mode=timer_mode,
             ),
+            "REF",
         )
     )
 
@@ -305,6 +335,7 @@ def main():
             eps=EPS,
         )
 
+    fused_op_ok = _check_correctness(fused_op_call, ref_normed, "fused_op")
     results.append(
         (
             "fused_op",
@@ -316,6 +347,7 @@ def main():
                 nsys_mode=nsys_mode,
                 timer_mode=timer_mode,
             ),
+            fused_op_ok,
         )
     )
 
@@ -327,6 +359,7 @@ def main():
         h = x
         return ar_norm_compiled(h, residual, weight, group_name)
 
+    compiled_ok = _check_correctness(compiled_call, ref_normed, "compiled")
     results.append(
         (
             "compiled",
@@ -339,6 +372,7 @@ def main():
                 nsys_mode=nsys_mode,
                 timer_mode=timer_mode,
             ),
+            compiled_ok,
         )
     )
 
@@ -361,6 +395,7 @@ def main():
         h = x
         return ar_norm_host_barrier(h, residual, weight, group_name)
 
+    host_barrier_ok = _check_correctness(compiled_host_barrier_call, ref_normed, "compiled_host_barrier")
     results.append(
         (
             "compiled_host_barrier",
@@ -373,6 +408,7 @@ def main():
                 nsys_mode=nsys_mode,
                 timer_mode=timer_mode,
             ),
+            host_barrier_ok,
         )
     )
 
@@ -396,6 +432,7 @@ def main():
         h = x
         return ar_norm_grid_cap(h, residual, weight, group_name)
 
+    gridcap_ok = _check_correctness(compiled_grid_cap_call, ref_normed, "compiled_gridcap36")
     results.append(
         (
             "compiled_gridcap36",
@@ -408,6 +445,7 @@ def main():
                 nsys_mode=nsys_mode,
                 timer_mode=timer_mode,
             ),
+            gridcap_ok,
         )
     )
 
@@ -429,6 +467,7 @@ def main():
         h = x
         return ar_norm_lamport(h, residual, weight, group_name)
 
+    lamport_ok = _check_correctness(compiled_lamport_call, ref_normed, "compiled_lamport")
     results.append(
         (
             "compiled_lamport",
@@ -441,6 +480,7 @@ def main():
                 nsys_mode=nsys_mode,
                 timer_mode=timer_mode,
             ),
+            lamport_ok,
         )
     )
 
@@ -451,6 +491,7 @@ def main():
         h = x
         return ar_norm_compiled_plain(h, residual, weight, group_name)
 
+    plain_ok = _check_correctness(compiled_plain_call, ref_normed, "compiled_plain")
     results.append(
         (
             "compiled_plain",
@@ -463,6 +504,7 @@ def main():
                 nsys_mode=nsys_mode,
                 timer_mode=timer_mode,
             ),
+            plain_ok,
         )
     )
 
@@ -505,6 +547,7 @@ def main():
         h_symm_compiled.copy_(x)
         return _ar_norm_mp(h_symm_compiled, residual, weight, group_name)
 
+    mempool_compiled_ok = _check_correctness(compiled_mempool_call, ref_normed, "compiled_mempool")
     results.append(
         (
             "compiled_mempool",
@@ -517,6 +560,7 @@ def main():
                 nsys_mode=nsys_mode,
                 timer_mode=timer_mode,
             ),
+            mempool_compiled_ok,
         )
     )
 
@@ -545,6 +589,7 @@ def main():
         )
         return output.view(x.shape), residual_out.view(x.shape)
 
+    mempool_ok = _check_correctness(mempool_call, ref_normed, "mempool")
     results.append(
         (
             "mempool",
@@ -556,6 +601,7 @@ def main():
                 nsys_mode=nsys_mode,
                 timer_mode=timer_mode,
             ),
+            mempool_ok,
         )
     )
 
@@ -582,6 +628,7 @@ def main():
         )
         return kraken_output
 
+    kraken_ok = _check_correctness(kraken_call, ref_normed, "kraken")
     results.append(
         (
             "kraken",
@@ -593,6 +640,7 @@ def main():
                 nsys_mode=nsys_mode,
                 timer_mode=timer_mode,
             ),
+            kraken_ok,
         )
     )
 
@@ -617,6 +665,7 @@ def main():
         )
         return kraken_2shot_output
 
+    kraken_2shot_ok = _check_correctness(kraken_2shot_call, ref_normed, "kraken_2shot")
     results.append(
         (
             "kraken_2shot",
@@ -628,6 +677,7 @@ def main():
                 nsys_mode=nsys_mode,
                 timer_mode=timer_mode,
             ),
+            kraken_2shot_ok,
         )
     )
 
@@ -676,6 +726,7 @@ def main():
             )
             return fi_norm_out
 
+        flashinfer_ok = _check_correctness(flashinfer_call, ref_normed, "flashinfer")
         results.append(
             (
                 "flashinfer",
@@ -687,6 +738,7 @@ def main():
                     nsys_mode=nsys_mode,
                     timer_mode=timer_mode,
                 ),
+                flashinfer_ok,
             )
         )
 
@@ -718,6 +770,7 @@ def main():
             _lam_iter[0] += 1
             return r
 
+        lamport_sa_ok = _check_correctness(lamport_standalone_call, ref_normed, "lamport_standalone")
         results.append(
             (
                 "lamport_standalone",
@@ -729,6 +782,7 @@ def main():
                     nsys_mode=nsys_mode,
                     timer_mode=timer_mode,
                 ),
+                lamport_sa_ok,
             )
         )
     except (ImportError, RuntimeError) as e:
@@ -738,24 +792,24 @@ def main():
     # --- Summary table ---
     if rank == 0 and results:
         baseline_us = next(
-            (us for name, us in results if name == "baseline" and us), None
+            (us for name, us, _ in results if name == "baseline" and us), None
         )
-        print(f"\n{'=' * 65}")
+        print(f"\n{'=' * 80}")
         print(
             f"  SUMMARY  (NUM_TOKENS={num_tokens}, HIDDEN={HIDDEN}, "
             f"world_size={dist.get_world_size()})"
         )
-        print(f"{'=' * 65}")
-        print(f"  {'Variant':<25s} {'us/iter':>10s} {'vs baseline':>12s}")
-        print(f"  {'-' * 25} {'-' * 10} {'-' * 12}")
-        for name, avg_us in results:
+        print(f"{'=' * 80}")
+        print(f"  {'Variant':<25s} {'us/iter':>10s} {'vs baseline':>12s}  {'correctness'}")
+        print(f"  {'-' * 25} {'-' * 10} {'-' * 12}  {'-' * 28}")
+        for name, avg_us, ok in results:
             if avg_us is None:
                 continue
             speedup = ""
             if baseline_us and baseline_us > 0:
                 ratio = baseline_us / avg_us
                 speedup = f"{ratio:.2f}x"
-            print(f"  {name:<25s} {avg_us:10.1f} {speedup:>12s}")
+            print(f"  {name:<25s} {avg_us:10.1f} {speedup:>12s}  {ok}")
         print()
 
     dist.destroy_process_group()
