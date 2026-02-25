@@ -1,12 +1,19 @@
 # Inductor-Generated Fused AllReduce via Kraken PTX
 
-## Status: Lamport push-model with simultaneous poll, 7.8µs at 1 token (4.4x baseline)
+## Status: Vectorized loads + Lamport push-model, 7.8µs at 1 token (4.4x baseline)
 
 All 28 tests pass (14 single-process + 8 multi-GPU distributed + 6 torch.compile e2e).
 Three sync modes: host barriers (default), device-side CAS, Lamport push-model.
 Lamport mode (`_symm_mem_sync_mode = "lamport"`) uses simultaneous all-peer
 polling with `fence.acquire.sys` for proper memory ordering, achieving 7.8µs
 at 1 token on 4xGB200 — within 2µs of FlashInfer's native CUDA kernel.
+
+All sync modes now use per-peer TensorArg kernel parameters instead of a
+single `symm_buf_ptrs` int64 pointer-of-pointers. This enables Triton's
+`tt.divisibility = 16` annotations, producing **vectorized `ld.global.v4.b32`
+loads** instead of scalar `ld.global.b16`. On GB200 (SM 10.0) with HIDDEN=2880
+and 4 peers: 16 vectorized loads vs 132 scalar loads — **8.2x fewer
+load instructions**.
 
 Profiled on 4xGB200 with NUM_TOKENS=32, HIDDEN=2880:
 - **compiled** (inductor P2P): 1.008ms total — matches kraken (1.002ms)
@@ -57,9 +64,9 @@ Generated:    prologue (copy→symm_mem + sync) → P2P reduce load loop →
 
 | Aspect | Generated | Kraken handwritten |
 |--------|-----------|-------------------|
-| Copy-in | `tl.load(buffer_ptrs + RANK)` → `tl.store` | Same |
-| Sync | `_symm_mem_sync(signal_pad_ptrs, ...)` | Same function |
-| P2P reduce | `tl.static_range(WS)` loop, pointer-to-pointer deref | `range(world_size)` loop, same deref |
+| Copy-in | `symm_peer_buf_{RANK}` direct arg (constexpr if-elif) | `tl.load(buffer_ptrs + RANK)` |
+| Sync | host barrier / Lamport / device CAS | device CAS (`_symm_mem_sync`) |
+| P2P reduce | Unrolled `tl.load(symm_peer_buf_{i} + idx)` per peer, **vectorized** | `range(world_size)` loop, pointer-to-pointer deref, scalar |
 | RMSNorm | **Inductor-generated** (pow→mean→rsqrt→mul) | Hand-coded |
 | Grid | Heuristic-chosen XBLOCK, prologue loops over XBLOCK rows | `num_blocks` (one per row) |
 | Reduction | Persistent (forced for P2P kernels) | Persistent (hardcoded) |
@@ -542,26 +549,22 @@ populate `_group_name_to_store`. This needs to be reconciled.
 
 ## Remaining Overhead
 
-### 1. `symm_mem_setup` called per kernel invocation
+### 1. `symm_mem_setup` / `*_peer_bufs` called per kernel invocation
 
-Cached (dict lookup) but still runs Python per call.
+Cached (dict lookup + `sm.get_buffer()` per peer) but still runs Python per call.
 
 **Fix:** Move to `Runner.__init__` or module-level init.
 
-### 2. Two CUDA int64 tensors for pointer arrays
+### 2. ~~Two CUDA int64 tensors for pointer arrays~~ → RESOLVED
 
-Created on first call, cached after.
+Replaced with per-peer `TensorArg` kernel parameters. No pointer array tensors
+needed for the hot data path. (`symm_signal_pad_ptrs` still uses int64 for
+device-CAS mode only, but it's not on the hot path.)
 
-**Fix:** Use `SymmetricMemory.buffer_ptrs_dev` / `signal_pad_ptrs_dev`
-raw ints directly, bypassing tensor creation.
+### 3. ~~bf16 hardcoded in prologue pointer cast~~ → RESOLVED
 
-### 3. bf16 hardcoded in prologue pointer cast
-
-```python
-_symm_local_buf = tl.load(_symm_bptrs + SYMM_RANK).to(tl.pointer_type(tl.bfloat16))
-```
-
-**Fix:** Use the actual input dtype from `V.graph.get_dtype(name)`.
+Per-peer args use `dtype=self.symm_mem_input_dtype` from the graph, so the
+pointer type is always correct. No hardcoded `tl.bfloat16` cast.
 
 ## Gating Plan: Large Tensor Fallback
 
@@ -786,7 +789,6 @@ JIT helpers inside the generated kernel:
 
 ```python
 from torch._inductor.runtime.lamport_helpers import (
-    _lamport_push_to_peers,       # push data to all peers' local buffers
     _lamport_poll_all_peers,      # simultaneous sentinel poll + acquire fence
     _lamport_clear_old_slot,      # re-arm sentinels for triple-buffer rotation
     _fence_sys as _lamport_fence_sys,  # system-scope release fence after push
@@ -794,6 +796,10 @@ from torch._inductor.runtime.lamport_helpers import (
     _lamport_advance_flag_block0, # in-kernel flag advancement (block 0 only)
 )
 ```
+
+Note: `_lamport_push_to_peers` is no longer imported — the push loop is
+inlined directly in the generated kernel as `tl.store(symm_peer_buf_{i} + ...)`
+per peer, enabling vectorized stores via TensorArg alignment metadata.
 
 ### Key design decisions
 
@@ -1010,13 +1016,28 @@ The 2.0µs gap to FlashInfer (5.8µs) comes from:
       of non-volatile data loads.
       Result: 18.5µs → 7.8µs at 1 token (4.4x baseline), now beats
       standalone (8.2µs).
+- [x] **Vectorized loads for P2P peer buffers:** Replaced the single
+      `symm_buf_ptrs` int64 tensor (pointer-of-pointers) with N separate
+      `TensorArg` kernel parameters (`symm_peer_buf_0` through
+      `symm_peer_buf_{N-1}`), one per peer. Each arg is a direct typed
+      pointer with Triton alignment metadata (`tt.divisibility = 16`),
+      enabling vectorized `ld.global.v4.b32` loads instead of scalar
+      `ld.global.b16`. On GB200 with HIDDEN=2880 and 4 peers: 16
+      vectorized loads vs 132 scalar loads — 8.2x fewer instructions.
+      Applied to all three sync modes (host barrier, device CAS, Lamport).
+      For Lamport, also inlined `_lamport_push_to_peers` as direct
+      `tl.store(symm_peer_buf_{i} + ...)` per peer, eliminating the
+      JIT helper's pointer indirection.
+      Files: `symm_mem_helpers.py` (new `*_peer_bufs` helpers),
+      `lamport_helpers.py` (new `lamport_workspace_peer_bufs`),
+      `triton.py` (signature, codegen, wrapper emit methods).
 - [ ] **Gate FX pass on tensor size:** Only replace `all_reduce + wait`
       with P2P when `numel * element_size < threshold` (default 1MB).
       Implement in `_can_replace()` using `node.meta["val"]`.
       Add `_fused_all_reduce_rmsnorm_max_bytes` config.
-- [ ] Move `symm_mem_setup` to graph init (one-time, not per-call)
-- [ ] Use `buffer_ptrs_dev` / `signal_pad_ptrs_dev` raw ints
-- [ ] Fix bf16 hardcoding → use actual input dtype
+- [ ] Move `symm_mem_setup` / `*_peer_bufs` to graph init (one-time, not per-call)
+- [x] ~~Use `buffer_ptrs_dev` / `signal_pad_ptrs_dev` raw ints~~ → resolved by per-peer TensorArgs
+- [x] ~~Fix bf16 hardcoding → use actual input dtype~~ → resolved by per-peer TensorArgs
 
 ## Improvements: Medium Term
 

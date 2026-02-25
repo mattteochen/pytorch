@@ -228,14 +228,15 @@ def main():
     parser.add_argument(
         "--num-tokens",
         type=int,
-        default=NUM_TOKENS,
-        help="Number of decode tokens (sequence length)",
+        nargs="+",
+        default=[NUM_TOKENS],
+        help="Number of decode tokens (one or more values, e.g. --num-tokens 1 32 1024)",
     )
     # torchrun injects extra args; ignore them.
     args, _ = parser.parse_known_args()
     nsys_mode = args.nsys
     timer_mode = args.timer
-    num_tokens = args.num_tokens
+    token_counts = args.num_tokens
 
     dist.init_process_group(backend="nccl")
     rank = dist.get_rank()
@@ -246,9 +247,11 @@ def main():
 
     # --- Symmetric memory setup (mirrors what SGLang model init would do) ---
     symm_mem.enable_symm_mem_for_group(group_name)
-    workspace_bytes = num_tokens * HIDDEN * 2  # bf16 = 2 bytes
+    max_tokens = max(token_counts)
+    workspace_bytes = max_tokens * HIDDEN * 2  # bf16 = 2 bytes
     symm_mem.get_symm_mem_workspace(group_name, min_size=workspace_bytes)
-    results: list[tuple[str, float | None, str]] = []  # (name, avg_us, correctness)
+    # all_results: {num_tokens: [(name, avg_us, correctness), ...]}
+    all_results: dict[int, list[tuple[str, float | None, str]]] = {}
 
     if rank == 0:
         mode_str = (
@@ -258,17 +261,12 @@ def main():
         )
         print(f"Mode: {mode_str}")
         print(
-            f"Config: NUM_TOKENS={num_tokens}, HIDDEN={HIDDEN}, world_size={dist.get_world_size()}"
+            f"Config: num_tokens={token_counts}, HIDDEN={HIDDEN}, world_size={dist.get_world_size()}"
         )
         print(f"Symmetric memory workspace pre-allocated: {workspace_bytes} bytes")
 
     # --- Build dummy model ---
     layer = DummyDecoderLayer(HIDDEN, INTER, EPS, device)
-
-    # --- Inputs (flattened, SGLang-style: num_tokens × hidden) ---
-    x = torch.randn(num_tokens, HIDDEN, device=device, dtype=torch.bfloat16)
-    residual = torch.randn_like(x)
-    weight = layer.norm_weight
 
     # --- Enable FX pass debug logging ---
     logging.getLogger("torch._inductor.fx_passes.fused_allreduce_rmsnorm").setLevel(
@@ -299,498 +297,8 @@ def main():
         except Exception as e:
             return f"ERROR: {e}"
 
-    # --- Variant 1: baseline (NCCL + eager) ---
-    # Run once to get reference output for correctness checks.
-    ref_out = layer.forward_baseline(x, residual, group_name)
-    torch.cuda.synchronize()
-    ref_normed = _extract_normed(ref_out).clone()
-
-    results.append(
-        (
-            "baseline",
-            _profile(
-                "baseline",
-                lambda: layer.forward_baseline(x, residual, group_name),
-                rank,
-                cuda_graph=True,
-                nsys_mode=nsys_mode,
-                timer_mode=timer_mode,
-            ),
-            "REF",
-        )
-    )
-
-    # --- Variant 2: fused op (direct call, no torch.compile) ---
-    __import__("torch.distributed._symmetric_memory._fused_all_reduce_rmsnorm")
-
-    def fused_op_call():
-        # h = layer.down_proj(F.silu(layer.moe_proj(x)))
-        h = x
-        return torch.ops.symm_mem.fused_all_reduce_rmsnorm(
-            h,
-            weight,
-            "sum",
-            group_name,
-            residual=residual,
-            eps=EPS,
-        )
-
-    fused_op_ok = _check_correctness(fused_op_call, ref_normed, "fused_op")
-    results.append(
-        (
-            "fused_op",
-            _profile(
-                "fused_op",
-                fused_op_call,
-                rank,
-                cuda_graph=True,
-                nsys_mode=nsys_mode,
-                timer_mode=timer_mode,
-            ),
-            fused_op_ok,
-        )
-    )
-
-    # --- Variant 3: torch.compile (inductor P2P codegen, kraken sync) ---
-    ar_norm_compiled = _make_compiled_ar_norm(EPS)
-
-    def compiled_call():
-        # h = layer.down_proj(F.silu(layer.moe_proj(x)))
-        h = x
-        return ar_norm_compiled(h, residual, weight, group_name)
-
-    compiled_ok = _check_correctness(compiled_call, ref_normed, "compiled")
-    results.append(
-        (
-            "compiled",
-            _profile(
-                "compiled",
-                compiled_call,
-                rank,
-                warmup=WARMUP_ITERS + 5,
-                cuda_graph=True,
-                nsys_mode=nsys_mode,
-                timer_mode=timer_mode,
-            ),
-            compiled_ok,
-        )
-    )
-
-    # --- Variant 3b: compiled + forced host barriers ---
-    def _make_host_barrier_ar_norm(eps_val):
-        @torch.compile(options={
-            "_fuse_symm_mem_comms": True,
-            "_symm_mem_host_barrier_threshold": 0,
-        })
-        def _fn(x, residual, weight, group_name):
-            reduced = funcol.all_reduce(x, "sum", group_name)
-            h = reduced + residual
-            normed = F.rms_norm(h, weight.shape, weight, eps_val)
-            return normed, h
-        return _fn
-
-    ar_norm_host_barrier = _make_host_barrier_ar_norm(EPS)
-
-    def compiled_host_barrier_call():
-        h = x
-        return ar_norm_host_barrier(h, residual, weight, group_name)
-
-    host_barrier_ok = _check_correctness(compiled_host_barrier_call, ref_normed, "compiled_host_barrier")
-    results.append(
-        (
-            "compiled_host_barrier",
-            _profile(
-                "compiled_host_barrier",
-                compiled_host_barrier_call,
-                rank,
-                warmup=WARMUP_ITERS + 5,
-                cuda_graph=True,
-                nsys_mode=nsys_mode,
-                timer_mode=timer_mode,
-            ),
-            host_barrier_ok,
-        )
-    )
-
-    # --- Variant 3c: compiled + device CAS + grid cap at 36 CTAs ---
-    def _make_grid_cap_ar_norm(eps_val):
-        @torch.compile(options={
-            "_fuse_symm_mem_comms": True,
-            "_symm_mem_host_barrier_threshold": -1,
-            "_symm_mem_grid_cap": 36,
-        })
-        def _fn(x, residual, weight, group_name):
-            reduced = funcol.all_reduce(x, "sum", group_name)
-            h = reduced + residual
-            normed = F.rms_norm(h, weight.shape, weight, eps_val)
-            return normed, h
-        return _fn
-
-    ar_norm_grid_cap = _make_grid_cap_ar_norm(EPS)
-
-    def compiled_grid_cap_call():
-        h = x
-        return ar_norm_grid_cap(h, residual, weight, group_name)
-
-    gridcap_ok = _check_correctness(compiled_grid_cap_call, ref_normed, "compiled_gridcap36")
-    results.append(
-        (
-            "compiled_gridcap36",
-            _profile(
-                "compiled_gridcap36",
-                compiled_grid_cap_call,
-                rank,
-                warmup=WARMUP_ITERS + 5,
-                cuda_graph=True,
-                nsys_mode=nsys_mode,
-                timer_mode=timer_mode,
-            ),
-            gridcap_ok,
-        )
-    )
-
-    # --- Variant 3d: compiled + Lamport push-model (zero barriers) ---
-    def _make_lamport_ar_norm(eps_val):
-        def _fn(x, residual, weight, group_name):
-            reduced = funcol.all_reduce(x, "sum", group_name)
-            h = reduced + residual
-            normed = F.rms_norm(h, weight.shape, weight, eps_val)
-            return normed, h
-        return compile_with_debug(_fn, inductor_kwargs={
-            "_fuse_symm_mem_comms": True,
-            "_symm_mem_sync_mode": "lamport",
-        })
-
-    ar_norm_lamport = _make_lamport_ar_norm(EPS)
-
-    def compiled_lamport_call():
-        h = x
-        return ar_norm_lamport(h, residual, weight, group_name)
-
-    lamport_ok = _check_correctness(compiled_lamport_call, ref_normed, "compiled_lamport")
-    results.append(
-        (
-            "compiled_lamport",
-            _profile(
-                "compiled_lamport",
-                compiled_lamport_call,
-                rank,
-                warmup=WARMUP_ITERS + 5,
-                cuda_graph=True,
-                nsys_mode=nsys_mode,
-                timer_mode=timer_mode,
-            ),
-            lamport_ok,
-        )
-    )
-
-    # --- Variant 4: torch.compile plain (default options) ---
-    ar_norm_compiled_plain = _make_compiled_plain_ar_norm(EPS)
-
-    def compiled_plain_call():
-        h = x
-        return ar_norm_compiled_plain(h, residual, weight, group_name)
-
-    plain_ok = _check_correctness(compiled_plain_call, ref_normed, "compiled_plain")
-    results.append(
-        (
-            "compiled_plain",
-            _profile(
-                "compiled_plain",
-                compiled_plain_call,
-                rank,
-                warmup=WARMUP_ITERS + 5,
-                cuda_graph=True,
-                nsys_mode=nsys_mode,
-                timer_mode=timer_mode,
-            ),
-            plain_ok,
-        )
-    )
-
-    # --- Variant 5: compiled + mempool (zero-copy matmul → symm mem) ---
-    # The matmul output lands directly in symmetric memory via the mem pool.
-    # _symm_mem_skip_prologue_copy tells the codegen to skip the copy
-    # (input is already where peers can read it) and just sync.
-
-    mempool_for_compiled = symm_mem.get_mem_pool(device)
-    with torch.cuda.use_mem_pool(mempool_for_compiled):
-        h_symm_compiled = torch.empty(
-            num_tokens, HIDDEN, device=device, dtype=torch.bfloat16
-        )
-    symm_mem.rendezvous(h_symm_compiled, dist.group.WORLD)
-
-    ar_norm_compiled_mp = _make_compiled_ar_norm(EPS)
-
-    # Compile with skip_prologue_copy so the kernel omits the copy.
-    # We need to trigger recompilation with the new config, so we
-    # create a fresh compiled function.
-    @torch.compile(
-        options={
-            "_fuse_symm_mem_comms": True,
-            "_symm_mem_skip_prologue_copy": True,
-        },
-    )
-    def _ar_norm_mp(x, residual, w, group_name):
-        reduced = funcol.all_reduce(x, "sum", group_name)
-        h = reduced + residual
-        normed = F.rms_norm(h, w.shape, w, EPS)
-        return normed, h
-
-    def compiled_mempool_call():
-        # intermediate = F.silu(layer.moe_proj(x))
-        # torch.mm(
-        #     intermediate.view(-1, INTER),
-        #     layer.down_proj.weight.t(),
-        #     out=h_symm_compiled,
-        # )
-        h_symm_compiled.copy_(x)
-        return _ar_norm_mp(h_symm_compiled, residual, weight, group_name)
-
-    mempool_compiled_ok = _check_correctness(compiled_mempool_call, ref_normed, "compiled_mempool")
-    results.append(
-        (
-            "compiled_mempool",
-            _profile(
-                "compiled_mempool",
-                compiled_mempool_call,
-                rank,
-                warmup=WARMUP_ITERS + 5,
-                cuda_graph=True,
-                nsys_mode=nsys_mode,
-                timer_mode=timer_mode,
-            ),
-            mempool_compiled_ok,
-        )
-    )
-
-    # --- Variant 6: mem pool (zero-copy with handwritten kernel) ---
-    # (Uses the old handwritten Triton kernel with host-side barriers)
-    # Pre-allocate output in symmetric memory and rendezvous BEFORE capture
-    # so the CUDA graph only sees GPU ops with fixed addresses.
-    mempool = symm_mem.get_mem_pool(device)
-    M_total = num_tokens
-    with torch.cuda.use_mem_pool(mempool):
-        h_symm = torch.empty(M_total, HIDDEN, device=device, dtype=torch.bfloat16)
-    sm_hdl = symm_mem.rendezvous(h_symm, dist.group.WORLD)
-    peer_bufs = _make_peer_bufs(sm_hdl, tuple(h_symm.shape), h_symm.dtype)
-
-    def mempool_call():
-        # intermediate = F.silu(layer.moe_proj(x))
-        # torch.mm(intermediate.view(-1, INTER), layer.down_proj.weight.t(), out=h_symm)
-        h_symm.copy_(x)
-        output, residual_out = _launch_fused_kernel(
-            sm_hdl,
-            peer_bufs,
-            h_symm,
-            weight,
-            residual=residual,
-            eps=EPS,
-        )
-        return output.view(x.shape), residual_out.view(x.shape)
-
-    mempool_ok = _check_correctness(mempool_call, ref_normed, "mempool")
-    results.append(
-        (
-            "mempool",
-            _profile(
-                "mempool",
-                mempool_call,
-                rank,
-                cuda_graph=True,
-                nsys_mode=nsys_mode,
-                timer_mode=timer_mode,
-            ),
-            mempool_ok,
-        )
-    )
-
-    # --- Variant 7: kraken (device-side sync, single kernel launch) ---
-    # Kraken needs a pre-allocated symmetric memory buffer + pre-allocated output.
-    kraken_symm_buf = symm_mem.empty(
-        (num_tokens, HIDDEN),
-        dtype=torch.bfloat16,
-        device=device,
-    )
-    symm_mem.rendezvous(kraken_symm_buf, group=dist.group.WORLD)
-    kraken_output = torch.empty_like(x)
-
-    def kraken_call():
-        # h = layer.down_proj(F.silu(layer.moe_proj(x)))
-        h = x
-        one_shot_all_reduce_bias_rms_norm(
-            kraken_symm_buf,
-            h,
-            residual,
-            weight,
-            kraken_output,
-            eps=EPS,
-        )
-        return kraken_output
-
-    kraken_ok = _check_correctness(kraken_call, ref_normed, "kraken")
-    results.append(
-        (
-            "kraken",
-            _profile(
-                "kraken",
-                kraken_call,
-                rank,
-                cuda_graph=True,
-                nsys_mode=nsys_mode,
-                timer_mode=timer_mode,
-            ),
-            kraken_ok,
-        )
-    )
-
-    # --- Variant 8: kraken two-shot (device-side sync, single kernel launch) ---
-    kraken_2shot_symm_buf = symm_mem.empty(
-        (num_tokens, HIDDEN),
-        dtype=torch.bfloat16,
-        device=device,
-    )
-    symm_mem.rendezvous(kraken_2shot_symm_buf, group=dist.group.WORLD)
-    kraken_2shot_output = torch.empty_like(x)
-
-    def kraken_2shot_call():
-        h = x
-        two_shot_all_reduce_bias_rms_norm(
-            kraken_2shot_symm_buf,
-            h,
-            residual,
-            weight,
-            kraken_2shot_output,
-            eps=EPS,
-        )
-        return kraken_2shot_output
-
-    kraken_2shot_ok = _check_correctness(kraken_2shot_call, ref_normed, "kraken_2shot")
-    results.append(
-        (
-            "kraken_2shot",
-            _profile(
-                "kraken_2shot",
-                kraken_2shot_call,
-                rank,
-                cuda_graph=True,
-                nsys_mode=nsys_mode,
-                timer_mode=timer_mode,
-            ),
-            kraken_2shot_ok,
-        )
-    )
-
-    # --- Variant 9: FlashInfer trtllm_allreduce_fusion (one-shot, no quant) ---
-    try:
-        import flashinfer.comm as flashinfer_comm
-
-        fi_max_token = 4096
-        fi_ipc_handles, fi_workspace = (
-            flashinfer_comm.trtllm_create_ipc_workspace_for_all_reduce_fusion(
-                tp_rank=rank,
-                tp_size=dist.get_world_size(),
-                max_token_num=fi_max_token,
-                hidden_dim=HIDDEN,
-                group=dist.group.WORLD,
-            )
-        )
-        fi_norm_out = torch.empty_like(x)
-        fi_residual_out = torch.empty_like(x)
-
-        def flashinfer_call():
-            # h = layer.down_proj(F.silu(layer.moe_proj(x)))
-            h = x
-            flashinfer_comm.trtllm_allreduce_fusion(
-                allreduce_in=h,
-                token_num=h.shape[0],
-                residual_in=residual,
-                residual_out=fi_residual_out,
-                norm_out=fi_norm_out,
-                rms_gamma=weight,
-                rms_eps=EPS,
-                hidden_dim=HIDDEN,
-                workspace_ptrs=fi_workspace,
-                pattern_code=flashinfer_comm.AllReduceFusionPattern.kARResidualRMSNorm,
-                allreduce_out=None,
-                quant_out=None,
-                scale_out=None,
-                layout_code=None,
-                scale_factor=None,
-                use_oneshot=True,
-                world_rank=rank,
-                world_size=dist.get_world_size(),
-                launch_with_pdl=True,
-                trigger_completion_at_end=True,
-                fp32_acc=True,
-            )
-            return fi_norm_out
-
-        flashinfer_ok = _check_correctness(flashinfer_call, ref_normed, "flashinfer")
-        results.append(
-            (
-                "flashinfer",
-                _profile(
-                    "flashinfer",
-                    flashinfer_call,
-                    rank,
-                    cuda_graph=True,
-                    nsys_mode=nsys_mode,
-                    timer_mode=timer_mode,
-                ),
-                flashinfer_ok,
-            )
-        )
-
-        flashinfer_comm.trtllm_destroy_ipc_workspace_for_all_reduce(
-            fi_ipc_handles, dist.group.WORLD
-        )
-    except (ImportError, AttributeError, RuntimeError) as e:
-        if rank == 0:
-            print(f"\nSkipping FlashInfer variant: {e}")
-
-    # --- Variant 10: Lamport push-model standalone (reference, not inductor) ---
-    try:
-        from lamport_allreduce_rmsnorm import (
-            lamport_allreduce_rmsnorm,
-            setup_lamport_workspace,
-        )
-
-        _lam_sm, _lam_buf, _lam_buf_ptrs, _lam_slot_elems = setup_lamport_workspace(
-            device, num_tokens, HIDDEN, dist.get_world_size(), dist.group.WORLD,
-        )
-        _lam_iter = [0]
-
-        def lamport_standalone_call():
-            h = x
-            r = lamport_allreduce_rmsnorm(
-                h, weight, _lam_buf_ptrs, _lam_slot_elems, _lam_iter[0],
-                rank, dist.get_world_size(), residual=residual, eps=EPS,
-            )
-            _lam_iter[0] += 1
-            return r
-
-        lamport_sa_ok = _check_correctness(lamport_standalone_call, ref_normed, "lamport_standalone")
-        results.append(
-            (
-                "lamport_standalone",
-                _profile(
-                    "lamport_standalone",
-                    lamport_standalone_call,
-                    rank,
-                    cuda_graph=True,
-                    nsys_mode=nsys_mode,
-                    timer_mode=timer_mode,
-                ),
-                lamport_sa_ok,
-            )
-        )
-    except (ImportError, RuntimeError) as e:
-        if rank == 0:
-            print(f"\nSkipping Lamport standalone variant: {e}")
-
-    # --- Summary table ---
-    if rank == 0 and results:
+    def _print_summary(results, num_tokens):
+        """Print per-token-count summary table."""
         baseline_us = next(
             (us for name, us, _ in results if name == "baseline" and us), None
         )
@@ -810,6 +318,553 @@ def main():
                 ratio = baseline_us / avg_us
                 speedup = f"{ratio:.2f}x"
             print(f"  {name:<25s} {avg_us:10.1f} {speedup:>12s}  {ok}")
+
+    def _run_benchmarks_for_token_count(num_tokens, x, residual, weight):
+        """Run all benchmark variants for a given token count, return results list."""
+        results: list[tuple[str, float | None, str]] = []
+
+        # Run once to get reference output for correctness checks.
+        ref_out = layer.forward_baseline(x, residual, group_name)
+        torch.cuda.synchronize()
+        ref_normed = _extract_normed(ref_out).clone()
+
+        results.append(
+            (
+                "baseline",
+                _profile(
+                    "baseline",
+                    lambda: layer.forward_baseline(x, residual, group_name),
+                    rank,
+                    cuda_graph=True,
+                    nsys_mode=nsys_mode,
+                    timer_mode=timer_mode,
+                ),
+                "REF",
+            )
+        )
+
+        # --- Variant 2: fused op (direct call, no torch.compile) ---
+        __import__("torch.distributed._symmetric_memory._fused_all_reduce_rmsnorm")
+
+        def fused_op_call():
+            # h = layer.down_proj(F.silu(layer.moe_proj(x)))
+            h = x
+            return torch.ops.symm_mem.fused_all_reduce_rmsnorm(
+                h,
+                weight,
+                "sum",
+                group_name,
+                residual=residual,
+                eps=EPS,
+            )
+
+        fused_op_ok = _check_correctness(fused_op_call, ref_normed, "fused_op")
+        results.append(
+            (
+                "fused_op",
+                _profile(
+                    "fused_op",
+                    fused_op_call,
+                    rank,
+                    cuda_graph=True,
+                    nsys_mode=nsys_mode,
+                    timer_mode=timer_mode,
+                ),
+                fused_op_ok,
+            )
+        )
+
+        # --- Variant 3: torch.compile (inductor P2P codegen, kraken sync) ---
+        ar_norm_compiled = _make_compiled_ar_norm(EPS)
+
+        def compiled_call():
+            # h = layer.down_proj(F.silu(layer.moe_proj(x)))
+            h = x
+            return ar_norm_compiled(h, residual, weight, group_name)
+
+        compiled_ok = _check_correctness(compiled_call, ref_normed, "compiled")
+        results.append(
+            (
+                "compiled",
+                _profile(
+                    "compiled",
+                    compiled_call,
+                    rank,
+                    warmup=WARMUP_ITERS + 5,
+                    cuda_graph=True,
+                    nsys_mode=nsys_mode,
+                    timer_mode=timer_mode,
+                ),
+                compiled_ok,
+            )
+        )
+
+        # --- Variant 3b: compiled + forced host barriers ---
+        def _make_host_barrier_ar_norm(eps_val):
+            @torch.compile(options={
+                "_fuse_symm_mem_comms": True,
+                "_symm_mem_host_barrier_threshold": 0,
+            })
+            def _fn(x, residual, weight, group_name):
+                reduced = funcol.all_reduce(x, "sum", group_name)
+                h = reduced + residual
+                normed = F.rms_norm(h, weight.shape, weight, eps_val)
+                return normed, h
+            return _fn
+
+        ar_norm_host_barrier = _make_host_barrier_ar_norm(EPS)
+
+        def compiled_host_barrier_call():
+            h = x
+            return ar_norm_host_barrier(h, residual, weight, group_name)
+
+        host_barrier_ok = _check_correctness(compiled_host_barrier_call, ref_normed, "compiled_host_barrier")
+        results.append(
+            (
+                "compiled_host_barrier",
+                _profile(
+                    "compiled_host_barrier",
+                    compiled_host_barrier_call,
+                    rank,
+                    warmup=WARMUP_ITERS + 5,
+                    cuda_graph=True,
+                    nsys_mode=nsys_mode,
+                    timer_mode=timer_mode,
+                ),
+                host_barrier_ok,
+            )
+        )
+
+        # --- Variant 3c: compiled + device CAS + grid cap at 36 CTAs ---
+        def _make_grid_cap_ar_norm(eps_val):
+            @torch.compile(options={
+                "_fuse_symm_mem_comms": True,
+                "_symm_mem_host_barrier_threshold": -1,
+                "_symm_mem_grid_cap": 36,
+            })
+            def _fn(x, residual, weight, group_name):
+                reduced = funcol.all_reduce(x, "sum", group_name)
+                h = reduced + residual
+                normed = F.rms_norm(h, weight.shape, weight, eps_val)
+                return normed, h
+            return _fn
+
+        ar_norm_grid_cap = _make_grid_cap_ar_norm(EPS)
+
+        def compiled_grid_cap_call():
+            h = x
+            return ar_norm_grid_cap(h, residual, weight, group_name)
+
+        gridcap_ok = _check_correctness(compiled_grid_cap_call, ref_normed, "compiled_gridcap36")
+        results.append(
+            (
+                "compiled_gridcap36",
+                _profile(
+                    "compiled_gridcap36",
+                    compiled_grid_cap_call,
+                    rank,
+                    warmup=WARMUP_ITERS + 5,
+                    cuda_graph=True,
+                    nsys_mode=nsys_mode,
+                    timer_mode=timer_mode,
+                ),
+                gridcap_ok,
+            )
+        )
+
+        # --- Variant 3d: compiled + Lamport push-model (zero barriers) ---
+        def _make_lamport_ar_norm(eps_val):
+            def _fn(x, residual, weight, group_name):
+                reduced = funcol.all_reduce(x, "sum", group_name)
+                h = reduced + residual
+                normed = F.rms_norm(h, weight.shape, weight, eps_val)
+                return normed, h
+            return compile_with_debug(_fn, inductor_kwargs={
+                "_fuse_symm_mem_comms": True,
+                "_symm_mem_sync_mode": "lamport",
+            })
+
+        ar_norm_lamport = _make_lamport_ar_norm(EPS)
+
+        def compiled_lamport_call():
+            h = x
+            return ar_norm_lamport(h, residual, weight, group_name)
+
+        lamport_ok = _check_correctness(compiled_lamport_call, ref_normed, "compiled_lamport")
+        results.append(
+            (
+                "compiled_lamport",
+                _profile(
+                    "compiled_lamport",
+                    compiled_lamport_call,
+                    rank,
+                    warmup=WARMUP_ITERS + 5,
+                    cuda_graph=True,
+                    nsys_mode=nsys_mode,
+                    timer_mode=timer_mode,
+                ),
+                lamport_ok,
+            )
+        )
+
+        # --- Variant 4: torch.compile plain (default options) ---
+        ar_norm_compiled_plain = _make_compiled_plain_ar_norm(EPS)
+
+        def compiled_plain_call():
+            h = x
+            return ar_norm_compiled_plain(h, residual, weight, group_name)
+
+        plain_ok = _check_correctness(compiled_plain_call, ref_normed, "compiled_plain")
+        results.append(
+            (
+                "compiled_plain",
+                _profile(
+                    "compiled_plain",
+                    compiled_plain_call,
+                    rank,
+                    warmup=WARMUP_ITERS + 5,
+                    cuda_graph=True,
+                    nsys_mode=nsys_mode,
+                    timer_mode=timer_mode,
+                ),
+                plain_ok,
+            )
+        )
+
+        # --- Variant 5: compiled + mempool (zero-copy matmul -> symm mem) ---
+        # The matmul output lands directly in symmetric memory via the mem pool.
+        # _symm_mem_skip_prologue_copy tells the codegen to skip the copy
+        # (input is already where peers can read it) and just sync.
+
+        mempool_for_compiled = symm_mem.get_mem_pool(device)
+        with torch.cuda.use_mem_pool(mempool_for_compiled):
+            h_symm_compiled = torch.empty(
+                num_tokens, HIDDEN, device=device, dtype=torch.bfloat16
+            )
+        symm_mem.rendezvous(h_symm_compiled, dist.group.WORLD)
+
+        ar_norm_compiled_mp = _make_compiled_ar_norm(EPS)
+
+        # Compile with skip_prologue_copy so the kernel omits the copy.
+        # We need to trigger recompilation with the new config, so we
+        # create a fresh compiled function.
+        @torch.compile(
+            options={
+                "_fuse_symm_mem_comms": True,
+                "_symm_mem_skip_prologue_copy": True,
+            },
+        )
+        def _ar_norm_mp(x, residual, w, group_name):
+            reduced = funcol.all_reduce(x, "sum", group_name)
+            h = reduced + residual
+            normed = F.rms_norm(h, w.shape, w, EPS)
+            return normed, h
+
+        def compiled_mempool_call():
+            # intermediate = F.silu(layer.moe_proj(x))
+            # torch.mm(
+            #     intermediate.view(-1, INTER),
+            #     layer.down_proj.weight.t(),
+            #     out=h_symm_compiled,
+            # )
+            h_symm_compiled.copy_(x)
+            return _ar_norm_mp(h_symm_compiled, residual, weight, group_name)
+
+        mempool_compiled_ok = _check_correctness(compiled_mempool_call, ref_normed, "compiled_mempool")
+        results.append(
+            (
+                "compiled_mempool",
+                _profile(
+                    "compiled_mempool",
+                    compiled_mempool_call,
+                    rank,
+                    warmup=WARMUP_ITERS + 5,
+                    cuda_graph=True,
+                    nsys_mode=nsys_mode,
+                    timer_mode=timer_mode,
+                ),
+                mempool_compiled_ok,
+            )
+        )
+
+        # --- Variant 6: mem pool (zero-copy with handwritten kernel) ---
+        # (Uses the old handwritten Triton kernel with host-side barriers)
+        # Pre-allocate output in symmetric memory and rendezvous BEFORE capture
+        # so the CUDA graph only sees GPU ops with fixed addresses.
+        mempool = symm_mem.get_mem_pool(device)
+        M_total = num_tokens
+        with torch.cuda.use_mem_pool(mempool):
+            h_symm = torch.empty(M_total, HIDDEN, device=device, dtype=torch.bfloat16)
+        sm_hdl = symm_mem.rendezvous(h_symm, dist.group.WORLD)
+        peer_bufs = _make_peer_bufs(sm_hdl, tuple(h_symm.shape), h_symm.dtype)
+
+        def mempool_call():
+            # intermediate = F.silu(layer.moe_proj(x))
+            # torch.mm(intermediate.view(-1, INTER), layer.down_proj.weight.t(), out=h_symm)
+            h_symm.copy_(x)
+            output, residual_out = _launch_fused_kernel(
+                sm_hdl,
+                peer_bufs,
+                h_symm,
+                weight,
+                residual=residual,
+                eps=EPS,
+            )
+            return output.view(x.shape), residual_out.view(x.shape)
+
+        mempool_ok = _check_correctness(mempool_call, ref_normed, "mempool")
+        results.append(
+            (
+                "mempool",
+                _profile(
+                    "mempool",
+                    mempool_call,
+                    rank,
+                    cuda_graph=True,
+                    nsys_mode=nsys_mode,
+                    timer_mode=timer_mode,
+                ),
+                mempool_ok,
+            )
+        )
+
+        # --- Variant 7: kraken (device-side sync, single kernel launch) ---
+        # Kraken needs a pre-allocated symmetric memory buffer + pre-allocated output.
+        kraken_symm_buf = symm_mem.empty(
+            (num_tokens, HIDDEN),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        symm_mem.rendezvous(kraken_symm_buf, group=dist.group.WORLD)
+        kraken_output = torch.empty_like(x)
+
+        def kraken_call():
+            # h = layer.down_proj(F.silu(layer.moe_proj(x)))
+            h = x
+            one_shot_all_reduce_bias_rms_norm(
+                kraken_symm_buf,
+                h,
+                residual,
+                weight,
+                kraken_output,
+                eps=EPS,
+            )
+            return kraken_output
+
+        kraken_ok = _check_correctness(kraken_call, ref_normed, "kraken")
+        results.append(
+            (
+                "kraken",
+                _profile(
+                    "kraken",
+                    kraken_call,
+                    rank,
+                    cuda_graph=True,
+                    nsys_mode=nsys_mode,
+                    timer_mode=timer_mode,
+                ),
+                kraken_ok,
+            )
+        )
+
+        # --- Variant 8: kraken two-shot (device-side sync, single kernel launch) ---
+        kraken_2shot_symm_buf = symm_mem.empty(
+            (num_tokens, HIDDEN),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        symm_mem.rendezvous(kraken_2shot_symm_buf, group=dist.group.WORLD)
+        kraken_2shot_output = torch.empty_like(x)
+
+        def kraken_2shot_call():
+            h = x
+            two_shot_all_reduce_bias_rms_norm(
+                kraken_2shot_symm_buf,
+                h,
+                residual,
+                weight,
+                kraken_2shot_output,
+                eps=EPS,
+            )
+            return kraken_2shot_output
+
+        kraken_2shot_ok = _check_correctness(kraken_2shot_call, ref_normed, "kraken_2shot")
+        results.append(
+            (
+                "kraken_2shot",
+                _profile(
+                    "kraken_2shot",
+                    kraken_2shot_call,
+                    rank,
+                    cuda_graph=True,
+                    nsys_mode=nsys_mode,
+                    timer_mode=timer_mode,
+                ),
+                kraken_2shot_ok,
+            )
+        )
+
+        # --- Variant 9: FlashInfer trtllm_allreduce_fusion (one-shot, no quant) ---
+        try:
+            import flashinfer.comm as flashinfer_comm
+
+            fi_max_token = 4096
+            fi_ipc_handles, fi_workspace = (
+                flashinfer_comm.trtllm_create_ipc_workspace_for_all_reduce_fusion(
+                    tp_rank=rank,
+                    tp_size=dist.get_world_size(),
+                    max_token_num=fi_max_token,
+                    hidden_dim=HIDDEN,
+                    group=dist.group.WORLD,
+                )
+            )
+            fi_norm_out = torch.empty_like(x)
+            fi_residual_out = torch.empty_like(x)
+
+            def flashinfer_call():
+                # h = layer.down_proj(F.silu(layer.moe_proj(x)))
+                h = x
+                flashinfer_comm.trtllm_allreduce_fusion(
+                    allreduce_in=h,
+                    token_num=h.shape[0],
+                    residual_in=residual,
+                    residual_out=fi_residual_out,
+                    norm_out=fi_norm_out,
+                    rms_gamma=weight,
+                    rms_eps=EPS,
+                    hidden_dim=HIDDEN,
+                    workspace_ptrs=fi_workspace,
+                    pattern_code=flashinfer_comm.AllReduceFusionPattern.kARResidualRMSNorm,
+                    allreduce_out=None,
+                    quant_out=None,
+                    scale_out=None,
+                    layout_code=None,
+                    scale_factor=None,
+                    use_oneshot=True,
+                    world_rank=rank,
+                    world_size=dist.get_world_size(),
+                    launch_with_pdl=True,
+                    trigger_completion_at_end=True,
+                    fp32_acc=True,
+                )
+                return fi_norm_out
+
+            flashinfer_ok = _check_correctness(flashinfer_call, ref_normed, "flashinfer")
+            results.append(
+                (
+                    "flashinfer",
+                    _profile(
+                        "flashinfer",
+                        flashinfer_call,
+                        rank,
+                        cuda_graph=True,
+                        nsys_mode=nsys_mode,
+                        timer_mode=timer_mode,
+                    ),
+                    flashinfer_ok,
+                )
+            )
+
+            flashinfer_comm.trtllm_destroy_ipc_workspace_for_all_reduce(
+                fi_ipc_handles, dist.group.WORLD
+            )
+        except (ImportError, AttributeError, RuntimeError) as e:
+            if rank == 0:
+                print(f"\nSkipping FlashInfer variant: {e}")
+
+        # --- Variant 10: Lamport push-model standalone (reference, not inductor) ---
+        try:
+            from lamport_allreduce_rmsnorm import (
+                lamport_allreduce_rmsnorm,
+                setup_lamport_workspace,
+            )
+
+            _lam_sm, _lam_buf, _lam_buf_ptrs, _lam_slot_elems = setup_lamport_workspace(
+                device, num_tokens, HIDDEN, dist.get_world_size(), dist.group.WORLD,
+            )
+            _lam_iter = [0]
+
+            def lamport_standalone_call():
+                h = x
+                r = lamport_allreduce_rmsnorm(
+                    h, weight, _lam_buf_ptrs, _lam_slot_elems, _lam_iter[0],
+                    rank, dist.get_world_size(), residual=residual, eps=EPS,
+                )
+                _lam_iter[0] += 1
+                return r
+
+            lamport_sa_ok = _check_correctness(lamport_standalone_call, ref_normed, "lamport_standalone")
+            results.append(
+                (
+                    "lamport_standalone",
+                    _profile(
+                        "lamport_standalone",
+                        lamport_standalone_call,
+                        rank,
+                        cuda_graph=True,
+                        nsys_mode=nsys_mode,
+                        timer_mode=timer_mode,
+                    ),
+                    lamport_sa_ok,
+                )
+            )
+        except (ImportError, RuntimeError) as e:
+            if rank == 0:
+                print(f"\nSkipping Lamport standalone variant: {e}")
+
+        return results
+
+    # --- Main loop: run benchmarks for each token count ---
+    for num_tokens in token_counts:
+        if rank == 0:
+            print(f"\n{'#' * 80}")
+            print(f"  NUM_TOKENS = {num_tokens}")
+            print(f"{'#' * 80}")
+
+        torch._dynamo.reset()
+        x = torch.randn(num_tokens, HIDDEN, device=device, dtype=torch.bfloat16)
+        residual = torch.randn_like(x)
+        weight = layer.norm_weight
+
+        results = _run_benchmarks_for_token_count(num_tokens, x, residual, weight)
+        all_results[num_tokens] = results
+
+        if rank == 0:
+            _print_summary(results, num_tokens)
+
+    # --- Combined table across all token counts ---
+    if rank == 0 and len(token_counts) > 1:
+        # Collect all variant names in order of first appearance
+        variant_names = []
+        for tc in token_counts:
+            for name, _, _ in all_results.get(tc, []):
+                if name not in variant_names:
+                    variant_names.append(name)
+
+        print(f"\n{'=' * 80}")
+        print(
+            f"  COMBINED  (HIDDEN={HIDDEN}, "
+            f"world_size={dist.get_world_size()})"
+        )
+        print(f"{'=' * 80}")
+        header = f"  {'Variant':<25s}"
+        for tc in token_counts:
+            header += f" {'T=' + str(tc):>12s}"
+        print(header)
+        print(f"  {'-' * 25}" + f" {'-' * 12}" * len(token_counts))
+        for vname in variant_names:
+            row = f"  {vname:<25s}"
+            for tc in token_counts:
+                us = None
+                for name, avg_us, _ in all_results.get(tc, []):
+                    if name == vname and avg_us is not None:
+                        us = avg_us
+                        break
+                if us is not None:
+                    row += f" {us:12.1f}"
+                else:
+                    row += f" {'--':>12s}"
+            print(row)
         print()
 
     dist.destroy_process_group()
