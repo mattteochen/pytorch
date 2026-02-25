@@ -812,16 +812,30 @@ def main():
             if rank == 0:
                 print(f"\nSkipping Lamport standalone variant: {e}")
 
+        dist.barrier()
+        torch.cuda.synchronize()
         return results
 
     # --- Main loop: run benchmarks for each token count ---
     for num_tokens in token_counts:
+        dist.barrier()
+        torch.cuda.synchronize()
+
         if rank == 0:
             print(f"\n{'#' * 80}")
             print(f"  NUM_TOKENS = {num_tokens}")
             print(f"{'#' * 80}")
 
         torch._dynamo.reset()
+
+        # Clear symm_mem / lamport caches so setup functions re-allocate
+        # for the new tensor shape (these are collectives — all ranks must
+        # call them together, so stale cache hits would desync ranks).
+        from torch._inductor.runtime.symm_mem_helpers import _symm_mem_cache
+        from torch._inductor.runtime.lamport_helpers import _lamport_cache
+        _symm_mem_cache.clear()
+        _lamport_cache.clear()
+
         x = torch.randn(num_tokens, HIDDEN, device=device, dtype=torch.bfloat16)
         residual = torch.randn_like(x)
         weight = layer.norm_weight
