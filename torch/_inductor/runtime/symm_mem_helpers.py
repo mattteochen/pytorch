@@ -95,6 +95,47 @@ def symm_mem_host_barrier_setup(
     return (buf_ptrs, rank, world_size)
 
 
+def symm_mem_peer_bufs(
+    input_tensor: torch.Tensor,
+    group_name: str,
+) -> tuple[list[torch.Tensor], torch.Tensor, int, int]:
+    """
+    Return per-peer tensor views for device-CAS mode.
+
+    Each tensor is a direct view of peer i's symmetric memory buffer with
+    proper alignment metadata, enabling vectorized Triton loads.
+
+    Returns ``(peer_bufs, signal_pad_ptrs_tensor, rank, world_size)``.
+    """
+    sm, _buf_ptrs, sig_ptrs, rank, world_size = _get_cached(input_tensor, group_name)
+    shape = input_tensor.shape
+    dtype = input_tensor.dtype
+    peer_bufs = [sm.get_buffer(i, shape, dtype) for i in range(world_size)]
+    return peer_bufs, sig_ptrs, rank, world_size
+
+
+def symm_mem_host_barrier_peer_bufs(
+    input_tensor: torch.Tensor,
+    group_name: str,
+    skip_copy: bool = False,
+) -> tuple[list[torch.Tensor], int, int]:
+    """
+    Host-barrier variant: copy input + return per-peer tensor views.
+
+    Returns ``(peer_bufs, rank, world_size)``.
+    """
+    sm, _buf_ptrs, _sig_ptrs, rank, world_size = _get_cached(input_tensor, group_name)
+    shape = input_tensor.shape
+    dtype = input_tensor.dtype
+
+    if not skip_copy:
+        local_buf = sm.get_buffer(rank, shape, dtype)
+        local_buf.copy_(input_tensor)
+
+    peer_bufs = [sm.get_buffer(i, shape, dtype) for i in range(world_size)]
+    return peer_bufs, rank, world_size
+
+
 def symm_mem_host_barrier(
     group_name: str,
 ) -> None:

@@ -539,12 +539,10 @@ class TestFusedAllReduceRMSNormDistributed(MultiProcContinuousTest):
         code = "\n".join(code_list)
         self.assertIn("_lamport_poll_all_peers", code,
                        "Kernel should call _lamport_poll_all_peers")
-        self.assertIn("_lamport_push_to_peers", code,
-                       "Kernel should call _lamport_push_to_peers (prologue)")
         self.assertIn("_lamport_clear_old_slot", code,
                        "Kernel should call _lamport_clear_old_slot (epilogue)")
-        self.assertIn("lamport_workspace_setup", code,
-                       "Wrapper should call lamport_workspace_setup")
+        self.assertIn("lamport_workspace_peer_bufs", code,
+                       "Wrapper should call lamport_workspace_peer_bufs")
         self.assertIn("_lamport_advance_flag_block0", code,
                        "Kernel should call _lamport_advance_flag_block0 (epilogue)")
         self.assertNotIn("lamport_advance_offsets", code,
@@ -563,7 +561,7 @@ class TestFusedAllReduceRMSNormDistributed(MultiProcContinuousTest):
                        "Kernel should receive signal pad pointers")
         self.assertNotIn("symm_mem_host_barrier", code,
                           "Wrapper should NOT use host barriers")
-        self.assertNotIn("lamport_workspace_setup", code,
+        self.assertNotIn("lamport_workspace_peer_bufs", code,
                           "Wrapper should NOT use Lamport setup")
         self.assertNotIn("_lamport_poll_all_peers", code,
                           "Kernel should NOT use Lamport reduce")
@@ -571,13 +569,13 @@ class TestFusedAllReduceRMSNormDistributed(MultiProcContinuousTest):
     def _assert_host_barrier_codegen(self, code_list):
         """Verify the generated code uses host barriers, not device CAS or Lamport."""
         code = "\n".join(code_list)
-        self.assertIn("symm_mem_host_barrier_setup", code,
+        self.assertIn("symm_mem_host_barrier_peer_bufs", code,
                        "Wrapper should call host barrier setup")
         self.assertIn("symm_mem_host_barrier", code,
                        "Wrapper should call host barrier")
         self.assertNotIn("_symm_mem_sync", code,
                           "Kernel should NOT use device-side CAS sync")
-        self.assertNotIn("lamport_workspace_setup", code,
+        self.assertNotIn("lamport_workspace_peer_bufs", code,
                           "Wrapper should NOT use Lamport setup")
         self.assertNotIn("_lamport_poll_all_peers", code,
                           "Kernel should NOT use Lamport reduce")

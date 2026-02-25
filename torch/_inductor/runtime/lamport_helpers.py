@@ -362,3 +362,28 @@ def lamport_workspace_setup(
         "meta": meta,
     }
     return (buf_ptrs, rank, world_size, meta)
+
+
+def lamport_workspace_peer_bufs(
+    input_tensor: torch.Tensor,
+    group_name: str,
+) -> tuple[list[torch.Tensor], int, int, torch.Tensor]:
+    """
+    Return per-peer tensor views of the triple-buffered Lamport workspace.
+
+    Each view covers the full workspace (3 * world_size * chunk elements)
+    as a 1D bfloat16 tensor backed by peer i's symmetric memory.
+
+    Returns ``(peer_bufs, rank, world_size, meta_tensor)``.
+    """
+    _buf_ptrs, rank, world_size, meta = lamport_workspace_setup(
+        input_tensor, group_name
+    )
+    cached = _lamport_cache[group_name]
+    sm = cached["sm"]
+    total_elems = cached["buf"].numel()
+    peer_bufs = [
+        sm.get_buffer(i, (total_elems,), torch.bfloat16)
+        for i in range(world_size)
+    ]
+    return peer_bufs, rank, world_size, meta
