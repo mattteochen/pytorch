@@ -25,12 +25,7 @@ import torch.nn.functional as F
 import torch._dynamo.config as dynamo_config
 import torch._inductor.config as inductor_config
 
-os.environ.setdefault("TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS", "TRITON")
-# torch._inductor.config.max_autotune_gemm = True
-# Manual CUDA graph capture is used below, so disable Inductor's internal
-# cudagraph wrapping to avoid double-capture conflicts.
 torch._inductor.config.triton.cudagraphs = False
-# torch._inductor.config.combo_kernels = True
 
 def compile_with_debug(fn, compile_kwargs=None, dynamo_kwargs=None, inductor_kwargs=None):
     """Wrap a function with torch.compile and enable debug output.
@@ -309,13 +304,13 @@ def run_native_grouped_mm_v2(layer, hidden_states, topk_weights, topk_ids):
         offsets, inv_perm, num_tokens, num_top_k, hidden_size,
     )
 
-run_native_grouped_mm_v2 = torch.compile(
-    run_native_grouped_mm_v2,
-    options={"combo_kernels": True, "max_autotune_gemm": True},
-)
+# run_native_grouped_mm_v2 = torch.compile(
+#     run_native_grouped_mm_v2,
+#     options={"combo_kernels": True, "max_autotune_gemm": True},
+# )
 run_native_grouped_mm_v2 = compile_with_debug(
     run_native_grouped_mm_v2,
-    inductor_kwargs={"combo_kernels": True, "max_autotune_gemm": True},
+    inductor_kwargs={"combo_kernels": True, "max_autotune_gemm": True, "max_autotune_gemm_backends": "ATEN, TRITON"},
 )
 
 
