@@ -22,10 +22,66 @@ import functools
 
 import torch
 import torch.nn.functional as F
+import torch.library
 import torch._dynamo.config as dynamo_config
 import torch._inductor.config as inductor_config
 
 torch._inductor.config.triton.cudagraphs = False
+
+
+# ── TE grouped_gemm custom op ────────────────────────────────────────────────
+def _te_grouped_gemm_impl(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    m_splits: list[int],
+) -> torch.Tensor:
+    """TE grouped GEMM: computes A @ B per group (same semantics as torch._grouped_mm).
+
+    A: [M_total, K], B: [G, K, N], m_splits: per-group row counts.
+    """
+    from transformer_engine.pytorch.cpp_extensions.gemm import general_grouped_gemm
+
+    G, K, N = B.shape
+    M_total = A.shape[0]
+
+    nonzero_indices = [i for i, m in enumerate(m_splits) if m > 0]
+    m_splits_nz = [m_splits[i] for i in nonzero_indices]
+
+    if not m_splits_nz:
+        return torch.empty(0, N, dtype=A.dtype, device=A.device)
+
+    act_splits = list(torch.split(A, m_splits, dim=0))
+    A_list = [B[i] for i in nonzero_indices]
+    B_list = [act_splits[i] for i in nonzero_indices]
+
+    out = torch.empty(M_total, N, dtype=A.dtype, device=A.device)
+
+    general_grouped_gemm(
+        A=A_list,
+        B=B_list,
+        out=[out],
+        quantization_params=[None] * len(m_splits_nz),
+        out_dtype=A.dtype,
+        layout="NN",
+        m_splits=m_splits_nz,
+        single_output=True,
+    )
+    return out
+
+
+@torch.library.custom_op("te::grouped_gemm", mutates_args=())
+def _te_grouped_gemm_op(
+    A: torch.Tensor, B: torch.Tensor, m_splits: list[int],
+) -> torch.Tensor:
+    return _te_grouped_gemm_impl(A, B, m_splits)
+
+
+@_te_grouped_gemm_op.register_fake
+def _te_grouped_gemm_fake(
+    A: torch.Tensor, B: torch.Tensor, m_splits: list[int],
+) -> torch.Tensor:
+    G, K, N = B.shape
+    return torch.empty(A.shape[0], N, dtype=A.dtype, device=A.device)
 
 def compile_with_debug(fn, compile_kwargs=None, dynamo_kwargs=None, inductor_kwargs=None):
     """Wrap a function with torch.compile and enable debug output.
@@ -133,6 +189,9 @@ class MockFusedMoELayer(torch.nn.Module):
                         dtype=dtype, device=device) * 0.01,
             requires_grad=False,
         )
+        # Precomputed transposed weights for TE grouped_gemm [G, K, N] layout
+        self.w13_weight_t = self.w13_weight.transpose(-1, -2).contiguous()
+        self.w2_weight_t = self.w2_weight.transpose(-1, -2).contiguous()
 
 
 # ── Server args init (needed by Triton config lookup) ────────────────────────
@@ -314,6 +373,84 @@ run_native_grouped_mm_v2 = compile_with_debug(
 )
 
 
+# ── 4. Native v2 with TE grouped_gemm (torch.compiled, full function) ────────
+_run_native_te_v2_compiled = None
+
+
+def _get_run_native_te_v2(m_splits):
+    """Compile the full TE v2 function (routing + GEMMs) with m_splits baked in."""
+    global _run_native_te_v2_compiled
+    if _run_native_te_v2_compiled is not None:
+        return _run_native_te_v2_compiled
+
+    def fn(layer_w13_t, layer_w13_bias, layer_w2_t, layer_w2_bias,
+           num_experts, hidden_states, topk_weights, topk_ids):
+        device = hidden_states.device
+        num_tokens, hidden_size = hidden_states.shape
+        num_top_k = topk_ids.size(-1)
+
+        expert_ids = topk_ids.reshape(-1)
+        token_idx = (
+            torch.arange(num_tokens, device=device)
+            .unsqueeze(1)
+            .expand(-1, num_top_k)
+            .reshape(-1)
+        )
+
+        sample_weights = topk_weights.reshape(-1)
+        current_hidden_states = hidden_states[token_idx]
+
+        perm = torch.argsort(expert_ids, stable=True)
+        inv_perm = torch.empty_like(perm)
+        inv_perm[perm] = torch.arange(perm.size(0), device=device, dtype=perm.dtype)
+
+        expert_ids_g = expert_ids[perm]
+        sample_weights_g = sample_weights[perm]
+        current_states_g = current_hidden_states[perm]
+
+        gate_up_out = torch.ops.te.grouped_gemm(current_states_g, layer_w13_t, m_splits)
+        gate_up_out = gate_up_out + layer_w13_bias[expert_ids_g]
+
+        hidden_after_activation = swiglu_with_alpha_and_limit_compiled(
+            gate_up_out, GEMM1_ALPHA, SWIGLU_LIMIT
+        )
+        hidden_after_activation = hidden_after_activation.to(current_states_g.dtype)
+
+        out_per_sample_g = torch.ops.te.grouped_gemm(hidden_after_activation, layer_w2_t, m_splits)
+        out_per_sample_g = out_per_sample_g + layer_w2_bias[expert_ids_g]
+
+        out_per_sample_g = out_per_sample_g * sample_weights_g.unsqueeze(-1)
+        out_per_sample = out_per_sample_g[inv_perm]
+        return out_per_sample.view(num_tokens, num_top_k, hidden_size).sum(dim=1).to(current_states_g.dtype)
+
+    _run_native_te_v2_compiled = torch.compile(
+        fn, options={"combo_kernels": True, "max_autotune_gemm": True, "max_autotune_gemm_backends": "ATEN, TRITON"},
+    )
+    return _run_native_te_v2_compiled
+
+
+def run_native_te_v2(layer, hidden_states, topk_weights, topk_ids, m_splits=None):
+    if m_splits is None:
+        device = hidden_states.device
+        expert_ids = topk_ids.reshape(-1)
+        perm = torch.argsort(expert_ids, stable=True)
+        expert_ids_g = expert_ids[perm]
+        boundaries = torch.arange(1, layer.num_experts + 1, device=device, dtype=expert_ids_g.dtype)
+        offsets = torch.searchsorted(expert_ids_g, boundaries).to(torch.int32)
+        m_splits = []
+        prev = 0
+        for o in offsets.tolist():
+            m_splits.append(o - prev)
+            prev = o
+
+    compiled_fn = _get_run_native_te_v2(m_splits)
+    return compiled_fn(
+        layer.w13_weight_t, layer.w13_weight_bias,
+        layer.w2_weight_t, layer.w2_weight_bias,
+        layer.num_experts, hidden_states, topk_weights, topk_ids,
+    )
+
+
 def run_native_grouped_mm(layer, hidden_states, topk_weights, topk_ids):
     device = hidden_states.device
     num_tokens, hidden_size = hidden_states.shape
@@ -452,6 +589,22 @@ def main():
     native_v2_fn = lambda: run_native_grouped_mm_v2(
         layer, hidden_states, topk_weights, topk_ids
     )
+    # Precompute m_splits once (D2H copy happens here, before CUDA graph capture).
+    # Inputs are fixed for this benchmark so routing is deterministic.
+    expert_ids = topk_ids.reshape(-1)
+    perm = torch.argsort(expert_ids, stable=True)
+    expert_ids_g = expert_ids[perm]
+    boundaries = torch.arange(1, NUM_EXPERTS + 1, device=device, dtype=expert_ids_g.dtype)
+    offsets = torch.searchsorted(expert_ids_g, boundaries).to(torch.int32)
+    te_v2_m_splits = []
+    prev = 0
+    for o in offsets.tolist():
+        te_v2_m_splits.append(o - prev)
+        prev = o
+
+    te_v2_fn = lambda: run_native_te_v2(
+        layer, hidden_states, topk_weights, topk_ids, m_splits=te_v2_m_splits
+    )
 
     # ── Warmup all paths (torch.compile + triton autotune) ──
     print("Warming up torch.compile + Triton autotune...")
@@ -460,6 +613,7 @@ def main():
         tk_out = tk_fn()
         native_out = native_fn()
         native_v2_out = native_v2_fn()
+        te_v2_out = te_v2_fn()
     torch.cuda.synchronize()
 
     # ── Correctness ──
@@ -467,6 +621,7 @@ def main():
     tk_f = tk_out.float()
     native_f = native_out.float()
     native_v2_f = native_v2_out.float()
+    te_v2_f = te_v2_out.float()
 
     print(f"\nOutput comparison:")
     print(f"  {'Backend':40s}  {'norm':>10s}  {'max Δ vs Triton':>16s}")
@@ -477,6 +632,8 @@ def main():
           f"  {(native_f - triton_f).abs().max().item():16.6e}")
     print(f"  {'Native grouped_mm v2 (view+sum)':40s}  {native_v2_f.norm():10.4f}"
           f"  {(native_v2_f - triton_f).abs().max().item():16.6e}")
+    print(f"  {'Native TE v2 (cuBLASLt grouped)':40s}  {te_v2_f.norm():10.4f}"
+          f"  {(te_v2_f - triton_f).abs().max().item():16.6e}")
 
     # ── Eager benchmark ──
     print(f"\nEager latency:")
@@ -488,9 +645,11 @@ def main():
                                   "Native grouped_mm (compiled)")
     _, native_v2_eager = bench_eager(native_v2_fn, args.warmup, args.iters,
                                      "Native grouped_mm v2 (view+sum)")
+    _, te_v2_eager = bench_eager(te_v2_fn, args.warmup, args.iters,
+                                  "Native TE v2 (cuBLASLt grouped)")
 
     if args.no_cuda_graph:
-        _print_summary(triton_eager, tk_eager, native_eager, native_v2_eager, "Eager")
+        _print_summary(triton_eager, tk_eager, native_eager, native_v2_eager, te_v2_eager, "Eager")
         return
 
     # ── CUDA graph benchmark ──
@@ -499,6 +658,7 @@ def main():
     tk_graph, _ = capture_cuda_graph(tk_fn)
     native_graph, _ = capture_cuda_graph(native_fn)
     native_v2_graph, _ = capture_cuda_graph(native_v2_fn)
+    te_v2_graph, _ = capture_cuda_graph(te_v2_fn)
 
     print(f"\nCUDA graph latency:")
     triton_graph_us = bench_cuda_graph(
@@ -513,9 +673,12 @@ def main():
     native_v2_graph_us = bench_cuda_graph(
         native_v2_graph, args.warmup, args.iters, "Native grouped_mm v2 (view+sum)"
     )
+    te_v2_graph_us = bench_cuda_graph(
+        te_v2_graph, args.warmup, args.iters, "Native TE v2 (cuBLASLt grouped)"
+    )
 
-    _print_summary(triton_eager, tk_eager, native_eager, native_v2_eager, "Eager")
-    _print_summary(triton_graph_us, tk_graph_us, native_graph_us, native_v2_graph_us, "CUDA graph")
+    _print_summary(triton_eager, tk_eager, native_eager, native_v2_eager, te_v2_eager, "Eager")
+    _print_summary(triton_graph_us, tk_graph_us, native_graph_us, native_v2_graph_us, te_v2_graph_us, "CUDA graph")
 
     # ── NVTX-marked iteration (CUDA-graphed) for nsys profiling ──
     print("\nRunning NVTX-marked iterations (cuda-graphed, 1x each)...")
@@ -530,17 +693,21 @@ def main():
     with torch.cuda.nvtx.range("native_grouped_mm_v2"):
         native_v2_graph.replay()
     torch.cuda.synchronize()
+    with torch.cuda.nvtx.range("native_te_v2"):
+        te_v2_graph.replay()
+    torch.cuda.synchronize()
     torch.cuda.cudart().cudaProfilerStop()
     print("Done. Use 'nsys profile ...' to capture the trace.")
 
 
-def _print_summary(triton_us, tk_us, native_us, native_v2_us, mode):
-    fastest = min(triton_us, tk_us, native_us, native_v2_us)
+def _print_summary(triton_us, tk_us, native_us, native_v2_us, te_v2_us, mode):
+    fastest = min(triton_us, tk_us, native_us, native_v2_us, te_v2_us)
     print(f"\n  {mode} summary (lower is better):")
     print(f"    {'Triton fused_experts':40s}  {triton_us:8.1f} μs  ({triton_us/fastest:.2f}x)")
     print(f"    {'Triton-kernels matmul_ogs':40s}  {tk_us:8.1f} μs  ({tk_us/fastest:.2f}x)")
     print(f"    {'Native grouped_mm (compiled)':40s}  {native_us:8.1f} μs  ({native_us/fastest:.2f}x)")
     print(f"    {'Native grouped_mm v2 (view+sum)':40s}  {native_v2_us:8.1f} μs  ({native_v2_us/fastest:.2f}x)")
+    print(f"    {'Native TE v2 (cuBLASLt grouped)':40s}  {te_v2_us:8.1f} μs  ({te_v2_us/fastest:.2f}x)")
 
 
 if __name__ == "__main__":
