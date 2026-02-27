@@ -22,66 +22,17 @@ import functools
 
 import torch
 import torch.nn.functional as F
-import torch.library
 import torch._dynamo.config as dynamo_config
 import torch._inductor.config as inductor_config
 
 torch._inductor.config.triton.cudagraphs = False
 
 
-# ── TE grouped_gemm custom op ────────────────────────────────────────────────
-def _te_grouped_gemm_impl(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    m_splits: list[int],
-) -> torch.Tensor:
-    """TE grouped GEMM: computes A @ B per group (same semantics as torch._grouped_mm).
-
-    A: [M_total, K], B: [G, K, N], m_splits: per-group row counts.
-    """
-    from transformer_engine.pytorch.cpp_extensions.gemm import general_grouped_gemm
-
-    G, K, N = B.shape
-    M_total = A.shape[0]
-
-    nonzero_indices = [i for i, m in enumerate(m_splits) if m > 0]
-    m_splits_nz = [m_splits[i] for i in nonzero_indices]
-
-    if not m_splits_nz:
-        return torch.empty(0, N, dtype=A.dtype, device=A.device)
-
-    act_splits = list(torch.split(A, m_splits, dim=0))
-    A_list = [B[i] for i in nonzero_indices]
-    B_list = [act_splits[i] for i in nonzero_indices]
-
-    out = torch.empty(M_total, N, dtype=A.dtype, device=A.device)
-
-    general_grouped_gemm(
-        A=A_list,
-        B=B_list,
-        out=[out],
-        quantization_params=[None] * len(m_splits_nz),
-        out_dtype=A.dtype,
-        layout="NN",
-        m_splits=m_splits_nz,
-        single_output=True,
-    )
-    return out
-
-
-@torch.library.custom_op("te::grouped_gemm", mutates_args=())
-def _te_grouped_gemm_op(
-    A: torch.Tensor, B: torch.Tensor, m_splits: list[int],
-) -> torch.Tensor:
-    return _te_grouped_gemm_impl(A, B, m_splits)
-
-
-@_te_grouped_gemm_op.register_fake
-def _te_grouped_gemm_fake(
-    A: torch.Tensor, B: torch.Tensor, m_splits: list[int],
-) -> torch.Tensor:
-    G, K, N = B.shape
-    return torch.empty(A.shape[0], N, dtype=A.dtype, device=A.device)
+# ── TE grouped_gemm v2 custom op (single-launch cuBLASLt, device offsets) ────
+import sys as _sys
+_sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "experimental"))
+from te_grouped_gemm_v2 import te_grouped_gemm_v2  # noqa: E402
+# Import registers the custom op torch.ops.te_v2.grouped_gemm
 
 def compile_with_debug(fn, compile_kwargs=None, dynamo_kwargs=None, inductor_kwargs=None):
     """Wrap a function with torch.compile and enable debug output.
@@ -373,78 +324,65 @@ run_native_grouped_mm_v2 = compile_with_debug(
 )
 
 
-# ── 4. Native v2 with TE grouped_gemm (torch.compiled, full function) ────────
-_run_native_te_v2_compiled = None
+# ── 4. Native v2 with TE grouped_gemm (single-launch cuBLASLt, device offsets) ─
+def _run_native_te_v2_fn(
+    layer_w13_t, layer_w13_bias, layer_w2_t, layer_w2_bias,
+    num_experts, hidden_states, topk_weights, topk_ids,
+):
+    device = hidden_states.device
+    num_tokens, hidden_size = hidden_states.shape
+    num_top_k = topk_ids.size(-1)
 
-
-def _get_run_native_te_v2(m_splits):
-    """Compile the full TE v2 function (routing + GEMMs) with m_splits baked in."""
-    global _run_native_te_v2_compiled
-    if _run_native_te_v2_compiled is not None:
-        return _run_native_te_v2_compiled
-
-    def fn(layer_w13_t, layer_w13_bias, layer_w2_t, layer_w2_bias,
-           num_experts, hidden_states, topk_weights, topk_ids):
-        device = hidden_states.device
-        num_tokens, hidden_size = hidden_states.shape
-        num_top_k = topk_ids.size(-1)
-
-        expert_ids = topk_ids.reshape(-1)
-        token_idx = (
-            torch.arange(num_tokens, device=device)
-            .unsqueeze(1)
-            .expand(-1, num_top_k)
-            .reshape(-1)
-        )
-
-        sample_weights = topk_weights.reshape(-1)
-        current_hidden_states = hidden_states[token_idx]
-
-        perm = torch.argsort(expert_ids, stable=True)
-        inv_perm = torch.empty_like(perm)
-        inv_perm[perm] = torch.arange(perm.size(0), device=device, dtype=perm.dtype)
-
-        expert_ids_g = expert_ids[perm]
-        sample_weights_g = sample_weights[perm]
-        current_states_g = current_hidden_states[perm]
-
-        gate_up_out = torch.ops.te.grouped_gemm(current_states_g, layer_w13_t, m_splits)
-        gate_up_out = gate_up_out + layer_w13_bias[expert_ids_g]
-
-        hidden_after_activation = swiglu_with_alpha_and_limit_compiled(
-            gate_up_out, GEMM1_ALPHA, SWIGLU_LIMIT
-        )
-        hidden_after_activation = hidden_after_activation.to(current_states_g.dtype)
-
-        out_per_sample_g = torch.ops.te.grouped_gemm(hidden_after_activation, layer_w2_t, m_splits)
-        out_per_sample_g = out_per_sample_g + layer_w2_bias[expert_ids_g]
-
-        out_per_sample_g = out_per_sample_g * sample_weights_g.unsqueeze(-1)
-        out_per_sample = out_per_sample_g[inv_perm]
-        return out_per_sample.view(num_tokens, num_top_k, hidden_size).sum(dim=1).to(current_states_g.dtype)
-
-    _run_native_te_v2_compiled = torch.compile(
-        fn, options={"combo_kernels": True, "max_autotune_gemm": True, "max_autotune_gemm_backends": "ATEN, TRITON"},
+    expert_ids = topk_ids.reshape(-1)
+    token_idx = (
+        torch.arange(num_tokens, device=device)
+        .unsqueeze(1)
+        .expand(-1, num_top_k)
+        .reshape(-1)
     )
-    return _run_native_te_v2_compiled
+
+    sample_weights = topk_weights.reshape(-1)
+    current_hidden_states = hidden_states[token_idx]
+
+    perm = torch.argsort(expert_ids, stable=True)
+    inv_perm = torch.empty_like(perm)
+    inv_perm[perm] = torch.arange(perm.size(0), device=device, dtype=perm.dtype)
+
+    expert_ids_g = expert_ids[perm]
+    sample_weights_g = sample_weights[perm]
+    current_states_g = current_hidden_states[perm]
+
+    boundaries = torch.arange(1, num_experts + 1, device=device, dtype=expert_ids_g.dtype)
+    offsets = torch.searchsorted(expert_ids_g, boundaries).to(torch.int32)
+
+    gate_up_out = torch.ops.te_v2.grouped_gemm(current_states_g, layer_w13_t, offsets)
+    gate_up_out = gate_up_out + layer_w13_bias[expert_ids_g]
+
+    hidden_after_activation = swiglu_with_alpha_and_limit_compiled(
+        gate_up_out, GEMM1_ALPHA, SWIGLU_LIMIT
+    )
+    hidden_after_activation = hidden_after_activation.to(current_states_g.dtype)
+
+    out_per_sample_g = torch.ops.te_v2.grouped_gemm(hidden_after_activation, layer_w2_t, offsets)
+    out_per_sample_g = out_per_sample_g + layer_w2_bias[expert_ids_g]
+
+    out_per_sample_g = out_per_sample_g * sample_weights_g.unsqueeze(-1)
+    out_per_sample = out_per_sample_g[inv_perm]
+    return out_per_sample.view(num_tokens, num_top_k, hidden_size).sum(dim=1).to(current_states_g.dtype)
+
+run_native_te_v2 = torch.compile(
+    _run_native_te_v2_fn,
+    options={"combo_kernels": True, "max_autotune_gemm": True, "max_autotune_gemm_backends": "ATEN, TRITON"},
+)
+
+# run_native_te_v2 = compile_with_debug(
+#     _run_native_te_v2_fn,
+#     inductor_kwargs={"combo_kernels": True, "max_autotune_gemm": True, "max_autotune_gemm_backends": "ATEN, TRITON"},
+# )
 
 
-def run_native_te_v2(layer, hidden_states, topk_weights, topk_ids, m_splits=None):
-    if m_splits is None:
-        device = hidden_states.device
-        expert_ids = topk_ids.reshape(-1)
-        perm = torch.argsort(expert_ids, stable=True)
-        expert_ids_g = expert_ids[perm]
-        boundaries = torch.arange(1, layer.num_experts + 1, device=device, dtype=expert_ids_g.dtype)
-        offsets = torch.searchsorted(expert_ids_g, boundaries).to(torch.int32)
-        m_splits = []
-        prev = 0
-        for o in offsets.tolist():
-            m_splits.append(o - prev)
-            prev = o
-
-    compiled_fn = _get_run_native_te_v2(m_splits)
-    return compiled_fn(
+def _run_native_te_v2_wrapper(layer, hidden_states, topk_weights, topk_ids):
+    return run_native_te_v2(
         layer.w13_weight_t, layer.w13_weight_bias,
         layer.w2_weight_t, layer.w2_weight_bias,
         layer.num_experts, hidden_states, topk_weights, topk_ids,
@@ -589,21 +527,8 @@ def main():
     native_v2_fn = lambda: run_native_grouped_mm_v2(
         layer, hidden_states, topk_weights, topk_ids
     )
-    # Precompute m_splits once (D2H copy happens here, before CUDA graph capture).
-    # Inputs are fixed for this benchmark so routing is deterministic.
-    expert_ids = topk_ids.reshape(-1)
-    perm = torch.argsort(expert_ids, stable=True)
-    expert_ids_g = expert_ids[perm]
-    boundaries = torch.arange(1, NUM_EXPERTS + 1, device=device, dtype=expert_ids_g.dtype)
-    offsets = torch.searchsorted(expert_ids_g, boundaries).to(torch.int32)
-    te_v2_m_splits = []
-    prev = 0
-    for o in offsets.tolist():
-        te_v2_m_splits.append(o - prev)
-        prev = o
-
-    te_v2_fn = lambda: run_native_te_v2(
-        layer, hidden_states, topk_weights, topk_ids, m_splits=te_v2_m_splits
+    te_v2_fn = lambda: _run_native_te_v2_wrapper(
+        layer, hidden_states, topk_weights, topk_ids
     )
 
     # ── Warmup all paths (torch.compile + triton autotune) ──
