@@ -304,14 +304,14 @@ def run_native_grouped_mm_v2(layer, hidden_states, topk_weights, topk_ids):
         offsets, inv_perm, num_tokens, num_top_k, hidden_size,
     )
 
-# run_native_grouped_mm_v2 = torch.compile(
-#     run_native_grouped_mm_v2,
-#     options={"combo_kernels": True, "max_autotune_gemm": True},
-# )
-run_native_grouped_mm_v2 = compile_with_debug(
+run_native_grouped_mm_v2 = torch.compile(
     run_native_grouped_mm_v2,
-    inductor_kwargs={"combo_kernels": True, "max_autotune_gemm": True, "max_autotune_gemm_backends": "ATEN, TRITON"},
+    options={"combo_kernels": True, "max_autotune_gemm": True, "max_autotune_gemm_backends": "TRITON"},
 )
+# run_native_grouped_mm_v2 = compile_with_debug(
+#     run_native_grouped_mm_v2,
+#     inductor_kwargs={"combo_kernels": True, "max_autotune_gemm": True, "max_autotune_gemm_backends": "ATEN, TRITON"},
+# )
 
 
 def run_native_grouped_mm(layer, hidden_states, topk_weights, topk_ids):
@@ -350,7 +350,7 @@ def run_native_grouped_mm(layer, hidden_states, topk_weights, topk_ids):
     )
 
 # run_native_grouped_mm = compile_with_debug(run_native_grouped_mm, inductor_kwargs={"combo_kernels": True, "max_autotune_gemm": True})
-run_native_grouped_mm = torch.compile(run_native_grouped_mm, options={"combo_kernels": True, "max_autotune_gemm": True})
+run_native_grouped_mm = torch.compile(run_native_grouped_mm, options={"combo_kernels": True, "max_autotune_gemm": True, "max_autotune_gemm_backends": "TRITON"})
 
 
 # ── Synthetic routing ────────────────────────────────────────────────────────
