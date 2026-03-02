@@ -716,9 +716,10 @@ we can close the gap:
 ## Open Questions / Future Work
 
 1. **Sync strategy selection.** Device-side per-block atomics don't scale
-   beyond ~32 tokens. Options: (a) gate the FX pass on tensor size,
-   (b) implement Lamport-style sentinel in codegen, (c) implement
-   two-shot reduce-scatter + allgather for large tensors.
+   beyond ~32 tokens. Options: ~~(a) gate the FX pass on tensor size~~ (DONE:
+   `config._fuse_symm_mem_comms_max_bytes`, default 1MB),
+   (b) implement Lamport-style sentinel in codegen (DONE: `_symm_mem_sync_mode = "lamport"`),
+   (c) implement two-shot reduce-scatter + allgather for large tensors.
 
 2. **Lamport-style sentinel sync for codegen.** Would keep single-launch
    advantage while scaling to large token counts. Requires push model,

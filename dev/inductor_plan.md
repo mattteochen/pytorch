@@ -517,30 +517,16 @@ more CAS pressure. A conservative threshold of **512KB** for 4 GPUs
 regime. FlashInfer dynamically switches one-shot vs two-shot at
 `kOneShotMaxToken = 128` regardless of world size.
 
-## Known Bug: Import Ordering for p2p_allreduce Lowering
+## ~~Known Bug: Import Ordering for p2p_allreduce Lowering~~ FIXED
 
-The `p2p_allreduce` Inductor lowering may silently fail to register if
-`torch.distributed._symmetric_memory` is not imported before the first
-`torch.compile` call.
+**Fixed:** `register_symm_mem_lowerings()` in `comm_lowering.py` now
+explicitly imports `torch.distributed._symmetric_memory._p2p_allreduce`
+before checking for the op. This ensures the `p2p_allreduce` lowering
+is registered regardless of whether the user imported
+`torch.distributed._symmetric_memory` before the first `torch.compile`.
 
-**Root cause:** `register_symm_mem_lowerings()` runs once at
-`lowering.py` import time (triggered by the first `torch.compile`). It
-checks `torch.ops.symm_mem.p2p_allreduce` with a try/except
-(`comm_lowering.py:759-763`). If the `_p2p_allreduce` module hasn't
-been imported yet, the op doesn't exist, `AttributeError` is caught,
-and the lowering is **permanently skipped**.
-
-**Symptom:** The FX pass replaces `all_reduce → wait_tensor` with
-`symm_mem.p2p_allreduce` correctly, but Inductor treats it as an extern
-kernel call (no fusion into Triton) and the eager fallback crashes with
-`cudaErrorIllegalAddress` because the input isn't in symmetric memory.
-
-**Workaround:** `import torch.distributed._symmetric_memory` before any
-`torch.compile` call (this registers the `p2p_allreduce` op).
-
-**Proper fix:** Either lazy-register the lowering (check at lowering
-time, not import time), or ensure the op module is imported as part of
-`register_symm_mem_lowerings()`.
+~~**Workaround:** `import torch.distributed._symmetric_memory` before any
+`torch.compile` call~~ — no longer needed.
 
 Related: `enable_symm_mem_for_group(group_name)` is marked deprecated
 but is still required for `is_symm_mem_enabled_for_group()` to return
@@ -1031,10 +1017,10 @@ The 2.0µs gap to FlashInfer (5.8µs) comes from:
       Files: `symm_mem_helpers.py` (new `*_peer_bufs` helpers),
       `lamport_helpers.py` (new `lamport_workspace_peer_bufs`),
       `triton.py` (signature, codegen, wrapper emit methods).
-- [ ] **Gate FX pass on tensor size:** Only replace `all_reduce + wait`
-      with P2P when `numel * element_size < threshold` (default 1MB).
-      Implement in `_can_replace()` using `node.meta["val"]`.
-      Add `_fused_all_reduce_rmsnorm_max_bytes` config.
+- [x] **Gate FX pass on tensor size:** Added
+      `config._fuse_symm_mem_comms_max_bytes` (default 1MB). `_can_replace()`
+      now checks `val.numel() * val.element_size()` against the threshold;
+      tensors above 1MB fall back to NCCL. Setting to 0 disables the gate.
 - [ ] Move `symm_mem_setup` / `*_peer_bufs` to graph init (one-time, not per-call)
 - [x] ~~Use `buffer_ptrs_dev` / `signal_pad_ptrs_dev` raw ints~~ → resolved by per-peer TensorArgs
 - [x] ~~Fix bf16 hardcoding → use actual input dtype~~ → resolved by per-peer TensorArgs
