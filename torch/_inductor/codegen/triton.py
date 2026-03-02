@@ -3688,6 +3688,12 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         # copies it into symmetric memory before the P2P loads).
         self.args.input(name)
 
+        # The push / copy phase reads from the allreduce input buffer via
+        # explicit tl.load with its own indexing.  If an upstream op is
+        # fused into this kernel, its store to the input buffer must not
+        # be eliminated — the push needs the data in global memory.
+        self.must_keep_buffers.add(name)
+
         indexing = self.indexing(index, block_ptr=False)
 
         if not isinstance(indexing, IndexingOptions):
@@ -6251,8 +6257,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         Emit wrapper code that sets up symmetric memory per-peer tensor
         views and appends them to *call_args*.  (Device-side CAS path.)
         """
-        assert self.symm_mem_input_name is not None
-        in_var = self.symm_mem_input_name
+        in_var = self._resolve_symm_mem_input_wrapper_name()
 
         wrapper.imports.writeline(
             "from torch._inductor.runtime.symm_mem_helpers import symm_mem_peer_bufs"
@@ -6272,8 +6277,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         memory workspace, pre-kernel barrier, and append per-peer tensor
         views to *call_args*.
         """
-        assert self.symm_mem_input_name is not None
-        in_var = self.symm_mem_input_name
+        in_var = self._resolve_symm_mem_input_wrapper_name()
 
         skip_copy = "True" if config._symm_mem_skip_prologue_copy else "False"
         wrapper.imports.writeline(
@@ -6294,6 +6298,21 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         """Emit post-kernel host-side barrier in the wrapper."""
         wrapper.writeline(f'symm_mem_host_barrier("{self._symm_group_name}")')
 
+    def _resolve_symm_mem_input_wrapper_name(self) -> str:
+        """Resolve the wrapper-level variable name for the allreduce input.
+
+        When buffer reuse renames the intermediate (e.g. ``buf13 = buf12;
+        del buf12``), the raw ``self.symm_mem_input_name`` (``buf12``) is
+        stale.  Inplace buffers track the rename chain via ``other_names``;
+        the last entry is the current wrapper-level name.
+        """
+        name = self.symm_mem_input_name
+        assert name is not None
+        inplaced = self.args.inplace_buffers.get(name)
+        if inplaced is not None and not isinstance(inplaced, RemovedArg):
+            return inplaced.other_names[-1]
+        return name
+
     def _emit_lamport_setup(self, wrapper, call_args: list) -> None:
         """
         Emit wrapper code for Lamport push-model mode: allocate triple-
@@ -6302,8 +6321,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         Zero wrapper GPU ops — the kernel reads the flag, advances it,
         and resets the block counter entirely in-kernel (FlashInfer-style).
         """
-        assert self.symm_mem_input_name is not None
-        in_var = self.symm_mem_input_name
+        in_var = self._resolve_symm_mem_input_wrapper_name()
 
         wrapper.imports.writeline(
             "from torch._inductor.runtime.lamport_helpers import "
