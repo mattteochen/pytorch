@@ -59,6 +59,7 @@ Generated:    prologue (copy→symm_mem + sync) → P2P reduce load loop →
 | `torch/_inductor/runtime/symm_mem_helpers.py` | Wrapper runtime: cached workspace + pointer tensors |
 | `test/distributed/test_fused_allreduce_rmsnorm.py` | 22 tests (pattern, op, compile e2e, multi-GPU) |
 | `dev/profile_fused_allreduce_rmsnorm.py` | 8-variant profiling script with --nsys mode |
+| `dev/moe_allreduce_norm_bench.py` | End-to-end MoE→AR→norm bench: Triton+FlashInfer vs inductor P2P vs eager |
 
 ## Generated Kernel vs Kraken Reference
 
@@ -527,6 +528,19 @@ is registered regardless of whether the user imported
 
 ~~**Workaround:** `import torch.distributed._symmetric_memory` before any
 `torch.compile` call~~ — no longer needed.
+
+## ~~Known Bug: Buffer Reuse Breaks symm_mem Setup in Complex Graphs~~ FIXED
+
+**Fixed:** All three `_emit_*_setup` methods in `triton.py` used
+`self.symm_mem_input_name` as a raw wrapper variable name. After buffer
+reuse (e.g. `buf13 = buf12; del buf12`), the original name is dead.
+Added `_resolve_symm_mem_wrapper_var()` which resolves through
+`self.args.inplace_buffers` to the live name (same mechanism
+`python_argdefs` uses for kernel call args). Fixes all three sync modes.
+
+**Trigger:** Complex graphs (e.g. MoE + allreduce + norm) where inductor
+reuses the P2P allreduce input buffer for another output. Simple graphs
+(standalone AR + norm) don't trigger the reuse, masking the bug.
 
 Related: `enable_symm_mem_for_group(group_name)` is marked deprecated
 but is still required for `is_symm_mem_enabled_for_group()` to return
@@ -1021,6 +1035,14 @@ The 2.0µs gap to FlashInfer (5.8µs) comes from:
       `config._fuse_symm_mem_comms_max_bytes` (default 1MB). `_can_replace()`
       now checks `val.numel() * val.element_size()` against the threshold;
       tensors above 1MB fall back to NCCL. Setting to 0 disables the gate.
+- [x] **Upstream fusion correctness:** When upstream ops (e.g., MoE tail)
+      fuse into the same kernel as the P2P allreduce, the prologue was
+      reading stale data from the output buffer (which hadn't been computed
+      yet). Fixed by splitting the kernel body into pre-allreduce and
+      post-allreduce phases. The prologue is emitted between them so it
+      reads the just-stored buffer. Detection: `name in store_buffer_names`.
+      For host barriers (incompatible with inline prologue), auto-switches
+      to Lamport. New test: `test_torch_compile_upstream_fused_allreduce_rmsnorm`.
 - [ ] Move `symm_mem_setup` / `*_peer_bufs` to graph init (one-time, not per-call)
 - [x] ~~Use `buffer_ptrs_dev` / `signal_pad_ptrs_dev` raw ints~~ → resolved by per-peer TensorArgs
 - [x] ~~Fix bf16 hardcoding → use actual input dtype~~ → resolved by per-peer TensorArgs

@@ -1061,7 +1061,8 @@ class OpOverrides(BasicMathOpsMixin, OpDecompositions, OpsHandler[Any]):
         )
 
     def symm_mem_p2p_reduce_load(
-        self, name: str, index: sympy.Expr, world_size: int, group_name: str = ""
+        self, name: str, index: sympy.Expr, world_size: int, group_name: str = "",
+        upstream_val: OpVarT | None = None,
     ) -> OpVarT:
         raise NotImplementedError(
             f"{type(self).__name__}: symm_mem_p2p_reduce_load not implemented"
@@ -2221,7 +2222,8 @@ class Kernel(CodeGen, Generic[CSEVariableType]):
         raise NotImplementedError
 
     def symm_mem_p2p_reduce_load(
-        self, name: str, index: sympy.Expr, world_size: int, group_name: str = ""
+        self, name: str, index: sympy.Expr, world_size: int, group_name: str = "",
+        upstream_val: CSEVariable | None = None,
     ) -> CSEVariable:
         raise NotImplementedError
 
@@ -2843,9 +2845,12 @@ class CSEProxy(DefaultHandler):
         return out
 
     def symm_mem_p2p_reduce_load(
-        self, name: str, index: sympy.Expr, world_size: int, group_name: str = ""
+        self, name: str, index: sympy.Expr, world_size: int, group_name: str = "",
+        upstream_val: CSEVariable | None = None,
     ) -> CSEVariable:
-        out = self.kernel.symm_mem_p2p_reduce_load(name, index, world_size, group_name)
+        out = self.kernel.symm_mem_p2p_reduce_load(
+            name, index, world_size, group_name, upstream_val=upstream_val,
+        )
         if out.use_count == 1:
             self.kernel.num_load += 1
         return out
