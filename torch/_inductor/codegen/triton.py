@@ -3684,6 +3684,29 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         self.symm_mem_input_dtype = V.graph.get_dtype(name)
         self._symm_group_name = group_name
 
+        # Eagerly determine sync mode so body codegen (which runs before
+        # codegen_kernel) can condition on it.
+        sync_mode = config._symm_mem_sync_mode
+        if sync_mode == "lamport":
+            self._symm_mem_use_lamport = True
+            self._symm_mem_use_host_barriers = False
+        elif sync_mode == "device_cas":
+            self._symm_mem_use_lamport = False
+            self._symm_mem_use_host_barriers = False
+        else:
+            self._symm_mem_use_lamport = False
+            threshold = config._symm_mem_host_barrier_threshold
+            if threshold == -1:
+                self._symm_mem_use_host_barriers = False
+            elif threshold == 0:
+                self._symm_mem_use_host_barriers = True
+            else:
+                xnumel = V.graph.sizevars.simplify(self.numels["x"])
+                is_static = isinstance(xnumel, (sympy.Integer, int))
+                self._symm_mem_use_host_barriers = (
+                    not is_static or int(xnumel) > threshold
+                )
+
         # Ensure the original input buffer is a kernel arg (the prologue
         # copies it into symmetric memory before the P2P loads).
         self.args.input(name)
@@ -3747,7 +3770,10 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         """
         in_var = self.args.input(self.symm_mem_input_name)
 
-        if not config._symm_mem_skip_prologue_copy:
+        if (
+            not config._symm_mem_skip_prologue_copy
+            and not self._symm_mem_use_host_barriers
+        ):
             # --- Copy phase: load from in_var, store to symm buf ---
             load_buffer.splice(
                 f"""
