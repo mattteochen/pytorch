@@ -26,10 +26,10 @@ from torch.distributed._functional_collectives import all_reduce
 
 
 # ── gpt-oss-20b model constants (scaled down for test) ──────────────────────
-NUM_EXPERTS = 8
-TOP_K = 2
-HIDDEN_SIZE = 256
-INTERMEDIATE_SIZE = 256
+NUM_EXPERTS = 32
+TOP_K = 4
+HIDDEN_SIZE = 2880
+INTERMEDIATE_SIZE = 2880
 GEMM1_ALPHA = 1.702
 SWIGLU_LIMIT = 7.0
 DTYPE = torch.bfloat16
