@@ -1018,6 +1018,13 @@ _symm_mem_grid_cap: int = 0
 # When set to "lamport", _symm_mem_host_barrier_threshold is ignored.
 _symm_mem_sync_mode: str = "host_barrier"
 
+# Maximum tensor size (in bytes) for the P2P allreduce FX pass to fire.
+# One-shot P2P reads the full tensor from every peer over NVLink, so
+# NVLink traffic scales as world_size * data_size. For large tensors
+# this loses to NCCL ring/tree allreduce (2 * data_size). Setting to 0
+# disables the gate (always use P2P regardless of size).
+_fuse_symm_mem_comms_max_bytes: int = 1048576  # 1 MB
+
 
 # Enable/disable partitioned scatter optimization for atomic add kernels
 # this will improve kernel performance at cost of memory usage.

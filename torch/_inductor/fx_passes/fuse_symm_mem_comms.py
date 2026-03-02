@@ -110,6 +110,17 @@ def _can_replace(all_reduce_node: fx.Node, wait_node: fx.Node) -> bool:
         log.debug("Cannot replace: unsupported reduce_op '%s' (only 'sum')", reduce_op)
         return False
 
+    max_bytes = torch._inductor.config._fuse_symm_mem_comms_max_bytes
+    if max_bytes > 0 and val is not None:
+        nbytes = val.numel() * val.element_size()
+        if nbytes > max_bytes:
+            log.debug(
+                "Cannot replace: tensor too large (%d bytes > %d threshold)",
+                nbytes,
+                max_bytes,
+            )
+            return False
+
     return True
 
 
