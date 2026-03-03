@@ -3392,17 +3392,22 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
     @staticmethod
     def _enable_pdl_codegen():
-        if not torch._inductor.config.triton.enable_pdl:
-            return False
         if isinstance(V.kernel, torch._inductor.select_algorithm.TritonTemplateKernel):
             return False
         # PDL uses CUDA-specific intrinsics (gdc_wait/gdc_launch), not available on ROCm
         if torch.version.hip:
             return False
-        return (
+        if not (
             V.graph.get_current_device_or_throw().type == "cuda"
             and torch.cuda.get_device_capability()[0] >= 9
-        )
+        ):
+            return False
+        # Lamport allreduce requires PDL across ALL kernels in the graph so
+        # that every predecessor calls gdc_launch_dependents() — otherwise
+        # the Lamport kernel's gdc_wait() in the prologue stalls forever.
+        if config._symm_mem_sync_mode == "lamport":
+            return True
+        return torch._inductor.config.triton.enable_pdl
 
     def _handle_pdl_before_access(
         self, wait_buffer, *dependencies, consider_reads=False
@@ -3451,12 +3456,18 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         launch_buffer.writeline(self.GDC_LAUNCH)
 
     def _filter_pdl(self, code: IndentedBuffer):
+        # Lamport kernels emit gdc_wait in their prologue (before body) and
+        # gdc_launch_dependents in their epilogue (after body).  Strip
+        # Inductor-injected gdc_wait from the body (redundant with prologue)
+        # but keep the body's gdc_launch — it provides a memory-visibility
+        # fence between the P2P stores and the epilogue cleanup.
+        strip_wait = self.has_symm_mem_p2p and self._symm_mem_use_lamport
         new_lines = []
         has_wait = False
         previous_launch = None
         for l in code._lines:
             if type(l) is str and self.GDC_WAIT in l:
-                if has_wait:
+                if strip_wait or has_wait:
                     continue
                 else:
                     has_wait = True
