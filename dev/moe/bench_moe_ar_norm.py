@@ -144,7 +144,11 @@ class MoELayer(torch.nn.Module):
 
 # ── Benchmark ──────────────────────────────────────────────────────────────
 def benchmark(name, fn, rank, warmup=10, iters=100, cuda_graph=True, cuda_graph_batch=10):
-    """Measure latency. Uses CUDA graph replay when cuda_graph=True."""
+    """Measure latency. Uses CUDA graph replay when cuda_graph=True.
+
+    Returns (avg_us, graph) where graph is a single-iteration CUDAGraph
+    (for NVTX profiling), or None when cuda_graph=False.
+    """
     if rank == 0:
         print(f"Benchmarking {name}...", flush=True)
     dist.barrier()
@@ -156,7 +160,6 @@ def benchmark(name, fn, rank, warmup=10, iters=100, cuda_graph=True, cuda_graph_
 
     if cuda_graph:
         stream = torch.cuda.Stream()
-        g = torch.cuda.CUDAGraph()
         with torch.cuda.stream(stream):
             for _ in range(3):
                 fn()
@@ -164,6 +167,11 @@ def benchmark(name, fn, rank, warmup=10, iters=100, cuda_graph=True, cuda_graph_
         torch.cuda.synchronize()
         dist.barrier()
 
+        g_single = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g_single, stream=stream):
+            fn()
+
+        g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g, stream=stream):
             for _ in range(cuda_graph_batch):
                 fn()
@@ -185,10 +193,11 @@ def benchmark(name, fn, rank, warmup=10, iters=100, cuda_graph=True, cuda_graph_
             fn()
         torch.cuda.synchronize()
         avg_us = (t0 - time.perf_counter()) / -iters * 1e6
+        g_single = None
 
     if rank == 0:
         print(f"  {name:40s} {avg_us:8.1f} μs/iter", flush=True)
-    return avg_us
+    return avg_us, g_single
 
 
 def check_correctness(name, result, ref, rank, atol=2e-2, rtol=2e-2):
@@ -204,12 +213,13 @@ def check_correctness(name, result, ref, rank, atol=2e-2, rtol=2e-2):
 
 
 def main():
-    import sys
-    print("main() starting", flush=True)
     parser = argparse.ArgumentParser()
     parser.add_argument("--num-tokens", type=int, default=1)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=100)
+    parser.add_argument("--cuda-graph-batch", type=int, default=10)
+    parser.add_argument("--nvtx", action="store_true")
+    parser.add_argument("--no-cuda-graph", action="store_true")
     args = parser.parse_args()
 
     dist.init_process_group("nccl")
@@ -389,24 +399,46 @@ def main():
     if rank == 0:
         print(f"\n--- Latency ({args.iters} iters) ---")
 
+    use_cg = not args.no_cuda_graph
+    b_graph = None
     with torch.inference_mode():
         if path_b_ok:
-            b_us = benchmark(
+            b_us, b_graph = benchmark(
                 "Path B: fused_triton + FlashInfer AR+norm",
                 path_b_call, rank,
                 warmup=args.warmup, iters=args.iters,
-                cuda_graph=True,
+                cuda_graph=use_cg, cuda_graph_batch=args.cuda_graph_batch,
             )
-        a_us = benchmark(
+        a_us, a_graph = benchmark(
             "Path A: compiled MoE v2 + Lamport AR+norm",
             path_a_call, rank,
             warmup=args.warmup, iters=args.iters,
-            cuda_graph=True,
+            cuda_graph=use_cg, cuda_graph_batch=args.cuda_graph_batch,
         )
 
     if rank == 0 and path_b_ok:
         speedup = b_us / a_us if a_us > 0 else float("inf")
         print(f"\n  Speedup (A vs B): {speedup:.2f}x")
+
+    # ── NVTX-marked single replay for nsys profiling ──
+    if args.nvtx:
+        if rank == 0:
+            print("\nRunning NVTX-marked iterations (cuda-graphed, 1x each)...")
+
+        torch.cuda.synchronize()
+        dist.barrier()
+        torch.cuda.cudart().cudaProfilerStart()
+        with torch.cuda.nvtx.range("path_a_compiled_moe_v2_lamport"):
+            a_graph.replay()
+        torch.cuda.synchronize()
+        if b_graph is not None:
+            with torch.cuda.nvtx.range("path_b_fused_triton_flashinfer"):
+                b_graph.replay()
+            torch.cuda.synchronize()
+        torch.cuda.cudart().cudaProfilerStop()
+
+        if rank == 0:
+            print("Done. Use 'nsys profile ...' to capture the trace.")
 
     # Cleanup
     if path_b_ok:
