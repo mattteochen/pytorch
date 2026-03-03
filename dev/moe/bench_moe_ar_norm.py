@@ -217,7 +217,7 @@ def main():
     parser.add_argument("--num-tokens", type=int, default=1)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=100)
-    parser.add_argument("--cuda-graph-batch", type=int, default=10)
+    parser.add_argument("--cuda-graph-batch", type=int, default=1)
     parser.add_argument("--nvtx", action="store_true")
     parser.add_argument("--no-cuda-graph", action="store_true")
     args = parser.parse_args()
@@ -376,14 +376,14 @@ def main():
                 use_oneshot=None, # self tuned
                 world_rank=rank,
                 world_size=world_size,
-                launch_with_pdl=True,
+                launch_with_pdl=False,
                 trigger_completion_at_end=True,
                 fp32_acc=True,
             )
 
         # Correctness (eager warmup — run a few times for NCCL/Triton init)
         with torch.inference_mode():
-            for _ in range(3):
+            for _ in range(1):
                 path_b_call()
         check_correctness("Path B normed", fi_norm_out, ref_normed, rank)
         check_correctness("Path B pre_norm", fi_residual_out, ref_pre_norm, rank)
