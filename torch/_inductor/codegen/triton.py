@@ -3854,6 +3854,18 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                         f"SYMM_RANK * _lam_chunk + _lam_row_offset + _lam_cols, "
                         f"_lam_data, mask=_lam_mask)"
                     )
+        # --- Clear old buffer slot (before poll, matching FlashInfer order) ---
+        load_buffer.writeline("for _lam_row_c in tl.static_range(XBLOCK):")
+        with load_buffer.indent():
+            load_buffer.splice(
+                """
+                _lam_row_idx_c = _lam_x_base + _lam_row_c
+                _lam_row_mask_c = _lam_row_idx_c < xnumel
+                _lam_row_offset_c = _lam_row_idx_c * r0_numel
+                _lam_mask_c = _lam_col_mask & _lam_row_mask_c
+                _lamport_clear_old_slot(_lam_clear_base, _lam_row_offset_c, _lam_cols, _lam_mask_c, _lam_chunk, SYMM_RANK, SYMM_WORLD_SIZE, R0_BLOCK)
+                """
+            )
         load_buffer.splice(
             """
             _lamport_fence_sys()
@@ -5660,12 +5672,12 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
     def _codegen_lamport_epilogue(self, code: IndentedBuffer) -> None:
         """
-        Emit the Lamport epilogue: clear the old buffer slot, then
-        advance the triple-buffer flag for the next iteration.
+        Emit the Lamport epilogue: advance the triple-buffer flag.
 
-        Reuses ``_lam_clear_base``, ``_lam_x_base``, ``_lam_cols``,
-        ``_lam_col_mask``, ``_lam_chunk``, ``_lam_meta_i32``,
-        ``_lam_flag`` from the prologue.
+        The old-slot clear has already been done in the body (before the
+        poll), matching FlashInfer's push → clear → poll order.
+
+        Reuses ``_lam_meta_i32``, ``_lam_flag`` from the prologue.
 
         Flag advancement (FlashInfer-style): block 0 spins on the
         block counter until all blocks have arrived, then advances
@@ -5674,13 +5686,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         """
         code.splice(
             """
-            # --- Lamport epilogue: clear old buffer slot + advance flag ---
-            for _lam_row_e in tl.static_range(XBLOCK):
-                _lam_row_idx_e = _lam_x_base + _lam_row_e
-                _lam_row_mask_e = _lam_row_idx_e < xnumel
-                _lam_row_offset_e = _lam_row_idx_e * r0_numel
-                _lam_mask_e = _lam_col_mask & _lam_row_mask_e
-                _lamport_clear_old_slot(_lam_clear_base, _lam_row_offset_e, _lam_cols, _lam_mask_e, _lam_chunk, SYMM_RANK, SYMM_WORLD_SIZE, R0_BLOCK)
+            # --- Lamport epilogue: advance flag ---
             _lamport_advance_flag_block0(_lam_meta_i32, _lam_flag)
             tl.extra.cuda.gdc_launch_dependents()
             """
