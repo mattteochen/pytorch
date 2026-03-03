@@ -545,6 +545,10 @@ class TestFusedAllReduceRMSNormDistributed(MultiProcContinuousTest):
                        "Wrapper should call lamport_workspace_peer_bufs")
         self.assertIn("_lamport_advance_flag_block0", code,
                        "Kernel should call _lamport_advance_flag_block0 (epilogue)")
+        self.assertIn("tl.extra.cuda.gdc_wait()", code,
+                       "Kernel should call gdc_wait() for PDL serialization")
+        self.assertIn("tl.extra.cuda.gdc_launch_dependents()", code,
+                       "Kernel should call gdc_launch_dependents() for PDL serialization")
         self.assertNotIn("lamport_advance_offsets", code,
                           "Wrapper should NOT call lamport_advance_offsets (in-kernel now)")
         self.assertNotIn("_symm_mem_sync", code,

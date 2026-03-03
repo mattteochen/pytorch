@@ -5619,7 +5619,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 )
         code.splice(
             f"""
-            # --- Lamport prologue: read flag + compute offsets ---
+            # --- Lamport prologue: PDL stall + read flag + compute offsets ---
+            tl.extra.cuda.gdc_wait()
             _lam_meta_i32 = _lam_meta.to(tl.pointer_type(tl.int32))
             _lam_flag = _lamport_volatile_load_u32(_lam_meta_i32 + 1)
             _lam_chunk = xnumel * r0_numel
@@ -5670,6 +5671,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 _lam_mask_e = _lam_col_mask & _lam_row_mask_e
                 _lamport_clear_old_slot(_lam_clear_base, _lam_row_offset_e, _lam_cols, _lam_mask_e, _lam_chunk, SYMM_RANK, SYMM_WORLD_SIZE, R0_BLOCK)
             _lamport_advance_flag_block0(_lam_meta_i32, _lam_flag)
+            tl.extra.cuda.gdc_launch_dependents()
             """
         )
 
@@ -5936,6 +5938,11 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             # Cooperative reductions rely on multi-block synchronization that
             # requires cooperative-grid launches to avoid hanging.
             triton_meta["launch_cooperative_grid"] = True
+
+        if self.has_symm_mem_p2p and self._symm_mem_use_lamport:
+            # Lamport triple-buffered allreduce needs PDL to prevent
+            # CUDA graph batched replay from overrunning the 3-slot headroom.
+            triton_meta["launch_pdl"] = True
 
         # Skip memory optimization for forward of the training loop where we expect
         # every new node will increase the peak memory and our greedy approach would

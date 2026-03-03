@@ -15,6 +15,8 @@ Usage (requires 2+ GPUs with P2P access):
 """
 
 import os
+import signal
+import sys
 import time
 
 import torch
@@ -306,4 +308,12 @@ def main():
 
 
 if __name__ == "__main__":
+    timeout = int(os.environ.get("TEST_TIMEOUT", "120"))
+
+    def _timeout_handler(signum, frame):
+        print(f"TIMEOUT after {timeout}s — likely a hang in CUDA graph replay", file=sys.stderr)
+        sys.exit(1)
+
+    signal.signal(signal.SIGALRM, _timeout_handler)
+    signal.alarm(timeout)
     main()

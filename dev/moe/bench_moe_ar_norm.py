@@ -267,8 +267,11 @@ def main():
         print("\n--- Path A: E2E compiled (MoE v2 + Lamport fused) ---", flush=True)
 
     @torch.compile(options={
+        "combo_kernels": True,
         "_fuse_symm_mem_comms": True,
-        "_symm_mem_sync_mode": "device_cas",
+        "_symm_mem_sync_mode": "lamport",
+        "max_autotune_gemm": True,
+        "max_autotune_gemm_backends": "TRITON"
     })
     def e2e_compiled(hs, tw, ti, w13, w13b, w2, w2b, res, w, gn):
         moe = moe_forward(hs, tw, ti, w13, w13b, w2, w2b, NUM_EXPERTS)
