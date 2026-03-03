@@ -3461,7 +3461,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         # inductor-injected gdc_wait AND gdc_launch from the body —
         # the prologue/epilogue pair is the single authoritative source.
         is_lamport = self.has_symm_mem_p2p and self._symm_mem_use_lamport
-        strip_wait, strip_launch = (is_lamport, is_lamport)
+        strip_wait, strip_launch = (is_lamport, not is_lamport) # Using Inductor launch dependent 
         new_lines = []
         has_wait = False
         previous_launch = None
@@ -5690,7 +5690,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             """
             # --- Lamport epilogue: advance flag ---
             _lamport_advance_flag_block0(_lam_meta_i32, _lam_flag)
-            tl.extra.cuda.gdc_launch_dependents()
+            # tl.extra.cuda.gdc_launch_dependents() # Relying on Inductor to emit this
             """
         )
 
