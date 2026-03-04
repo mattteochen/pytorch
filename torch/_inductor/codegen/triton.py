@@ -3456,12 +3456,15 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         launch_buffer.writeline(self.GDC_LAUNCH)
 
     def _filter_pdl(self, code: IndentedBuffer):
-        # Lamport kernels emit gdc_wait in their prologue and
-        # gdc_launch_dependents in their epilogue.  Strip all
-        # inductor-injected gdc_wait AND gdc_launch from the body —
-        # the prologue/epilogue pair is the single authoritative source.
-        is_lamport = self.has_symm_mem_p2p and self._symm_mem_use_lamport
-        strip_wait, strip_launch = (is_lamport, not is_lamport) # Using Inductor launch dependent 
+        # Deduplicate PDL markers: keep the first gdc_wait and the last
+        # gdc_launch_dependents (in-place, after the last load).
+        #
+        # For Lamport kernels, strip all gdc_wait from
+        # the body — the Lamport prologue emits its own authoritative wait.
+        # Launches are never stripped: every kernel must call
+        # gdc_launch_dependents so that the next kernel's gdc_wait
+        # (including the Lamport prologue's) doesn't stall.
+        strip_wait = self.has_symm_mem_p2p and self._symm_mem_use_lamport
         new_lines = []
         has_wait = False
         previous_launch = None
@@ -3472,8 +3475,6 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 else:
                     has_wait = True
             if type(l) is str and self.GDC_LAUNCH in l:
-                if strip_launch:
-                    continue
                 if previous_launch is not None:
                     new_lines.pop(previous_launch)
                 previous_launch = len(new_lines)
