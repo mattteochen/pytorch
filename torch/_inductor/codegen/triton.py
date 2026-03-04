@@ -3399,22 +3399,17 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
     @staticmethod
     def _enable_pdl_codegen():
+        if not torch._inductor.config.triton.enable_pdl:
+            return False
         if isinstance(V.kernel, torch._inductor.select_algorithm.TritonTemplateKernel):
             return False
         # PDL uses CUDA-specific intrinsics (gdc_wait/gdc_launch), not available on ROCm
         if torch.version.hip:
             return False
-        if not (
+        return (
             V.graph.get_current_device_or_throw().type == "cuda"
             and torch.cuda.get_device_capability()[0] >= 9
-        ):
-            return False
-        # Lamport allreduce requires PDL across ALL kernels in the graph so
-        # that every predecessor calls gdc_launch_dependents() — otherwise
-        # the Lamport kernel's gdc_wait() in the prologue stalls forever.
-        if config._symm_mem_sync_mode == "lamport":
-            return True
-        return torch._inductor.config.triton.enable_pdl
+        )
 
     def _handle_pdl_before_access(
         self, wait_buffer, *dependencies, consider_reads=False
@@ -3463,24 +3458,16 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         launch_buffer.writeline(self.GDC_LAUNCH)
 
     def _filter_pdl(self, code: IndentedBuffer):
-        # Lamport kernels emit gdc_wait in their prologue and
-        # gdc_launch_dependents in their epilogue.  Strip all
-        # inductor-injected gdc_wait AND gdc_launch from the body —
-        # the prologue/epilogue pair is the single authoritative source.
-        is_lamport = self.has_symm_mem_p2p and self._symm_mem_use_lamport
-        strip_wait, strip_launch = (is_lamport, not is_lamport) # Using Inductor launch dependent 
         new_lines = []
         has_wait = False
         previous_launch = None
         for l in code._lines:
             if type(l) is str and self.GDC_WAIT in l:
-                if strip_wait or has_wait:
+                if has_wait:
                     continue
                 else:
                     has_wait = True
             if type(l) is str and self.GDC_LAUNCH in l:
-                if strip_launch:
-                    continue
                 if previous_launch is not None:
                     new_lines.pop(previous_launch)
                 previous_launch = len(new_lines)
@@ -3705,38 +3692,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         self.symm_mem_input_dtype = V.graph.get_dtype(name)
         self._symm_group_name = group_name
 
-        # Eagerly determine sync mode so body codegen (which runs before
-        # codegen_kernel) can condition on it.
-        sync_mode = config._symm_mem_sync_mode
-        if sync_mode == "lamport":
-            self._symm_mem_use_lamport = True
-            self._symm_mem_use_host_barriers = False
-        elif sync_mode == "device_cas":
-            self._symm_mem_use_lamport = False
-            self._symm_mem_use_host_barriers = False
-        else:
-            self._symm_mem_use_lamport = False
-            threshold = config._symm_mem_host_barrier_threshold
-            if threshold == -1:
-                self._symm_mem_use_host_barriers = False
-            elif threshold == 0:
-                self._symm_mem_use_host_barriers = True
-            else:
-                xnumel = V.graph.sizevars.simplify(self.numels["x"])
-                is_static = isinstance(xnumel, (sympy.Integer, int))
-                self._symm_mem_use_host_barriers = (
-                    not is_static or int(xnumel) > threshold
-                )
-
-        # Ensure the original input buffer is a kernel arg (the prologue
-        # copies it into symmetric memory before the P2P loads).
         self.args.input(name)
-
-        # The push / copy phase reads from the allreduce input buffer via
-        # explicit tl.load with its own indexing.  If an upstream op is
-        # fused into this kernel, its store to the input buffer must not
-        # be eliminated — the push needs the data in global memory.
-        self.must_keep_buffers.add(name)
 
         indexing = self.indexing(index, block_ptr=False)
 
@@ -3793,41 +3749,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
     def _codegen_pull_reduce_load(
         self, load_buffer, indexing, shape_str: str
     ) -> None:
-        """Emit pull-model P2P reduce: copy to symm buf + sync + accumulate.
-
-        The copy (``in_var`` → ``_symm_local_buf``) and device-side sync
-        are emitted here — inside the body — rather than in the prologue,
-        so that any upstream pointwise ops fused into the same kernel
-        have already written ``in_var`` by the time the copy reads it.
-
-        Uses ``_symm_local_buf``, ``_symm_x_base``, ``_symm_cols``,
-        ``_symm_col_mask`` from the prologue setup.
-        """
-        in_var = self.args.input(self.symm_mem_input_name)
-
-        if (
-            not config._symm_mem_skip_prologue_copy
-            and not self._symm_mem_use_host_barriers
-        ):
-            # --- Copy phase: load from in_var, store to symm buf ---
-            load_buffer.splice(
-                f"""
-                for _symm_row in tl.static_range(XBLOCK):
-                    _symm_row_idx = _symm_x_base + _symm_row
-                    _symm_row_mask = _symm_row_idx < xnumel
-                    _symm_idx = _symm_row_idx * r0_numel + _symm_cols
-                    _symm_mask = _symm_col_mask & _symm_row_mask
-                    _symm_val = tl.load({in_var} + _symm_idx, _symm_mask, other=0.0)
-                    tl.store(_symm_local_buf + _symm_idx, _symm_val, _symm_mask)
-                """
-            )
-            load_buffer.writeline(
-                "_symm_mem_sync(symm_signal_pad_ptrs, None, SYMM_RANK, "
-                "SYMM_WORLD_SIZE, hasPreviousMemAccess=True, "
-                "hasSubsequentMemAccess=True)"
-            )
-
-        # --- Accumulate from all peers ---
+        """Emit pull-model P2P reduce: direct loads from per-peer args."""
         load_buffer.writeline(
             f"_symm_acc = tl.zeros([{shape_str}], dtype=tl.float32)"
         )
@@ -3841,63 +3763,14 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
     def _codegen_lamport_reduce_load(
         self, load_buffer, indexing, shape_str: str
     ) -> None:
-        """Emit Lamport push-model reduce: push + fence + arrive + poll + accumulate.
+        """Emit Lamport push-model reduce: poll local buffer + accumulate.
 
-        The push phase (load from ``in_var``, store to all peers, fence,
-        block_arrive) is emitted here — inside the body — rather than in
-        the prologue, so that any upstream pointwise ops fused into the
-        same kernel have already written ``in_var`` by the time the push
-        reads it.
-
-        Uses ``_lam_my_buf_base``, ``_lam_x_base``, ``_lam_chunk``,
-        ``_lam_n_words``, ``_lam_buf_offset``, ``_lam_cols``,
-        ``_lam_col_mask``, ``_lam_meta_i32`` from the prologue.
+        The self-contribution is loaded from the input buffer.  When the
+        prologue is emitted inline (upstream fusion), the buffer has just
+        been written by the pre-allreduce stores, so the load is valid.
         """
         tl_dtype = triton_type(self.symm_mem_input_dtype)
         in_var = self.args.input(self.symm_mem_input_name)
-
-        # --- Push phase: load data, store to all peers, fence, arrive ---
-        load_buffer.writeline("for _lam_row in tl.static_range(XBLOCK):")
-        with load_buffer.indent():
-            load_buffer.splice(
-                f"""
-                _lam_row_idx = _lam_x_base + _lam_row
-                _lam_row_mask = _lam_row_idx < xnumel
-                _lam_row_offset = _lam_row_idx * r0_numel
-                _lam_idx = _lam_row_offset + _lam_cols
-                _lam_mask = _lam_col_mask & _lam_row_mask
-                _lam_data = tl.load({in_var} + _lam_idx, _lam_mask, other=0.0)
-                _lam_data = _lamport_remove_neg_zero(_lam_data)
-                """
-            )
-            for i in range(self.symm_mem_world_size):
-                load_buffer.writeline(f"if {i} != SYMM_RANK:")
-                with load_buffer.indent():
-                    load_buffer.writeline(
-                        f"tl.store(symm_peer_buf_{i} + _lam_buf_offset + "
-                        f"SYMM_RANK * _lam_chunk + _lam_row_offset + _lam_cols, "
-                        f"_lam_data, mask=_lam_mask)"
-                    )
-        # --- Clear old buffer slot (before poll, matching FlashInfer order) ---
-        load_buffer.writeline("for _lam_row_c in tl.static_range(XBLOCK):")
-        with load_buffer.indent():
-            load_buffer.splice(
-                """
-                _lam_row_idx_c = _lam_x_base + _lam_row_c
-                _lam_row_mask_c = _lam_row_idx_c < xnumel
-                _lam_row_offset_c = _lam_row_idx_c * r0_numel
-                _lam_mask_c = _lam_col_mask & _lam_row_mask_c
-                _lamport_clear_old_slot(_lam_clear_base, _lam_row_offset_c, _lam_cols, _lam_mask_c, _lam_chunk, SYMM_RANK, SYMM_WORLD_SIZE, R0_BLOCK)
-                """
-            )
-        load_buffer.splice(
-            """
-            _lamport_fence_sys()
-            _lamport_block_arrive(_lam_meta_i32)
-            """
-        )
-
-        # --- Poll + accumulate ---
         load_buffer.writeline(
             f"_symm_acc = tl.load({in_var} + ({indexing.index_str}), "
             f"{indexing.mask_str}, other=0.0).to(tl.float32)"
@@ -5595,18 +5468,16 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
     def _codegen_symm_mem_prologue(self, code: IndentedBuffer) -> None:
         """
-        Emit the symmetric memory P2P setup prologue: select the local
-        buffer and pre-compute helper variables.
+        Emit the symmetric memory P2P prologue:
+        1. Copy rows of the local input into this rank's symmetric buffer.
+        2. Device-side sync so all peers' data is visible.
 
-        The actual copy (``in_var`` → ``_symm_local_buf``) and the
-        device-side sync are deferred to ``_codegen_pull_reduce_load``
-        so that any upstream pointwise ops fused into the same kernel
-        have written ``in_var`` before the copy reads it.
-
-        When ``_symm_mem_skip_prologue_copy`` is set, only the sync is
-        emitted (no copy needed).
+        When ``_symm_mem_grid_cap`` is active the copy grid-strides over
+        all rows so that a capped grid still covers the full tensor.
         """
         assert self.symm_mem_input_name is not None
+        in_var = self.args.input(self.symm_mem_input_name)
+        grid_cap = config._symm_mem_grid_cap
 
         if config._symm_mem_skip_prologue_copy:
             code.splice(
@@ -5615,23 +5486,52 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 _symm_mem_sync(symm_signal_pad_ptrs, None, SYMM_RANK, SYMM_WORLD_SIZE, hasPreviousMemAccess=True, hasSubsequentMemAccess=True)
                 """
             )
-            return
-
-        # Buffer selection (SYMM_RANK is constexpr → Triton DCEs non-matching).
-        code.writeline("# --- symm mem prologue: setup ---")
-        for i in range(self.symm_mem_world_size):
-            prefix = "if" if i == 0 else "elif"
-            code.writeline(f"{prefix} SYMM_RANK == {i}:")
-            with code.indent():
-                code.writeline(f"_symm_local_buf = symm_peer_buf_{i}")
-
-        code.splice(
-            """
-            _symm_x_base = tl.program_id(0).to(tl.int64) * XBLOCK
-            _symm_cols = tl.arange(0, R0_BLOCK)
-            _symm_col_mask = _symm_cols < r0_numel
-            """
-        )
+        elif grid_cap > 0:
+            code.writeline("# --- symm mem prologue: grid-stride copy + sync ---")
+            for i in range(self.symm_mem_world_size):
+                prefix = "if" if i == 0 else "elif"
+                code.writeline(f"{prefix} SYMM_RANK == {i}:")
+                with code.indent():
+                    code.writeline(f"_symm_local_buf = symm_peer_buf_{i}")
+            code.splice(
+                f"""
+                _symm_cols = tl.arange(0, R0_BLOCK)
+                _symm_col_mask = _symm_cols < r0_numel
+                _symm_num_tiles = tl.cdiv(xnumel, XBLOCK)
+                for _symm_tile in range(tl.program_id(0), _symm_num_tiles, tl.num_programs(0)):
+                    _symm_x_base = _symm_tile.to(tl.int64) * XBLOCK
+                    for _symm_row in tl.static_range(XBLOCK):
+                        _symm_row_idx = _symm_x_base + _symm_row
+                        _symm_row_mask = _symm_row_idx < xnumel
+                        _symm_idx = _symm_row_idx * r0_numel + _symm_cols
+                        _symm_mask = _symm_col_mask & _symm_row_mask
+                        _symm_val = tl.load({in_var} + _symm_idx, _symm_mask, other=0.0)
+                        tl.store(_symm_local_buf + _symm_idx, _symm_val, _symm_mask)
+                _symm_mem_sync(symm_signal_pad_ptrs, None, SYMM_RANK, SYMM_WORLD_SIZE, hasPreviousMemAccess=True, hasSubsequentMemAccess=True)
+                """
+            )
+        else:
+            code.writeline("# --- symm mem prologue: copy local input -> symm buffer ---")
+            for i in range(self.symm_mem_world_size):
+                prefix = "if" if i == 0 else "elif"
+                code.writeline(f"{prefix} SYMM_RANK == {i}:")
+                with code.indent():
+                    code.writeline(f"_symm_local_buf = symm_peer_buf_{i}")
+            code.splice(
+                f"""
+                _symm_x_base = tl.program_id(0).to(tl.int64) * XBLOCK
+                _symm_cols = tl.arange(0, R0_BLOCK)
+                _symm_col_mask = _symm_cols < r0_numel
+                for _symm_row in tl.static_range(XBLOCK):
+                    _symm_row_idx = _symm_x_base + _symm_row
+                    _symm_row_mask = _symm_row_idx < xnumel
+                    _symm_idx = _symm_row_idx * r0_numel + _symm_cols
+                    _symm_mask = _symm_col_mask & _symm_row_mask
+                    _symm_val = tl.load({in_var} + _symm_idx, _symm_mask, other=0.0)
+                    tl.store(_symm_local_buf + _symm_idx, _symm_val, _symm_mask)
+                _symm_mem_sync(symm_signal_pad_ptrs, None, SYMM_RANK, SYMM_WORLD_SIZE, hasPreviousMemAccess=True, hasSubsequentMemAccess=True)
+                """
+            )
 
     def _codegen_symm_mem_epilogue(self, code: IndentedBuffer) -> None:
         """Emit the final device-side sync after all stores."""
@@ -5644,13 +5544,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
     def _codegen_lamport_prologue(self, code: IndentedBuffer) -> None:
         """
-        Emit the Lamport setup prologue: read flag from metadata via
-        volatile load, compute offsets, pre-compute shared pointers.
-
-        The push phase (load data, store to peers, fence, block_arrive)
-        is deferred to ``_codegen_lamport_reduce_load`` so that upstream
-        pointwise ops fused into the same kernel have a chance to write
-        ``in_var`` before the push reads it.
+        Emit the Lamport push prologue: read flag from metadata via
+        volatile load, compute offsets, pre-compute shared pointers,
+        push data to all peers, then signal block arrival.
 
         Variables prefixed with ``_lam_`` are set here and reused by the
         body (``_codegen_lamport_reduce_load``) and epilogue
@@ -5658,6 +5554,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         """
         assert self.symm_mem_input_name is not None
         assert self.symm_mem_input_dtype is not None
+        in_var = self.args.input(self.symm_mem_input_name)
         elem_bytes = torch.tensor([], dtype=self.symm_mem_input_dtype).element_size()
         assert (
             elem_bytes == 2
@@ -5676,8 +5573,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 )
         code.splice(
             f"""
-            # --- Lamport prologue: PDL stall + read flag + compute offsets ---
-            tl.extra.cuda.gdc_wait()
+            # --- Lamport prologue: read flag + compute offsets + push + arrive ---
             _lam_meta_i32 = _lam_meta.to(tl.pointer_type(tl.int32))
             _lam_flag = _lamport_volatile_load_u32(_lam_meta_i32 + 1)
             _lam_chunk = xnumel * r0_numel
@@ -5703,15 +5599,44 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             _lam_n_words = r0_numel // 2
             """
         )
+        # Push loop: load data, remove sentinels, store to all peers
+        code.writeline("for _lam_row in tl.static_range(XBLOCK):")
+        with code.indent():
+            code.splice(
+                f"""
+                _lam_row_idx = _lam_x_base + _lam_row
+                _lam_row_mask = _lam_row_idx < xnumel
+                _lam_row_offset = _lam_row_idx * r0_numel
+                _lam_idx = _lam_row_offset + _lam_cols
+                _lam_mask = _lam_col_mask & _lam_row_mask
+                _lam_data = tl.load({in_var} + _lam_idx, _lam_mask, other=0.0)
+                _lam_data = _lamport_remove_neg_zero(_lam_data)
+                """
+            )
+            # Inline push to peers: store directly to each peer's buffer arg
+            for i in range(self.symm_mem_world_size):
+                code.writeline(f"if {i} != SYMM_RANK:")
+                with code.indent():
+                    code.writeline(
+                        f"tl.store(symm_peer_buf_{i} + _lam_buf_offset + "
+                        f"SYMM_RANK * _lam_chunk + _lam_row_offset + _lam_cols, "
+                        f"_lam_data, mask=_lam_mask)"
+                    )
+        code.splice(
+            """
+            _lamport_fence_sys()
+            _lamport_block_arrive(_lam_meta_i32)
+            """
+        )
 
     def _codegen_lamport_epilogue(self, code: IndentedBuffer) -> None:
         """
-        Emit the Lamport epilogue: advance the triple-buffer flag.
+        Emit the Lamport epilogue: clear the old buffer slot, then
+        advance the triple-buffer flag for the next iteration.
 
-        The old-slot clear has already been done in the body (before the
-        poll), matching FlashInfer's push → clear → poll order.
-
-        Reuses ``_lam_meta_i32``, ``_lam_flag`` from the prologue.
+        Reuses ``_lam_clear_base``, ``_lam_x_base``, ``_lam_cols``,
+        ``_lam_col_mask``, ``_lam_chunk``, ``_lam_meta_i32``,
+        ``_lam_flag`` from the prologue.
 
         Flag advancement (FlashInfer-style): block 0 spins on the
         block counter until all blocks have arrived, then advances
@@ -5720,9 +5645,14 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         """
         code.splice(
             """
-            # --- Lamport epilogue: advance flag ---
+            # --- Lamport epilogue: clear old buffer slot + advance flag ---
+            for _lam_row_e in tl.static_range(XBLOCK):
+                _lam_row_idx_e = _lam_x_base + _lam_row_e
+                _lam_row_mask_e = _lam_row_idx_e < xnumel
+                _lam_row_offset_e = _lam_row_idx_e * r0_numel
+                _lam_mask_e = _lam_col_mask & _lam_row_mask_e
+                _lamport_clear_old_slot(_lam_clear_base, _lam_row_offset_e, _lam_cols, _lam_mask_e, _lam_chunk, SYMM_RANK, SYMM_WORLD_SIZE, R0_BLOCK)
             _lamport_advance_flag_block0(_lam_meta_i32, _lam_flag)
-            # tl.extra.cuda.gdc_launch_dependents() # Relying on Inductor to emit this
             """
         )
 
@@ -5989,11 +5919,6 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             # Cooperative reductions rely on multi-block synchronization that
             # requires cooperative-grid launches to avoid hanging.
             triton_meta["launch_cooperative_grid"] = True
-
-        if self.has_symm_mem_p2p and self._symm_mem_use_lamport:
-            # Lamport triple-buffered allreduce needs PDL to prevent
-            # CUDA graph batched replay from overrunning the 3-slot headroom.
-            triton_meta["launch_pdl"] = True
 
         # Skip memory optimization for forward of the training loop where we expect
         # every new node will increase the peak memory and our greedy approach would
@@ -6358,7 +6283,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         Emit wrapper code that sets up symmetric memory per-peer tensor
         views and appends them to *call_args*.  (Device-side CAS path.)
         """
-        in_var = self._resolve_symm_mem_input_wrapper_name()
+        in_var = self._resolve_symm_mem_wrapper_var()
 
         wrapper.imports.writeline(
             "from torch._inductor.runtime.symm_mem_helpers import symm_mem_peer_bufs"
@@ -6378,7 +6303,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         memory workspace, pre-kernel barrier, and append per-peer tensor
         views to *call_args*.
         """
-        in_var = self._resolve_symm_mem_input_wrapper_name()
+        in_var = self._resolve_symm_mem_wrapper_var()
 
         skip_copy = "True" if config._symm_mem_skip_prologue_copy else "False"
         wrapper.imports.writeline(
@@ -6399,21 +6324,6 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         """Emit post-kernel host-side barrier in the wrapper."""
         wrapper.writeline(f'symm_mem_host_barrier("{self._symm_group_name}")')
 
-    def _resolve_symm_mem_input_wrapper_name(self) -> str:
-        """Resolve the wrapper-level variable name for the allreduce input.
-
-        When buffer reuse renames the intermediate (e.g. ``buf13 = buf12;
-        del buf12``), the raw ``self.symm_mem_input_name`` (``buf12``) is
-        stale.  Inplace buffers track the rename chain via ``other_names``;
-        the last entry is the current wrapper-level name.
-        """
-        name = self.symm_mem_input_name
-        assert name is not None
-        inplaced = self.args.inplace_buffers.get(name)
-        if inplaced is not None and not isinstance(inplaced, RemovedArg):
-            return inplaced.other_names[-1]
-        return name
-
     def _emit_lamport_setup(self, wrapper, call_args: list) -> None:
         """
         Emit wrapper code for Lamport push-model mode: allocate triple-
@@ -6422,7 +6332,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         Zero wrapper GPU ops — the kernel reads the flag, advances it,
         and resets the block counter entirely in-kernel (FlashInfer-style).
         """
-        in_var = self._resolve_symm_mem_input_wrapper_name()
+        in_var = self._resolve_symm_mem_wrapper_var()
 
         wrapper.imports.writeline(
             "from torch._inductor.runtime.lamport_helpers import "
