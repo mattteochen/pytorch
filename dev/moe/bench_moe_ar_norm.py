@@ -376,7 +376,7 @@ def main():
                 use_oneshot=None, # self tuned
                 world_rank=rank,
                 world_size=world_size,
-                launch_with_pdl=False,
+                launch_with_pdl=True,
                 trigger_completion_at_end=True,
                 fp32_acc=True,
             )
