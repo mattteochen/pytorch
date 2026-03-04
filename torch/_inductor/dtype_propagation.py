@@ -262,7 +262,8 @@ class DtypePropagationOpsHandler:
 
     @staticmethod
     def symm_mem_p2p_reduce_load(
-        name: str, index, world_size: int, group_name: str = ""
+        name: str, index, world_size: int, group_name: str = "",
+        upstream_val=None,
     ) -> torch.dtype:
         return upcast_compute_type(V.graph.get_dtype(name))
 

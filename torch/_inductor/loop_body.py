@@ -642,11 +642,14 @@ class CaptureIndexing(WrapperHandler):
         return self._inner.load(name, index)
 
     def symm_mem_p2p_reduce_load(
-        self, name: str, index: sympy.Expr, world_size: int, group_name: str = ""
+        self, name: str, index: sympy.Expr, world_size: int, group_name: str = "",
+        upstream_val=None,
     ):
         index = self._simplify(index)
         index = self._add_index(index, MemoryUsageType.LOAD, buffer_name=name)
-        return self._inner.symm_mem_p2p_reduce_load(name, index, world_size, group_name)
+        return self._inner.symm_mem_p2p_reduce_load(
+            name, index, world_size, group_name, upstream_val=upstream_val,
+        )
 
     def load_seed(self, name: str, index: int):
         assert isinstance(index, int)
