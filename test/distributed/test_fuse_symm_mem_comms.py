@@ -545,6 +545,10 @@ class TestFusedAllReduceRMSNormDistributed(MultiProcContinuousTest):
                        "Wrapper should call lamport_workspace_peer_bufs")
         self.assertIn("_lamport_advance_flag_block0", code,
                        "Kernel should call _lamport_advance_flag_block0 (epilogue)")
+        self.assertIn("tl.extra.cuda.gdc_wait()", code,
+                       "Kernel should call gdc_wait() for PDL serialization")
+        self.assertIn("tl.extra.cuda.gdc_launch_dependents()", code,
+                       "Kernel should call gdc_launch_dependents() for PDL serialization")
         self.assertNotIn("lamport_advance_offsets", code,
                           "Wrapper should NOT call lamport_advance_offsets (in-kernel now)")
         self.assertNotIn("_symm_mem_sync", code,
@@ -664,6 +668,106 @@ class TestFusedAllReduceRMSNormDistributed(MultiProcContinuousTest):
 
         torch.testing.assert_close(normed, expected_normed, atol=2e-2, rtol=2e-2)
         self._assert_lamport_codegen(code)
+
+    @skip_if_lt_x_gpu(2)
+    def test_torch_compile_lamport_upstream_pointwise_allreduce_rmsnorm(self):
+        """
+        End-to-end torch.compile with Lamport push-model sync and an
+        upstream pointwise op fused before the allreduce:
+        pointwise -> all_reduce -> add residual -> rms_norm.
+
+        The push phase must read from in_var AFTER the upstream compute
+        has written to it, so this validates the mid-body flush logic.
+        """
+        self._init_process()
+        hidden = 64
+        eps = 1e-5
+
+        x = torch.randn(4, hidden, device=self.device, dtype=torch.bfloat16)
+        residual = torch.randn(4, hidden, device=self.device, dtype=torch.bfloat16)
+        weight = torch.ones(hidden, device=self.device, dtype=torch.float32)
+
+        group_name = dist.group.WORLD.group_name
+        symm_mem.enable_symm_mem_for_group(group_name)
+        symm_mem.get_symm_mem_workspace(
+            group_name, min_size=x.numel() * x.element_size()
+        )
+
+        # Reference: upstream pointwise -> allreduce -> residual add -> rmsnorm
+        upstream = x * 2.0
+        expected_normed, expected_pre_norm = self._reference_allreduce_rmsnorm(
+            upstream, weight, eps, residual=residual,
+        )
+
+        @torch.compile(options={
+            "_fuse_symm_mem_comms": True,
+            "_symm_mem_sync_mode": "lamport",
+        })
+        def upstream_ar_norm(inp, res, w, gn):
+            up = inp * 2.0
+            reduced = all_reduce(up, "sum", group=gn)
+            h = reduced + res
+            normed = F.rms_norm(h, w.shape, w, eps)
+            return normed, h
+
+        with torch.inference_mode():
+            (normed, pre_norm), code = run_and_get_code(
+                upstream_ar_norm, x, residual, weight, group_name
+            )
+
+        torch.testing.assert_close(normed, expected_normed, atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(
+            pre_norm, expected_pre_norm, atol=2e-2, rtol=2e-2
+        )
+        self._assert_lamport_codegen(code)
+
+    @skip_if_lt_x_gpu(2)
+    def test_torch_compile_device_cas_upstream_pointwise_allreduce_rmsnorm(self):
+        """
+        End-to-end torch.compile with device-side CAS sync and an
+        upstream pointwise op fused before the allreduce:
+        pointwise -> all_reduce -> add residual -> rms_norm.
+        """
+        self._init_process()
+        hidden = 64
+        eps = 1e-5
+
+        x = torch.randn(4, hidden, device=self.device, dtype=torch.bfloat16)
+        residual = torch.randn(4, hidden, device=self.device, dtype=torch.bfloat16)
+        weight = torch.ones(hidden, device=self.device, dtype=torch.float32)
+
+        group_name = dist.group.WORLD.group_name
+        symm_mem.enable_symm_mem_for_group(group_name)
+        symm_mem.get_symm_mem_workspace(
+            group_name, min_size=x.numel() * x.element_size()
+        )
+
+        upstream = x * 2.0
+        expected_normed, expected_pre_norm = self._reference_allreduce_rmsnorm(
+            upstream, weight, eps, residual=residual,
+        )
+
+        @torch.compile(options={
+            "_fuse_symm_mem_comms": True,
+            "_symm_mem_sync_mode": "device_cas",
+        })
+        def upstream_ar_norm(inp, res, w, gn):
+            up = inp * 2.0
+            reduced = all_reduce(up, "sum", group=gn)
+            h = reduced + res
+            normed = F.rms_norm(h, w.shape, w, eps)
+            return normed, h
+
+        with torch.inference_mode():
+            (normed, pre_norm), code = run_and_get_code(
+                upstream_ar_norm, x, residual, weight, group_name
+            )
+
+        torch.testing.assert_close(normed, expected_normed, atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(
+            pre_norm, expected_pre_norm, atol=2e-2, rtol=2e-2
+        )
+        self._assert_device_cas_codegen(code)
 
     @skip_if_lt_x_gpu(2)
     def test_torch_compile_device_cas_allreduce_rmsnorm(self):
