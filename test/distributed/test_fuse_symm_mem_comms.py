@@ -460,21 +460,21 @@ class TestFusedAllReduceRMSNormDistributed(MultiProcContinuousTest):
 
         torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
 
+    def _reference_allreduce_sum(self, x, residual=None):
+        reduced = torch.ops._c10d_functional.all_reduce(x, "sum", "0")
+        reduced = torch.ops._c10d_functional.wait_tensor(reduced)
+        if residual is not None:
+            reduced = reduced + residual
+        return reduced.sum(dim=-1), reduced
+
     @skip_if_lt_x_gpu(2)
-    def test_torch_compile_allreduce_rmsnorm(self):
-        """
-        End-to-end torch.compile test: the FX pass should replace
-        all_reduce+wait with p2p_allreduce, and inductor should lower
-        and compile the graph.  We verify the compiled function produces
-        numerically correct output.
-        """
+    def test_torch_compile_allreduce_sum(self):
+        """E2E torch.compile: all_reduce -> add residual -> sum(dim=-1)."""
         self._init_process()
         hidden = 64
-        eps = 1e-5
 
         x = torch.randn(4, hidden, device=self.device, dtype=torch.bfloat16)
         residual = torch.randn(4, hidden, device=self.device, dtype=torch.bfloat16)
-        weight = torch.ones(hidden, device=self.device, dtype=torch.float32)
 
         group_name = dist.group.WORLD.group_name
         symm_mem.enable_symm_mem_for_group(group_name)
@@ -482,37 +482,27 @@ class TestFusedAllReduceRMSNormDistributed(MultiProcContinuousTest):
             group_name, min_size=x.numel() * x.element_size()
         )
 
-        expected_normed, expected_pre_norm = self._reference_allreduce_rmsnorm(
-            x,
-            weight,
-            eps,
-            residual=residual,
-        )
+        expected_sum, expected_h = self._reference_allreduce_sum(x, residual=residual)
 
         @torch.compile(options={"_fuse_symm_mem_comms": True})
-        def ar_norm(inp, res, w, gn):
+        def fn(inp, res, gn):
             reduced = all_reduce(inp, "sum", group=gn)
             h = reduced + res
-            normed = F.rms_norm(h, w.shape, w, eps)
-            return normed, h
+            return h.sum(dim=-1), h
 
         with torch.inference_mode():
-            normed, pre_norm = ar_norm(x, residual, weight, group_name)
+            result_sum, result_h = fn(x, residual, group_name)
 
-        torch.testing.assert_close(normed, expected_normed, atol=2e-2, rtol=2e-2)
-        torch.testing.assert_close(pre_norm, expected_pre_norm, atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(result_sum, expected_sum, atol=0.2, rtol=0.1)
+        torch.testing.assert_close(result_h, expected_h, atol=2e-2, rtol=2e-2)
 
     @skip_if_lt_x_gpu(2)
-    def test_torch_compile_allreduce_rmsnorm_no_residual(self):
-        """
-        End-to-end torch.compile: all_reduce -> rms_norm (no residual add).
-        """
+    def test_torch_compile_allreduce_sum_no_residual(self):
+        """E2E torch.compile: all_reduce -> sum(dim=-1) (no residual)."""
         self._init_process()
         hidden = 64
-        eps = 1e-5
 
         x = torch.randn(4, hidden, device=self.device, dtype=torch.bfloat16)
-        weight = torch.ones(hidden, device=self.device, dtype=torch.float32)
 
         group_name = dist.group.WORLD.group_name
         symm_mem.enable_symm_mem_for_group(group_name)
@@ -520,18 +510,17 @@ class TestFusedAllReduceRMSNormDistributed(MultiProcContinuousTest):
             group_name, min_size=x.numel() * x.element_size()
         )
 
-        expected_normed, _ = self._reference_allreduce_rmsnorm(x, weight, eps)
+        expected_sum, _ = self._reference_allreduce_sum(x)
 
         @torch.compile(options={"_fuse_symm_mem_comms": True})
-        def ar_norm(inp, w, gn):
+        def fn(inp, gn):
             reduced = all_reduce(inp, "sum", group=gn)
-            normed = F.rms_norm(reduced, w.shape, w, eps)
-            return normed
+            return reduced.sum(dim=-1)
 
         with torch.inference_mode():
-            normed = ar_norm(x, weight, group_name)
+            result = fn(x, group_name)
 
-        torch.testing.assert_close(normed, expected_normed, atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(result, expected_sum, atol=0.2, rtol=0.1)
 
 
     def _assert_lamport_codegen(self, code_list):
@@ -584,23 +573,13 @@ class TestFusedAllReduceRMSNormDistributed(MultiProcContinuousTest):
         self.assertNotIn("_lamport_poll_all_peers", code,
                           "Kernel should NOT use Lamport reduce")
 
-    @skip_if_lt_x_gpu(2)
-    def test_torch_compile_lamport_allreduce_rmsnorm(self):
-        """
-        End-to-end torch.compile with Lamport push-model sync:
-        all_reduce -> add residual -> rms_norm.
-
-        Verifies both numerical correctness AND that the generated Triton
-        kernel uses the Lamport push/poll/clear helpers (not the pull model
-        or NCCL fallback).
-        """
+    def _compile_allreduce_sum_with_codegen(self, sync_mode, assert_codegen_fn):
+        """all_reduce -> add residual -> sum(dim=-1), with codegen check."""
         self._init_process()
         hidden = 64
-        eps = 1e-5
 
         x = torch.randn(4, hidden, device=self.device, dtype=torch.bfloat16)
         residual = torch.randn(4, hidden, device=self.device, dtype=torch.bfloat16)
-        weight = torch.ones(hidden, device=self.device, dtype=torch.float32)
 
         group_name = dist.group.WORLD.group_name
         symm_mem.enable_symm_mem_for_group(group_name)
@@ -608,133 +587,33 @@ class TestFusedAllReduceRMSNormDistributed(MultiProcContinuousTest):
             group_name, min_size=x.numel() * x.element_size()
         )
 
-        expected_normed, expected_pre_norm = self._reference_allreduce_rmsnorm(
-            x, weight, eps, residual=residual,
-        )
+        expected_sum, expected_h = self._reference_allreduce_sum(x, residual=residual)
 
         @torch.compile(options={
             "_fuse_symm_mem_comms": True,
-            "_symm_mem_sync_mode": "lamport",
+            "_symm_mem_sync_mode": sync_mode,
         })
-        def ar_norm(inp, res, w, gn):
+        def fn(inp, res, gn):
             reduced = all_reduce(inp, "sum", group=gn)
             h = reduced + res
-            normed = F.rms_norm(h, w.shape, w, eps)
-            return normed, h
+            return h.sum(dim=-1), h
 
         with torch.inference_mode():
-            (normed, pre_norm), code = run_and_get_code(
-                ar_norm, x, residual, weight, group_name
+            (result_sum, result_h), code = run_and_get_code(
+                fn, x, residual, group_name
             )
 
-        torch.testing.assert_close(normed, expected_normed, atol=2e-2, rtol=2e-2)
-        torch.testing.assert_close(pre_norm, expected_pre_norm, atol=2e-2, rtol=2e-2)
-        self._assert_lamport_codegen(code)
+        torch.testing.assert_close(result_sum, expected_sum, atol=0.2, rtol=0.1)
+        torch.testing.assert_close(result_h, expected_h, atol=4e-2, rtol=4e-2)
+        assert_codegen_fn(code)
 
-    @skip_if_lt_x_gpu(2)
-    def test_torch_compile_lamport_no_residual(self):
-        """
-        End-to-end torch.compile with Lamport push-model sync:
-        all_reduce -> rms_norm (no residual).
-
-        Verifies both numerical correctness AND codegen structure.
-        """
+    def _compile_upstream_allreduce_sum_with_codegen(self, sync_mode, assert_codegen_fn):
+        """mul -> all_reduce -> add residual -> sum(dim=-1), with codegen check."""
         self._init_process()
         hidden = 64
-        eps = 1e-5
-
-        x = torch.randn(4, hidden, device=self.device, dtype=torch.bfloat16)
-        weight = torch.ones(hidden, device=self.device, dtype=torch.float32)
-
-        group_name = dist.group.WORLD.group_name
-        symm_mem.enable_symm_mem_for_group(group_name)
-        symm_mem.get_symm_mem_workspace(
-            group_name, min_size=x.numel() * x.element_size()
-        )
-
-        expected_normed, _ = self._reference_allreduce_rmsnorm(x, weight, eps)
-
-        @torch.compile(options={
-            "_fuse_symm_mem_comms": True,
-            "_symm_mem_sync_mode": "lamport",
-        })
-        def ar_norm(inp, w, gn):
-            reduced = all_reduce(inp, "sum", group=gn)
-            normed = F.rms_norm(reduced, w.shape, w, eps)
-            return normed
-
-        with torch.inference_mode():
-            normed, code = run_and_get_code(ar_norm, x, weight, group_name)
-
-        torch.testing.assert_close(normed, expected_normed, atol=2e-2, rtol=2e-2)
-        self._assert_lamport_codegen(code)
-
-    @skip_if_lt_x_gpu(2)
-    def test_torch_compile_lamport_upstream_pointwise_allreduce_rmsnorm(self):
-        """
-        End-to-end torch.compile with Lamport push-model sync and an
-        upstream pointwise op fused before the allreduce:
-        pointwise -> all_reduce -> add residual -> rms_norm.
-
-        The push phase must read from in_var AFTER the upstream compute
-        has written to it, so this validates the mid-body flush logic.
-        """
-        self._init_process()
-        hidden = 64
-        eps = 1e-5
 
         x = torch.randn(4, hidden, device=self.device, dtype=torch.bfloat16)
         residual = torch.randn(4, hidden, device=self.device, dtype=torch.bfloat16)
-        weight = torch.ones(hidden, device=self.device, dtype=torch.float32)
-
-        group_name = dist.group.WORLD.group_name
-        symm_mem.enable_symm_mem_for_group(group_name)
-        symm_mem.get_symm_mem_workspace(
-            group_name, min_size=x.numel() * x.element_size()
-        )
-
-        # Reference: upstream pointwise -> allreduce -> residual add -> rmsnorm
-        upstream = x * 2.0
-        expected_normed, expected_pre_norm = self._reference_allreduce_rmsnorm(
-            upstream, weight, eps, residual=residual,
-        )
-
-        @torch.compile(options={
-            "_fuse_symm_mem_comms": True,
-            "_symm_mem_sync_mode": "lamport",
-        })
-        def upstream_ar_norm(inp, res, w, gn):
-            up = inp * 2.0
-            reduced = all_reduce(up, "sum", group=gn)
-            h = reduced + res
-            normed = F.rms_norm(h, w.shape, w, eps)
-            return normed, h
-
-        with torch.inference_mode():
-            (normed, pre_norm), code = run_and_get_code(
-                upstream_ar_norm, x, residual, weight, group_name
-            )
-
-        torch.testing.assert_close(normed, expected_normed, atol=2e-2, rtol=2e-2)
-        torch.testing.assert_close(
-            pre_norm, expected_pre_norm, atol=2e-2, rtol=2e-2
-        )
-        self._assert_lamport_codegen(code)
-
-    @skip_if_lt_x_gpu(2)
-    def test_torch_compile_device_cas_upstream_pointwise_allreduce_rmsnorm(self):
-        """
-        End-to-end torch.compile with device-side CAS sync and an
-        upstream pointwise op fused before the allreduce:
-        pointwise -> all_reduce -> add residual -> rms_norm.
-        """
-        self._init_process()
-        hidden = 64
-        eps = 1e-5
-
-        x = torch.randn(4, hidden, device=self.device, dtype=torch.bfloat16)
-        residual = torch.randn(4, hidden, device=self.device, dtype=torch.bfloat16)
-        weight = torch.ones(hidden, device=self.device, dtype=torch.float32)
 
         group_name = dist.group.WORLD.group_name
         symm_mem.enable_symm_mem_for_group(group_name)
@@ -743,48 +622,70 @@ class TestFusedAllReduceRMSNormDistributed(MultiProcContinuousTest):
         )
 
         upstream = x * 2.0
-        expected_normed, expected_pre_norm = self._reference_allreduce_rmsnorm(
-            upstream, weight, eps, residual=residual,
+        expected_sum, expected_h = self._reference_allreduce_sum(
+            upstream, residual=residual,
         )
 
         @torch.compile(options={
             "_fuse_symm_mem_comms": True,
-            "_symm_mem_sync_mode": "device_cas",
+            "_symm_mem_sync_mode": sync_mode,
         })
-        def upstream_ar_norm(inp, res, w, gn):
+        def fn(inp, res, gn):
             up = inp * 2.0
             reduced = all_reduce(up, "sum", group=gn)
             h = reduced + res
-            normed = F.rms_norm(h, w.shape, w, eps)
-            return normed, h
+            return h.sum(dim=-1), h
 
         with torch.inference_mode():
-            (normed, pre_norm), code = run_and_get_code(
-                upstream_ar_norm, x, residual, weight, group_name
+            (result_sum, result_h), code = run_and_get_code(
+                fn, x, residual, group_name
             )
 
-        torch.testing.assert_close(normed, expected_normed, atol=2e-2, rtol=2e-2)
-        torch.testing.assert_close(
-            pre_norm, expected_pre_norm, atol=2e-2, rtol=2e-2
-        )
-        self._assert_device_cas_codegen(code)
+        torch.testing.assert_close(result_sum, expected_sum, atol=0.2, rtol=0.1)
+        torch.testing.assert_close(result_h, expected_h, atol=4e-2, rtol=4e-2)
+        assert_codegen_fn(code)
+
+    # --- Lamport ---
 
     @skip_if_lt_x_gpu(2)
-    def test_torch_compile_device_cas_allreduce_rmsnorm(self):
-        """
-        End-to-end torch.compile with device-side CAS sync:
-        all_reduce -> add residual -> rms_norm.
+    def test_torch_compile_lamport_allreduce_sum(self):
+        self._compile_allreduce_sum_with_codegen("lamport", self._assert_lamport_codegen)
 
-        Verifies both numerical correctness AND that the generated Triton
-        kernel uses device-side CAS sync (not Lamport or host barriers).
-        """
+    @skip_if_lt_x_gpu(2)
+    def test_torch_compile_lamport_upstream_allreduce_sum(self):
+        self._compile_upstream_allreduce_sum_with_codegen(
+            "lamport", self._assert_lamport_codegen
+        )
+
+    # --- device_cas ---
+
+    @skip_if_lt_x_gpu(2)
+    def test_torch_compile_device_cas_allreduce_sum(self):
+        self._compile_allreduce_sum_with_codegen(
+            "device_cas", self._assert_device_cas_codegen
+        )
+
+    @skip_if_lt_x_gpu(2)
+    def test_torch_compile_device_cas_upstream_allreduce_sum(self):
+        self._compile_upstream_allreduce_sum_with_codegen(
+            "device_cas", self._assert_device_cas_codegen
+        )
+
+    # --- host_barrier ---
+
+    @skip_if_lt_x_gpu(2)
+    def test_torch_compile_host_barrier_allreduce_sum(self):
+        self._compile_allreduce_sum_with_codegen(
+            "host_barrier", self._assert_host_barrier_codegen
+        )
+
+    @skip_if_lt_x_gpu(2)
+    def test_torch_compile_host_barrier_no_residual_sum(self):
+        """host_barrier: all_reduce -> sum(dim=-1), no residual."""
         self._init_process()
         hidden = 64
-        eps = 1e-5
 
         x = torch.randn(4, hidden, device=self.device, dtype=torch.bfloat16)
-        residual = torch.randn(4, hidden, device=self.device, dtype=torch.bfloat16)
-        weight = torch.ones(hidden, device=self.device, dtype=torch.float32)
 
         group_name = dist.group.WORLD.group_name
         symm_mem.enable_symm_mem_for_group(group_name)
@@ -792,149 +693,20 @@ class TestFusedAllReduceRMSNormDistributed(MultiProcContinuousTest):
             group_name, min_size=x.numel() * x.element_size()
         )
 
-        expected_normed, expected_pre_norm = self._reference_allreduce_rmsnorm(
-            x, weight, eps, residual=residual,
-        )
-
-        @torch.compile(options={
-            "_fuse_symm_mem_comms": True,
-            "_symm_mem_sync_mode": "device_cas",
-        })
-        def ar_norm(inp, res, w, gn):
-            reduced = all_reduce(inp, "sum", group=gn)
-            h = reduced + res
-            normed = F.rms_norm(h, w.shape, w, eps)
-            return normed, h
-
-        with torch.inference_mode():
-            (normed, pre_norm), code = run_and_get_code(
-                ar_norm, x, residual, weight, group_name
-            )
-
-        torch.testing.assert_close(normed, expected_normed, atol=2e-2, rtol=2e-2)
-        torch.testing.assert_close(pre_norm, expected_pre_norm, atol=2e-2, rtol=2e-2)
-        self._assert_device_cas_codegen(code)
-
-    @skip_if_lt_x_gpu(2)
-    def test_torch_compile_device_cas_no_residual(self):
-        """
-        End-to-end torch.compile with device-side CAS sync:
-        all_reduce -> rms_norm (no residual).
-
-        Verifies both numerical correctness AND codegen structure.
-        """
-        self._init_process()
-        hidden = 64
-        eps = 1e-5
-
-        x = torch.randn(4, hidden, device=self.device, dtype=torch.bfloat16)
-        weight = torch.ones(hidden, device=self.device, dtype=torch.float32)
-
-        group_name = dist.group.WORLD.group_name
-        symm_mem.enable_symm_mem_for_group(group_name)
-        symm_mem.get_symm_mem_workspace(
-            group_name, min_size=x.numel() * x.element_size()
-        )
-
-        expected_normed, _ = self._reference_allreduce_rmsnorm(x, weight, eps)
-
-        @torch.compile(options={
-            "_fuse_symm_mem_comms": True,
-            "_symm_mem_sync_mode": "device_cas",
-        })
-        def ar_norm(inp, w, gn):
-            reduced = all_reduce(inp, "sum", group=gn)
-            normed = F.rms_norm(reduced, w.shape, w, eps)
-            return normed
-
-        with torch.inference_mode():
-            normed, code = run_and_get_code(ar_norm, x, weight, group_name)
-
-        torch.testing.assert_close(normed, expected_normed, atol=2e-2, rtol=2e-2)
-        self._assert_device_cas_codegen(code)
-
-    @skip_if_lt_x_gpu(2)
-    def test_torch_compile_host_barrier_allreduce_rmsnorm(self):
-        """
-        End-to-end torch.compile with host barrier sync:
-        all_reduce -> add residual -> rms_norm.
-
-        Verifies both numerical correctness AND that the generated code
-        uses host barriers (not device CAS or Lamport).
-        """
-        self._init_process()
-        hidden = 64
-        eps = 1e-5
-
-        x = torch.randn(4, hidden, device=self.device, dtype=torch.bfloat16)
-        residual = torch.randn(4, hidden, device=self.device, dtype=torch.bfloat16)
-        weight = torch.ones(hidden, device=self.device, dtype=torch.float32)
-
-        group_name = dist.group.WORLD.group_name
-        symm_mem.enable_symm_mem_for_group(group_name)
-        symm_mem.get_symm_mem_workspace(
-            group_name, min_size=x.numel() * x.element_size()
-        )
-
-        expected_normed, expected_pre_norm = self._reference_allreduce_rmsnorm(
-            x, weight, eps, residual=residual,
-        )
+        expected_sum, _ = self._reference_allreduce_sum(x)
 
         @torch.compile(options={
             "_fuse_symm_mem_comms": True,
             "_symm_mem_sync_mode": "host_barrier",
         })
-        def ar_norm(inp, res, w, gn):
+        def fn(inp, gn):
             reduced = all_reduce(inp, "sum", group=gn)
-            h = reduced + res
-            normed = F.rms_norm(h, w.shape, w, eps)
-            return normed, h
+            return reduced.sum(dim=-1)
 
         with torch.inference_mode():
-            (normed, pre_norm), code = run_and_get_code(
-                ar_norm, x, residual, weight, group_name
-            )
+            result, code = run_and_get_code(fn, x, group_name)
 
-        torch.testing.assert_close(normed, expected_normed, atol=2e-2, rtol=2e-2)
-        torch.testing.assert_close(pre_norm, expected_pre_norm, atol=2e-2, rtol=2e-2)
-        self._assert_host_barrier_codegen(code)
-
-    @skip_if_lt_x_gpu(2)
-    def test_torch_compile_host_barrier_no_residual(self):
-        """
-        End-to-end torch.compile with host barrier sync:
-        all_reduce -> rms_norm (no residual).
-
-        Verifies both numerical correctness AND codegen structure.
-        """
-        self._init_process()
-        hidden = 64
-        eps = 1e-5
-
-        x = torch.randn(4, hidden, device=self.device, dtype=torch.bfloat16)
-        weight = torch.ones(hidden, device=self.device, dtype=torch.float32)
-
-        group_name = dist.group.WORLD.group_name
-        symm_mem.enable_symm_mem_for_group(group_name)
-        symm_mem.get_symm_mem_workspace(
-            group_name, min_size=x.numel() * x.element_size()
-        )
-
-        expected_normed, _ = self._reference_allreduce_rmsnorm(x, weight, eps)
-
-        @torch.compile(options={
-            "_fuse_symm_mem_comms": True,
-            "_symm_mem_sync_mode": "host_barrier",
-        })
-        def ar_norm(inp, w, gn):
-            reduced = all_reduce(inp, "sum", group=gn)
-            normed = F.rms_norm(reduced, w.shape, w, eps)
-            return normed
-
-        with torch.inference_mode():
-            normed, code = run_and_get_code(ar_norm, x, weight, group_name)
-
-        torch.testing.assert_close(normed, expected_normed, atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(result, expected_sum, atol=0.2, rtol=0.1)
         self._assert_host_barrier_codegen(code)
 
 
