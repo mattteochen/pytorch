@@ -306,7 +306,7 @@ def run_native_grouped_mm_v2(layer, hidden_states, topk_weights, topk_ids):
 
 run_native_grouped_mm_v2 = torch.compile(
     run_native_grouped_mm_v2,
-    options={"combo_kernels": True, "max_autotune_gemm": True, "max_autotune_gemm_backends": "TRITON", "triton.enable_pdl": True},
+    options={"combo_kernels": True, "max_autotune_gemm": True, "max_autotune_gemm_backends": "TRITON"},
 )
 # run_native_grouped_mm_v2 = compile_with_debug(
 #     run_native_grouped_mm_v2,
@@ -350,7 +350,7 @@ def run_native_grouped_mm(layer, hidden_states, topk_weights, topk_ids):
     )
 
 # run_native_grouped_mm = compile_with_debug(run_native_grouped_mm, inductor_kwargs={"combo_kernels": True, "max_autotune_gemm": True})
-run_native_grouped_mm = torch.compile(run_native_grouped_mm, options={"combo_kernels": True, "max_autotune_gemm": True, "max_autotune_gemm_backends": "TRITON", "triton.enable_pdl": True})
+run_native_grouped_mm = torch.compile(run_native_grouped_mm, options={"combo_kernels": True, "max_autotune_gemm": True, "max_autotune_gemm_backends": "TRITON"})
 
 
 # ── Synthetic routing ────────────────────────────────────────────────────────

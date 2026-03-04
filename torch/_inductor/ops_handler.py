@@ -230,24 +230,13 @@ class OpsHandler(Generic[T]):
         raise NotImplementedError
 
     def symm_mem_p2p_reduce_load(
-        self,
-        name: str,
-        index: sympy.Expr,
-        world_size: int,
-        group_name: str = "",
-        upstream_val: T | None = None,
+        self, name: str, index: sympy.Expr, world_size: int, group_name: str = ""
     ) -> T:
         """
         Load from all peer symmetric memory buffers at 'index' and sum-reduce.
         Used for P2P allreduce via symmetric memory with kraken device-side sync.
         'name' refers to the original input buffer; the codegen backend is
         responsible for emitting P2P loads from all peer buffers.
-
-        *upstream_val*, when provided, is the register-resident value of the
-        allreduce input at this index (produced by the upstream fused
-        computation). The codegen uses it to initialize the accumulator and
-        push to peers directly, avoiding a stale-buffer read when upstream
-        ops are fused into the same kernel.
         """
         raise NotImplementedError
 
@@ -1132,11 +1121,10 @@ class OpCounterCSE(DefaultHandler):
         return self._update_count(val)
 
     def symm_mem_p2p_reduce_load(
-        self, name: str, index: sympy.Expr, world_size: int, group_name: str = "",
-        upstream_val=None,
+        self, name: str, index: sympy.Expr, world_size: int, group_name: str = ""
     ) -> str:
         val = self.parent_handler.symm_mem_p2p_reduce_load(
-            name, index, world_size, group_name, upstream_val=upstream_val,
+            name, index, world_size, group_name
         )
         if val not in self.var_names:
             self._used_ops.add("symm_mem_p2p_reduce_load")

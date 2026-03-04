@@ -938,59 +938,5 @@ class TestFusedAllReduceRMSNormDistributed(MultiProcContinuousTest):
         self._assert_host_barrier_codegen(code)
 
 
-    @skip_if_lt_x_gpu(2)
-    def test_torch_compile_upstream_fused_allreduce_rmsnorm(self):
-        """
-        End-to-end: upstream matmul + allreduce + add + rms_norm compiled
-        together.  The upstream op fuses into the same kernel as the P2P
-        allreduce, testing that the prologue reads the computed (not stale)
-        buffer.
-        """
-        self._init_process()
-        hidden = 64
-        eps = 1e-5
-
-        x = torch.randn(4, hidden, device=self.device, dtype=torch.bfloat16)
-        weight_proj = torch.randn(
-            hidden, hidden, device=self.device, dtype=torch.bfloat16
-        )
-        residual = torch.randn(4, hidden, device=self.device, dtype=torch.bfloat16)
-        norm_weight = torch.ones(hidden, device=self.device, dtype=torch.float32)
-
-        group_name = dist.group.WORLD.group_name
-        symm_mem.enable_symm_mem_for_group(group_name)
-        symm_mem.get_symm_mem_workspace(
-            group_name, min_size=x.numel() * x.element_size()
-        )
-
-        # Eager reference (no compile, uses NCCL)
-        projected = x @ weight_proj
-        reduced_ref = all_reduce(projected, "sum", group=group_name)
-        h_ref = reduced_ref + residual
-        normed_ref = F.rms_norm(h_ref, norm_weight.shape, norm_weight, eps)
-
-        @torch.compile(options={
-            "_fuse_symm_mem_comms": True,
-            "_symm_mem_sync_mode": "lamport",
-        })
-        def upstream_fused_ar_norm(inp, w_proj, res, nw, gn):
-            proj = inp @ w_proj
-            reduced = all_reduce(proj, "sum", group=gn)
-            h = reduced + res
-            normed = F.rms_norm(h, nw.shape, nw, eps)
-            return normed, h
-
-        with torch.inference_mode():
-            normed, h = upstream_fused_ar_norm(
-                x, weight_proj, residual, norm_weight, group_name
-            )
-
-        # The upstream matmul + P2P allreduce accumulates differently than
-        # NCCL (different float accumulation order), so bf16 precision
-        # requires slightly wider tolerance.
-        torch.testing.assert_close(h, h_ref, atol=5e-2, rtol=5e-2)
-        torch.testing.assert_close(normed, normed_ref, atol=5e-2, rtol=5e-2)
-
-
 if __name__ == "__main__":
     run_tests()

@@ -1358,12 +1358,10 @@ class SimplifyIndexing(V.WrapperHandler):  # type: ignore[name-defined]
         return self._inner.load(name, self._simplify(index))
 
     def symm_mem_p2p_reduce_load(
-        self, name: str, index: sympy.Expr, world_size: int, group_name: str = "",
-        upstream_val=None,
+        self, name: str, index: sympy.Expr, world_size: int, group_name: str = ""
     ):
         return self._inner.symm_mem_p2p_reduce_load(
-            name, self._simplify(index), world_size, group_name,
-            upstream_val=upstream_val,
+            name, self._simplify(index), world_size, group_name
         )
 
     def store(self, name, index, value, mode=None):

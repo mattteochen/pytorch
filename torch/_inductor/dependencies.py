@@ -582,8 +582,7 @@ class _RecordLoadStoreInner(V.MockHandler):  # type: ignore[name-defined]
         self._reads.add(MemoryDep(name, *self.canonicalize(index)))
 
     def symm_mem_p2p_reduce_load(
-        self, name: str, index: sympy.Expr, world_size: int, group_name: str = "",
-        upstream_val=None,
+        self, name: str, index: sympy.Expr, world_size: int, group_name: str = ""
     ) -> None:
         self._reads.add(MemoryDep(name, *self.canonicalize(index)))
 
