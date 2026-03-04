@@ -3835,7 +3835,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         tl_dtype = triton_type(self.symm_mem_input_dtype)
         in_var = self.args.input(self.symm_mem_input_name)
 
-        # --- Push phase: load data, store to all peers, fence, arrive ---
+        load_buffer.writeline(
+            "# ─── Lamport push: load local data, write to every peer's buffer ───"
+        )
         load_buffer.writeline("for _lam_row in tl.static_range(XBLOCK):")
         with load_buffer.indent():
             load_buffer.splice(
@@ -3857,7 +3859,10 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                         f"SYMM_RANK * _lam_chunk + _lam_row_offset + _lam_cols, "
                         f"_lam_data, mask=_lam_mask)"
                     )
-        # --- Clear old buffer slot (before poll, matching FlashInfer order) ---
+
+        load_buffer.writeline(
+            "# ─── Lamport clear: re-arm old triple-buffer slot with sentinels ───"
+        )
         load_buffer.writeline("for _lam_row_c in tl.static_range(XBLOCK):")
         with load_buffer.indent():
             load_buffer.splice(
@@ -3869,14 +3874,18 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 _lamport_clear_old_slot(_lam_clear_base, _lam_row_offset_c, _lam_cols, _lam_mask_c, _lam_chunk, SYMM_RANK, SYMM_WORLD_SIZE, R0_BLOCK)
                 """
             )
+
         load_buffer.splice(
             """
+            # ─── Lamport fence + arrive: make push visible, signal readiness ───
             _lamport_fence_sys()
             _lamport_block_arrive(_lam_meta_i32)
             """
         )
 
-        # --- Poll + accumulate ---
+        load_buffer.writeline(
+            "# ─── Lamport poll + accumulate: wait for peers, sum all shards ─────"
+        )
         load_buffer.writeline(
             f"_symm_acc = tl.load({in_var} + ({indexing.index_str}), "
             f"{indexing.mask_str}, other=0.0).to(tl.float32)"
@@ -5645,8 +5654,12 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 )
         code.splice(
             f"""
-            # --- Lamport prologue: PDL stall + read flag + compute offsets ---
+            # ═══ Lamport prologue ═══════════════════════════════════════════
+            # PDL stall: wait for the previous kernel's gdc_launch_dependents
+            # so CUDA-graph batched replay cannot overrun the 3-slot headroom.
             tl.extra.cuda.gdc_wait()
+
+            # Read triple-buffer flag (volatile) and derive slot offsets.
             _lam_meta_i32 = _lam_meta.to(tl.pointer_type(tl.int32))
             _lam_flag = _lamport_volatile_load_u32(_lam_meta_i32 + 1)
             _lam_chunk = xnumel * r0_numel
@@ -5655,8 +5668,6 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             _lam_clear_offset = ((_lam_flag + 2) % 3) * _lam_slot_elems
             """
         )
-        # Select local buffer from per-peer args (SYMM_RANK is constexpr,
-        # so Triton dead-code-eliminates all non-matching branches).
         for i in range(self.symm_mem_world_size):
             prefix = "if" if i == 0 else "elif"
             code.writeline(f"{prefix} SYMM_RANK == {i}:")
@@ -5670,6 +5681,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             _lam_cols = tl.arange(0, R0_BLOCK)
             _lam_col_mask = _lam_cols < r0_numel
             _lam_n_words = r0_numel // 2
+            # ═══ end prologue ═══════════════════════════════════════════════
             """
         )
 
@@ -5689,9 +5701,12 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         """
         code.splice(
             """
-            # --- Lamport epilogue: advance flag ---
+            # ═══ Lamport epilogue ═══════════════════════════════════════════
+            # Block 0 spins until all blocks have arrived, then advances
+            # the triple-buffer flag: meta[1] = (flag + 1) % 3, meta[0] = 0.
             _lamport_advance_flag_block0(_lam_meta_i32, _lam_flag)
-            # tl.extra.cuda.gdc_launch_dependents() # Relying on Inductor to emit this
+            # gdc_launch_dependents is emitted by Inductor PDL codegen
+            # ═══ end epilogue ═══════════════════════════════════════════════
             """
         )
 
