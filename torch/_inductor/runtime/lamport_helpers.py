@@ -1,15 +1,8 @@
 """
-Runtime helpers for Lamport push-model P2P allreduce in inductor-generated
-Triton kernels.
+Lamport push-model P2P allreduce helpers for inductor-generated Triton kernels.
 
-Provides:
-  - @triton.jit helper functions for the Lamport sentinel protocol
-    (push to peers, volatile poll, fence, sentinel clear)
-  - Python workspace management (triple-buffered symmetric memory)
-  - Iteration tracking for buffer rotation
-
-The codegen emits imports from this module and calls the JIT helpers
-inside the generated kernel, plus the Python helpers in the wrapper.
+@triton.jit helpers for the sentinel protocol (push, volatile poll, fence,
+clear) and Python workspace management (triple-buffered symmetric memory).
 """
 
 from __future__ import annotations
@@ -33,7 +26,6 @@ _NEG_ZERO = tl.constexpr(0x8000)
 
 @triton.jit
 def _fence_sys():
-    """System-scope fence ensuring all prior stores are visible to all GPUs."""
     tl.inline_asm_elementwise(
         "fence.sc.sys;",
         "=r",
@@ -46,14 +38,8 @@ def _fence_sys():
 
 @triton.jit
 def _fence_acquire_sys():
-    """System-scope acquire fence pairing with writer's fence.sc.sys (release).
-
-    Must be called after polling volatile sentinel loads and before reading
-    the actual data via regular (non-volatile) loads. Without this, the GPU
-    may serve subsequent tl.load from stale L2 cache entries — the sentinel
-    word propagated via NVLink but the data words may not yet be visible
-    to non-volatile loads.
-    """
+    # Pairs with writer's fence.sc.sys; needed after sentinel poll before
+    # non-volatile data loads to prevent stale L2 cache hits.
     tl.inline_asm_elementwise(
         "fence.acquire.sys;",
         "=r",
@@ -66,7 +52,6 @@ def _fence_acquire_sys():
 
 @triton.jit
 def _volatile_load_u32_scalar(addr):
-    """Single scalar volatile load bypassing L1 cache."""
     return tl.inline_asm_elementwise(
         "ld.volatile.global.b32 $0, [$1];",
         "=r, l",
@@ -79,18 +64,12 @@ def _volatile_load_u32_scalar(addr):
 
 @triton.jit
 def _remove_neg_zero(val):
-    """Replace bf16 -0.0 with +0.0 so real data never matches sentinel."""
     bits = val.to(tl.uint16, bitcast=True)
     return tl.where(bits == _NEG_ZERO, tl.zeros_like(val), val)
 
 
 @triton.jit
 def _poll_last_word(slot_u32_ptr, n_words):
-    """Spin on the last u32 word of a slot until it contains no sentinel.
-
-    Since the writer stores sequentially with a system fence, if the
-    last word is ready, all prior words are guaranteed visible.
-    """
     last_addr = slot_u32_ptr + (n_words - 1)
     ready = tl.full([], 0, dtype=tl.int32)
     while ready == 0:
@@ -117,10 +96,6 @@ def _lamport_push_to_peers(
     RANK: tl.constexpr,
     WORLD_SIZE: tl.constexpr,
 ):
-    """Push local data to all peers' symmetric memory buffers.
-
-    ``buf_ptrs_u64`` must be pre-cast: ``buf_ptrs.to(pointer_type(uint64))``.
-    """
     for peer in tl.static_range(WORLD_SIZE):
         if peer != RANK:
             peer_buf = tl.load(buf_ptrs_u64 + peer).to(tl.pointer_type(tl.bfloat16))
@@ -142,10 +117,6 @@ def _lamport_poll_and_reduce(
     WORLD_SIZE: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    """Poll own local buffer for all peers' data, accumulate into fp32.
-
-    ``my_buf_base`` must be pre-computed: ``my_buf + buf_offset``.
-    """
     acc = tl.zeros([BLOCK_N], dtype=tl.float32)
     for peer in tl.static_range(WORLD_SIZE):
         slot_bf16 = my_buf_base + peer * chunk + row_offset
@@ -168,11 +139,6 @@ def _lamport_poll_rows(
     XBLOCK: tl.constexpr,
     xnumel,
 ):
-    """Poll sentinel words for all rows in the XBLOCK tile, non-self peers.
-
-    Ends with fence.acquire.sys to pair with the writer's fence.sc.sys,
-    ensuring subsequent non-volatile data loads see the writer's stores.
-    """
     for row in tl.static_range(XBLOCK):
         row_idx = x_base + row
         if row_idx < xnumel:
@@ -197,12 +163,7 @@ def _lamport_poll_all_peers(
     XBLOCK: tl.constexpr,
     xnumel,
 ):
-    """Poll all non-self peers simultaneously per row, overlapping latency.
-
-    Instead of sequential per-peer spin loops, uses a single while-loop
-    that checks all peers each iteration, breaking when all are ready.
-    Ends with fence.acquire.sys for the same reason as _lamport_poll_rows.
-    """
+    # Simultaneous poll: single while-loop checks all non-self peers per row.
     for row in tl.static_range(XBLOCK):
         row_idx = x_base + row
         if row_idx < xnumel:
@@ -237,10 +198,6 @@ def _lamport_clear_old_slot(
     WORLD_SIZE: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    """Write -0.0 sentinels to the old buffer slot (from 2 iterations ago).
-
-    ``clear_base`` must be pre-computed: ``my_buf + clear_offset``.
-    """
     neg_zero = tl.full([BLOCK_N], _NEG_ZERO, dtype=tl.uint16).to(
         tl.bfloat16, bitcast=True
     )
@@ -259,23 +216,13 @@ def _lamport_clear_old_slot(
 
 @triton.jit
 def _lamport_block_arrive(meta_i32_ptr):
-    """Signal this block has read the flag and finished its push phase.
-
-    Syncs threads within the block, then atomically increments the block
-    counter in ``meta[0]``.  Device-scope atomic (same-GPU, cheap).
-    """
     tl.debug_barrier()
     tl.atomic_add(meta_i32_ptr, 1, sem="release", scope="gpu")
 
 
 @triton.jit
 def _lamport_advance_flag_block0(meta_i32_ptr, flag_value):
-    """Block 0 only: wait for all blocks to arrive, advance flag, reset.
-
-    Spins on ``meta[0]`` (block counter) via volatile load until it
-    equals ``gridDim.x``.  Then stores ``(flag + 1) % 3`` to
-    ``meta[1]`` and resets ``meta[0]`` to 0.
-    """
+    # Block 0: spin on meta[0] until all blocks arrived, advance meta[1], reset.
     if tl.program_id(0) == 0:
         _lam_expected = tl.num_programs(0)
         _lam_ready = tl.full([], 0, dtype=tl.int32)
@@ -297,20 +244,10 @@ def lamport_workspace_setup(
     input_tensor: torch.Tensor,
     group_name: str,
 ) -> tuple[torch.Tensor, int, int, torch.Tensor]:
-    """
-    Allocate (or retrieve cached) triple-buffered symmetric memory workspace
-    and a GPU-resident metadata tensor for in-kernel flag advancement.
+    """Allocate (or retrieve cached) triple-buffered workspace + metadata.
 
-    Returns ``(buf_ptrs, rank, world_size, meta_tensor)``.
-
-    ``meta_tensor`` is a ``[2]`` int32 CUDA tensor:
-      - ``meta[0]``: block counter (for intra-GPU block synchronization)
-      - ``meta[1]``: flag value (triple-buffer index: 0, 1, or 2)
-
-    The kernel reads the flag at the start, advances it at the end
-    (block 0 only), and resets the counter — all inside the kernel.
-    Zero wrapper GPU ops.  CUDA-graph-safe because the kernel always
-    reads/writes the same addresses; values change between replays.
+    Returns (buf_ptrs, rank, world_size, meta_tensor).
+    meta is int32[2]: [block_counter, flag_value]. Updated in-kernel only.
     """
     key = group_name
     if key in _lamport_cache:
@@ -368,14 +305,7 @@ def lamport_workspace_peer_bufs(
     input_tensor: torch.Tensor,
     group_name: str,
 ) -> tuple[list[torch.Tensor], int, int, torch.Tensor]:
-    """
-    Return per-peer tensor views of the triple-buffered Lamport workspace.
-
-    Each view covers the full workspace (3 * world_size * chunk elements)
-    as a 1D bfloat16 tensor backed by peer i's symmetric memory.
-
-    Returns ``(peer_bufs, rank, world_size, meta_tensor)``.
-    """
+    """Return per-peer tensor views of the triple-buffered workspace."""
     _buf_ptrs, rank, world_size, meta = lamport_workspace_setup(
         input_tensor, group_name
     )

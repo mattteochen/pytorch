@@ -3456,14 +3456,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         launch_buffer.writeline(self.GDC_LAUNCH)
 
     def _filter_pdl(self, code: IndentedBuffer):
-        # Deduplicate PDL markers: keep the first gdc_wait and the last
-        # gdc_launch_dependents (in-place, after the last load).
-        #
-        # For Lamport kernels, strip all gdc_wait from
-        # the body — the Lamport prologue emits its own authoritative wait.
-        # Launches are never stripped: every kernel must call
-        # gdc_launch_dependents so that the next kernel's gdc_wait
-        # (including the Lamport prologue's) doesn't stall.
+        # Keep first gdc_wait + last gdc_launch_dependents (in-place).
+        # Lamport kernels: strip all waits (prologue has its own).
         strip_wait = self.has_symm_mem_p2p and self._symm_mem_use_lamport
         new_lines = []
         has_wait = False
@@ -3681,17 +3675,6 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         world_size: int,
         group_name: str = "",
     ) -> TritonCSEVariable:
-        """
-        Generate a P2P reduce load: sum values from all peer symmetric memory
-        buffers.
-
-        In pull mode (host_barrier / device_cas), each rank reads from all
-        peers' symmetric memory buffers over NVLink.
-
-        In Lamport push mode, the prologue already pushed data to all peers'
-        local buffers.  This method polls via ``_lamport_poll_all_peers`` then
-        accumulates from the local buffer using 2D-native indexing.
-        """
         self.has_symm_mem_p2p = True
         self.symm_mem_world_size = world_size
         self.symm_mem_input_name = name
@@ -3772,16 +3755,6 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
     def _codegen_pull_reduce_load(
         self, load_buffer, indexing, shape_str: str
     ) -> None:
-        """Emit pull-model P2P reduce: copy to symm buf + sync + accumulate.
-
-        The copy (``in_var`` → ``_symm_local_buf``) and device-side sync
-        are emitted here — inside the body — rather than in the prologue,
-        so that any upstream pointwise ops fused into the same kernel
-        have already written ``in_var`` by the time the copy reads it.
-
-        Uses ``_symm_local_buf``, ``_symm_x_base``, ``_symm_cols``,
-        ``_symm_col_mask`` from the prologue setup.
-        """
         in_var = self.args.input(self.symm_mem_input_name)
 
         if (
@@ -3820,18 +3793,6 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
     def _codegen_lamport_reduce_load(
         self, load_buffer, indexing, shape_str: str
     ) -> None:
-        """Emit Lamport push-model reduce: push + fence + arrive + poll + accumulate.
-
-        The push phase (load from ``in_var``, store to all peers, fence,
-        block_arrive) is emitted here — inside the body — rather than in
-        the prologue, so that any upstream pointwise ops fused into the
-        same kernel have already written ``in_var`` by the time the push
-        reads it.
-
-        Uses ``_lam_my_buf_base``, ``_lam_x_base``, ``_lam_chunk``,
-        ``_lam_n_words``, ``_lam_buf_offset``, ``_lam_cols``,
-        ``_lam_col_mask``, ``_lam_meta_i32`` from the prologue.
-        """
         tl_dtype = triton_type(self.symm_mem_input_dtype)
         in_var = self.args.input(self.symm_mem_input_name)
 
@@ -5621,19 +5582,6 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         )
 
     def _codegen_lamport_prologue(self, code: IndentedBuffer) -> None:
-        """
-        Emit the Lamport setup prologue: read flag from metadata via
-        volatile load, compute offsets, pre-compute shared pointers.
-
-        The push phase (load data, store to peers, fence, block_arrive)
-        is deferred to ``_codegen_lamport_reduce_load`` so that upstream
-        pointwise ops fused into the same kernel have a chance to write
-        ``in_var`` before the push reads it.
-
-        Variables prefixed with ``_lam_`` are set here and reused by the
-        body (``_codegen_lamport_reduce_load``) and epilogue
-        (``_codegen_lamport_epilogue``), avoiding redundant computation.
-        """
         assert self.symm_mem_input_name is not None
         assert self.symm_mem_input_dtype is not None
         elem_bytes = torch.tensor([], dtype=self.symm_mem_input_dtype).element_size()
@@ -5686,19 +5634,6 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         )
 
     def _codegen_lamport_epilogue(self, code: IndentedBuffer) -> None:
-        """
-        Emit the Lamport epilogue: advance the triple-buffer flag.
-
-        The old-slot clear has already been done in the body (before the
-        poll), matching FlashInfer's push → clear → poll order.
-
-        Reuses ``_lam_meta_i32``, ``_lam_flag`` from the prologue.
-
-        Flag advancement (FlashInfer-style): block 0 spins on the
-        block counter until all blocks have arrived, then advances
-        ``meta[1] = (flag + 1) % 3`` and resets ``meta[0] = 0``.
-        Zero wrapper GPU ops.
-        """
         code.splice(
             """
             # ═══ Lamport epilogue ═══════════════════════════════════════════
@@ -6321,10 +6256,6 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             self.deallocate_workspaces()
 
     def _emit_symm_mem_setup(self, wrapper, call_args: list) -> None:
-        """
-        Emit wrapper code that sets up symmetric memory per-peer tensor
-        views and appends them to *call_args*.  (Device-side CAS path.)
-        """
         in_var = self._resolve_symm_mem_input_wrapper_name()
 
         wrapper.imports.writeline(
@@ -6340,11 +6271,6 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         call_args.append("_symm_signal_pad_ptrs")
 
     def _emit_symm_mem_host_barrier_setup(self, wrapper, call_args: list) -> None:
-        """
-        Emit wrapper code for host-barrier mode: copy input to symmetric
-        memory workspace, pre-kernel barrier, and append per-peer tensor
-        views to *call_args*.
-        """
         in_var = self._resolve_symm_mem_input_wrapper_name()
 
         skip_copy = "True" if config._symm_mem_skip_prologue_copy else "False"
@@ -6363,17 +6289,10 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             call_args.append(f"_symm_peer_bufs[{i}]")
 
     def _emit_symm_mem_host_barrier_epilogue(self, wrapper) -> None:
-        """Emit post-kernel host-side barrier in the wrapper."""
         wrapper.writeline(f'symm_mem_host_barrier("{self._symm_group_name}")')
 
     def _resolve_symm_mem_input_wrapper_name(self) -> str:
-        """Resolve the wrapper-level variable name for the allreduce input.
-
-        When buffer reuse renames the intermediate (e.g. ``buf13 = buf12;
-        del buf12``), the raw ``self.symm_mem_input_name`` (``buf12``) is
-        stale.  Inplace buffers track the rename chain via ``other_names``;
-        the last entry is the current wrapper-level name.
-        """
+        # Inplace buffer reuse can rename the intermediate; follow the chain.
         name = self.symm_mem_input_name
         assert name is not None
         inplaced = self.args.inplace_buffers.get(name)
@@ -6382,13 +6301,6 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         return name
 
     def _emit_lamport_setup(self, wrapper, call_args: list) -> None:
-        """
-        Emit wrapper code for Lamport push-model mode: allocate triple-
-        buffered workspace, append per-peer tensor views to call_args.
-
-        Zero wrapper GPU ops — the kernel reads the flag, advances it,
-        and resets the block counter entirely in-kernel (FlashInfer-style).
-        """
         in_var = self._resolve_symm_mem_input_wrapper_name()
 
         wrapper.imports.writeline(
