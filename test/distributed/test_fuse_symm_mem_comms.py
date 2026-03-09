@@ -573,7 +573,9 @@ class TestFusedAllReduceRMSNormDistributed(MultiProcContinuousTest):
         self.assertNotIn("_lamport_poll_all_peers", code,
                           "Kernel should NOT use Lamport reduce")
 
-    def _compile_allreduce_sum_with_codegen(self, sync_mode, assert_codegen_fn):
+    def _compile_allreduce_sum_with_codegen(
+        self, sync_mode, assert_codegen_fn, extra_options=None
+    ):
         """all_reduce -> add residual -> sum(dim=-1), with codegen check."""
         self._init_process()
         hidden = 64
@@ -589,10 +591,14 @@ class TestFusedAllReduceRMSNormDistributed(MultiProcContinuousTest):
 
         expected_sum, expected_h = self._reference_allreduce_sum(x, residual=residual)
 
-        @torch.compile(options={
+        compile_options = {
             "_fuse_symm_mem_comms": True,
             "_symm_mem_sync_mode": sync_mode,
-        })
+        }
+        if extra_options:
+            compile_options.update(extra_options)
+
+        @torch.compile(options=compile_options)
         def fn(inp, res, gn):
             reduced = all_reduce(inp, "sum", group=gn)
             h = reduced + res
@@ -607,7 +613,9 @@ class TestFusedAllReduceRMSNormDistributed(MultiProcContinuousTest):
         torch.testing.assert_close(result_h, expected_h, atol=4e-2, rtol=4e-2)
         assert_codegen_fn(code)
 
-    def _compile_upstream_allreduce_sum_with_codegen(self, sync_mode, assert_codegen_fn):
+    def _compile_upstream_allreduce_sum_with_codegen(
+        self, sync_mode, assert_codegen_fn, extra_options=None
+    ):
         """mul -> all_reduce -> add residual -> sum(dim=-1), with codegen check."""
         self._init_process()
         hidden = 64
@@ -626,10 +634,14 @@ class TestFusedAllReduceRMSNormDistributed(MultiProcContinuousTest):
             upstream, residual=residual,
         )
 
-        @torch.compile(options={
+        compile_options = {
             "_fuse_symm_mem_comms": True,
             "_symm_mem_sync_mode": sync_mode,
-        })
+        }
+        if extra_options:
+            compile_options.update(extra_options)
+
+        @torch.compile(options=compile_options)
         def fn(inp, res, gn):
             up = inp * 2.0
             reduced = all_reduce(up, "sum", group=gn)
@@ -682,10 +694,26 @@ class TestFusedAllReduceRMSNormDistributed(MultiProcContinuousTest):
         self.assertIn("_2shot_col_mask", code,
                        "Kernel should mask columns to local rank's chunk")
 
+    def _assert_device_cas_2_shot_grid_cap_codegen(self, code_list):
+        self._assert_device_cas_2_shot_codegen(code_list)
+        code = "\n".join(code_list)
+        self.assertEqual(code.count("for _x_tile in range("), 3)
+        self.assertEqual(
+            code.count("_symm_x_base = _x_tile.to(tl.int64) * XBLOCK"), 3
+        )
+
     @skip_if_lt_x_gpu(2)
     def test_torch_compile_device_cas_2_shot_allreduce_sum(self):
         self._compile_allreduce_sum_with_codegen(
             "device_cas_2_shot", self._assert_device_cas_2_shot_codegen
+        )
+
+    @skip_if_lt_x_gpu(2)
+    def test_torch_compile_device_cas_2_shot_grid_cap_allreduce_sum(self):
+        self._compile_allreduce_sum_with_codegen(
+            "device_cas_2_shot",
+            self._assert_device_cas_2_shot_grid_cap_codegen,
+            {"_symm_mem_grid_cap": 2},
         )
 
     @skip_if_lt_x_gpu(2)

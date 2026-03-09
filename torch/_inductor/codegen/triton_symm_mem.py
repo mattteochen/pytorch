@@ -21,6 +21,13 @@ if TYPE_CHECKING:
     from .triton import TritonCSEVariable, TritonKernel
 
 
+_TWO_SHOT_COPY_BEGIN = "# --- symm mem two-shot copy begin ---"
+_TWO_SHOT_COPY_END = "# --- symm mem two-shot copy end ---"
+_TWO_SHOT_REDUCE_BEGIN = "# --- symm mem two-shot reduce begin ---"
+_TWO_SHOT_REDUCE_END = "# --- symm mem two-shot reduce end ---"
+_TWO_SHOT_TAIL_BEGIN = "# --- symm mem two-shot tail begin ---"
+
+
 def _triton_type(dtype):
     from ..utils import triton_type
 
@@ -180,11 +187,14 @@ def _codegen_two_shot_reduce_load(kernel, load_buffer, indexing, shape_str: str)
     buffer.  Requires r0_numel % SYMM_WORLD_SIZE == 0.
     """
     in_var = kernel.args.input(kernel.symm_mem_input_name)
+    use_grid_cap = config._symm_mem_grid_cap > 0
 
     if (
         not config._symm_mem_skip_prologue_copy
         and not kernel._symm_mem_use_host_barriers
     ):
+        if use_grid_cap:
+            load_buffer.writeline(_TWO_SHOT_COPY_BEGIN)
         load_buffer.splice(
             f"""
             for _symm_row in tl.static_range(XBLOCK):
@@ -196,17 +206,25 @@ def _codegen_two_shot_reduce_load(kernel, load_buffer, indexing, shape_str: str)
                 tl.store(_symm_local_buf + _symm_idx, _symm_val, _symm_mask)
             """
         )
+        if use_grid_cap:
+            load_buffer.writeline(_TWO_SHOT_COPY_END)
         load_buffer.writeline(
             "_symm_mem_sync(symm_signal_pad_ptrs, None, SYMM_RANK, "
             "SYMM_WORLD_SIZE, hasPreviousMemAccess=True, "
             "hasSubsequentMemAccess=True)"
         )
 
+    # Reduce-scatter: each rank works on its column chunk using a
+    # chunk-sized arange (R0_BLOCK // SYMM_WORLD_SIZE) rather than the
+    # full R0_BLOCK, avoiding wasted vector lanes.
+    if use_grid_cap:
+        load_buffer.writeline(_TWO_SHOT_REDUCE_BEGIN)
     load_buffer.splice(
         """
         _2shot_chunk = r0_numel // SYMM_WORLD_SIZE
-        _2shot_start = SYMM_RANK * _2shot_chunk
-        _2shot_col_mask = (_symm_cols >= _2shot_start) & (_symm_cols < (_2shot_start + _2shot_chunk))
+        _2shot_cols = tl.arange(0, R0_BLOCK // SYMM_WORLD_SIZE)
+        _2shot_col_mask = _2shot_cols < _2shot_chunk
+        _2shot_col_start = SYMM_RANK * _2shot_chunk
         """
     )
 
@@ -216,9 +234,9 @@ def _codegen_two_shot_reduce_load(kernel, load_buffer, indexing, shape_str: str)
             """
             _2shot_row_idx = _symm_x_base + _2shot_row
             _2shot_row_mask = _2shot_row_idx < xnumel
-            _2shot_idx = _2shot_row_idx * r0_numel + _symm_cols
+            _2shot_idx = _2shot_row_idx * r0_numel + _2shot_col_start + _2shot_cols
             _2shot_mask = _2shot_col_mask & _2shot_row_mask
-            _2shot_acc = tl.zeros([R0_BLOCK], dtype=tl.float32)
+            _2shot_acc = tl.zeros([R0_BLOCK // SYMM_WORLD_SIZE], dtype=tl.float32)
             """
         )
         for i in range(kernel.symm_mem_world_size):
@@ -233,12 +251,16 @@ def _codegen_two_shot_reduce_load(kernel, load_buffer, indexing, shape_str: str)
                 f"_2shot_acc, _2shot_mask)"
             )
 
+    if use_grid_cap:
+        load_buffer.writeline(_TWO_SHOT_REDUCE_END)
     load_buffer.writeline(
         "_symm_mem_sync(symm_signal_pad_ptrs, None, SYMM_RANK, "
         "SYMM_WORLD_SIZE, hasPreviousMemAccess=True, "
         "hasSubsequentMemAccess=True)"
     )
 
+    if use_grid_cap:
+        load_buffer.writeline(_TWO_SHOT_TAIL_BEGIN)
     load_buffer.writeline(
         f"_symm_acc = tl.load("
         f"_symm_local_buf + ({indexing.index_str}), "
@@ -443,9 +465,7 @@ def codegen_lamport_epilogue(kernel, code):
 # ------------------------------------------------------------------
 
 
-def codegen_grid_stride_body(kernel, code):
-    body_text = kernel.body.getvalue()
-
+def _rewrite_xoffset_for_grid_stride(body_text: str) -> str:
     new_body_text = re.sub(
         r"xoffset = tl\.program_id\(0\)(?:\.to\(tl\.int64\))? \* XBLOCK",
         "xoffset = _x_tile.to(tl.int64) * XBLOCK",
@@ -455,13 +475,61 @@ def codegen_grid_stride_body(kernel, code):
         "Grid-stride body rewrite failed: could not find "
         "'xoffset = tl.program_id(0) * XBLOCK' in kernel body"
     )
+    return new_body_text
 
+
+def _codegen_grid_stride_loop(code, body_text: str):
     code.writeline(
         "for _x_tile in range(tl.program_id(0), tl.cdiv(xnumel, XBLOCK), "
         "tl.num_programs(0)):"
     )
     with code.indent():
-        code.splice(new_body_text)
+        code.writeline("_symm_x_base = _x_tile.to(tl.int64) * XBLOCK")
+        code.splice(body_text)
+
+
+def _extract_two_shot_grid_phases(
+    body_text: str,
+) -> tuple[str, str | None, str, str]:
+    if _TWO_SHOT_COPY_BEGIN in body_text:
+        common_prefix, rest = body_text.split(_TWO_SHOT_COPY_BEGIN, 1)
+        copy_phase, rest = rest.split(_TWO_SHOT_COPY_END, 1)
+        _, rest = rest.split(_TWO_SHOT_REDUCE_BEGIN, 1)
+    else:
+        common_prefix, rest = body_text.split(_TWO_SHOT_REDUCE_BEGIN, 1)
+        copy_phase = None
+    reduce_phase, rest = rest.split(_TWO_SHOT_REDUCE_END, 1)
+    _, tail = rest.split(_TWO_SHOT_TAIL_BEGIN, 1)
+    return common_prefix, copy_phase, reduce_phase, tail
+
+
+def codegen_grid_stride_body(kernel, code):
+    _codegen_grid_stride_loop(
+        code, _rewrite_xoffset_for_grid_stride(kernel.body.getvalue())
+    )
+
+
+def codegen_two_shot_grid_stride_body(kernel, code):
+    common_prefix, copy_phase, reduce_phase, tail = _extract_two_shot_grid_phases(
+        kernel.body.getvalue()
+    )
+    compute_body = _rewrite_xoffset_for_grid_stride(common_prefix + tail)
+
+    if copy_phase is not None:
+        _codegen_grid_stride_loop(code, copy_phase)
+        code.writeline(
+            "_symm_mem_sync(symm_signal_pad_ptrs, None, SYMM_RANK, "
+            "SYMM_WORLD_SIZE, hasPreviousMemAccess=True, "
+            "hasSubsequentMemAccess=True)"
+        )
+
+    _codegen_grid_stride_loop(code, reduce_phase)
+    code.writeline(
+        "_symm_mem_sync(symm_signal_pad_ptrs, None, SYMM_RANK, "
+        "SYMM_WORLD_SIZE, hasPreviousMemAccess=True, "
+        "hasSubsequentMemAccess=True)"
+    )
+    _codegen_grid_stride_loop(code, compute_body)
 
 
 # ------------------------------------------------------------------

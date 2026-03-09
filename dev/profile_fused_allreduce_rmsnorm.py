@@ -10,6 +10,7 @@ Profiles variants:
   3b. compiled_host_barrier – compiled + forced host barriers
   3c. compiled_gridcap36 – compiled + device CAS + grid cap at 36 CTAs
   3d. compiled_lamport   – compiled + Lamport push-model (zero barriers, inductor codegen)
+  3e. compiled_2shot     – compiled + two-shot reduce-scatter+allgather (device CAS sync)
   4. compiled_plain      – torch.compile default settings (no fused allreduce+rmsnorm option)
   5. compiled_mempool    – compiled + mempool zero-copy (matmul → symm mem, single kernel)
   6. mempool             – mem pool zero-copy with handwritten kernel (host-side barriers)
@@ -479,7 +480,7 @@ def main():
                 h = reduced + residual
                 normed = F.rms_norm(h, weight.shape, weight, eps_val)
                 return normed, h
-            return compile_with_debug(_fn, inductor_kwargs={
+            return torch.compile(_fn, options={
                 "_fuse_symm_mem_comms": True,
                 "_symm_mem_sync_mode": "lamport",
             })
@@ -504,6 +505,44 @@ def main():
                     timer_mode=timer_mode,
                 ),
                 lamport_ok,
+            )
+        )
+
+        # --- Variant 3e: compiled + two-shot reduce-scatter+allgather ---
+        def _make_2shot_ar_norm(eps_val):
+            def _fn(x, residual, weight, group_name):
+                reduced = funcol.all_reduce(x, "sum", group_name)
+                h = reduced + residual
+                normed = F.rms_norm(h, weight.shape, weight, eps_val)
+                return normed, h
+            return torch.compile(_fn, options={
+                "_fuse_symm_mem_comms": True,
+                "_fuse_symm_mem_comms_max_bytes": 0,
+                "_symm_mem_sync_mode": "device_cas_2_shot",
+                "_symm_mem_grid_cap": 128,
+                "trace.enabled": True,
+            })
+
+        ar_norm_2shot = _make_2shot_ar_norm(EPS)
+
+        def compiled_2shot_call():
+            h = x
+            return ar_norm_2shot(h, residual, weight, group_name)
+
+        two_shot_ok = _check_correctness(compiled_2shot_call, ref_normed, "compiled_2shot")
+        results.append(
+            (
+                "compiled_2shot",
+                _profile(
+                    "compiled_2shot",
+                    compiled_2shot_call,
+                    rank,
+                    warmup=WARMUP_ITERS + 5,
+                    cuda_graph=True,
+                    nsys_mode=nsys_mode,
+                    timer_mode=timer_mode,
+                ),
+                two_shot_ok,
             )
         )
 
@@ -740,7 +779,7 @@ def main():
                     scale_out=None,
                     layout_code=None,
                     scale_factor=None,
-                    use_oneshot=True,
+                    use_oneshot=None,
                     world_rank=rank,
                     world_size=dist.get_world_size(),
                     launch_with_pdl=True,

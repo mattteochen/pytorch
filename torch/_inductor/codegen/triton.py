@@ -5766,7 +5766,10 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 and not self._symm_mem_use_lamport
                 and config._symm_mem_grid_cap > 0
             ):
-                _symm_mem.codegen_grid_stride_body(self, code)
+                if config._symm_mem_sync_mode == "device_cas_2_shot":
+                    _symm_mem.codegen_two_shot_grid_stride_body(self, code)
+                else:
+                    _symm_mem.codegen_grid_stride_body(self, code)
             else:
                 code.splice(self.body)
             if self.has_symm_mem_p2p and self._symm_mem_use_lamport:
