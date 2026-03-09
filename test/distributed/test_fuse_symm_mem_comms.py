@@ -701,6 +701,13 @@ class TestFusedAllReduceRMSNormDistributed(MultiProcContinuousTest):
         self.assertEqual(
             code.count("_symm_x_base = _x_tile.to(tl.int64) * XBLOCK"), 3
         )
+        self.assertNotIn(
+            "_symm_x_base = tl.program_id(0).to(tl.int64) * XBLOCK", code
+        )
+        self.assertIn("\n    _2shot_chunk = r0_numel // SYMM_WORLD_SIZE", code)
+        self.assertNotIn("\n        _2shot_chunk = r0_numel // SYMM_WORLD_SIZE", code)
+        self.assertIn("\n    r0_index = tl.arange(0, R0_BLOCK)[None, :]", code)
+        self.assertNotIn("\n        r0_index = tl.arange(0, R0_BLOCK)[None, :]", code)
 
     @skip_if_lt_x_gpu(2)
     def test_torch_compile_device_cas_2_shot_allreduce_sum(self):

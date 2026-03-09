@@ -375,9 +375,10 @@ def codegen_symm_mem_prologue(kernel, code):
         with code.indent():
             code.writeline(f"_symm_local_buf = symm_peer_buf_{i}")
 
+    if config._symm_mem_grid_cap <= 0:
+        code.writeline("_symm_x_base = tl.program_id(0).to(tl.int64) * XBLOCK")
     code.splice(
         """
-        _symm_x_base = tl.program_id(0).to(tl.int64) * XBLOCK
         _symm_cols = tl.arange(0, R0_BLOCK)
         _symm_col_mask = _symm_cols < r0_numel
         """
@@ -503,6 +504,35 @@ def _extract_two_shot_grid_phases(
     return common_prefix, copy_phase, reduce_phase, tail
 
 
+def _split_two_shot_reduce_phase(reduce_phase: str) -> tuple[str, str]:
+    reduce_loop = "for _2shot_row in tl.static_range(XBLOCK):"
+    reduce_preheader, reduce_body = reduce_phase.split(reduce_loop, 1)
+    return reduce_preheader, f"{reduce_loop}{reduce_body}"
+
+
+def _split_x_tile_setup(common_prefix: str) -> tuple[str, str]:
+    invariant_lines = []
+    x_tile_lines = []
+    found_xoffset = False
+
+    for line in common_prefix.splitlines(keepends=True):
+        stripped = line.lstrip()
+        if stripped.startswith(("xoffset = ", "xindex = ", "xmask = ", "x0 = ")):
+            x_tile_lines.append(line)
+            if stripped.startswith("xoffset = "):
+                found_xoffset = True
+        else:
+            invariant_lines.append(line)
+
+    assert found_xoffset, (
+        "Grid-stride x-tile setup split failed: could not find "
+        "'xoffset = ...' in kernel body prefix"
+    )
+    return "".join(invariant_lines), _rewrite_xoffset_for_grid_stride(
+        "".join(x_tile_lines)
+    )
+
+
 def codegen_grid_stride_body(kernel, code):
     _codegen_grid_stride_loop(
         code, _rewrite_xoffset_for_grid_stride(kernel.body.getvalue())
@@ -513,7 +543,8 @@ def codegen_two_shot_grid_stride_body(kernel, code):
     common_prefix, copy_phase, reduce_phase, tail = _extract_two_shot_grid_phases(
         kernel.body.getvalue()
     )
-    compute_body = _rewrite_xoffset_for_grid_stride(common_prefix + tail)
+    reduce_preheader, reduce_body = _split_two_shot_reduce_phase(reduce_phase)
+    compute_preheader, x_tile_setup = _split_x_tile_setup(common_prefix)
 
     if copy_phase is not None:
         _codegen_grid_stride_loop(code, copy_phase)
@@ -523,13 +554,17 @@ def codegen_two_shot_grid_stride_body(kernel, code):
             "hasSubsequentMemAccess=True)"
         )
 
-    _codegen_grid_stride_loop(code, reduce_phase)
+    if reduce_preheader.strip():
+        code.splice(reduce_preheader)
+    _codegen_grid_stride_loop(code, reduce_body)
     code.writeline(
         "_symm_mem_sync(symm_signal_pad_ptrs, None, SYMM_RANK, "
         "SYMM_WORLD_SIZE, hasPreviousMemAccess=True, "
         "hasSubsequentMemAccess=True)"
     )
-    _codegen_grid_stride_loop(code, compute_body)
+    if compute_preheader.strip():
+        code.splice(compute_preheader)
+    _codegen_grid_stride_loop(code, x_tile_setup + tail)
 
 
 # ------------------------------------------------------------------
