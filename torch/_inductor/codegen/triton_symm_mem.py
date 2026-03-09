@@ -1,7 +1,7 @@
 """
 Symmetric memory P2P allreduce codegen for TritonKernel.
 
-Three sync modes: host_barrier (default), device_cas, lamport.
+Four sync modes: host_barrier (default), device_cas, device_cas_2_shot, lamport.
 All functions take an explicit kernel argument instead of using self.
 """
 
@@ -66,7 +66,7 @@ def symm_mem_p2p_reduce_load(
     if sync_mode == "lamport":
         kernel._symm_mem_use_lamport = True
         kernel._symm_mem_use_host_barriers = False
-    elif sync_mode == "device_cas":
+    elif sync_mode in ("device_cas", "device_cas_2_shot"):
         kernel._symm_mem_use_lamport = False
         kernel._symm_mem_use_host_barriers = False
     else:
@@ -108,6 +108,8 @@ def symm_mem_p2p_reduce_load(
 
     if config._symm_mem_sync_mode == "lamport":
         _codegen_lamport_reduce_load(kernel, load_buffer, indexing, shape_str)
+    elif config._symm_mem_sync_mode == "device_cas_2_shot":
+        _codegen_two_shot_reduce_load(kernel, load_buffer, indexing, shape_str)
     else:
         _codegen_pull_reduce_load(kernel, load_buffer, indexing, shape_str)
 
@@ -163,6 +165,85 @@ def _codegen_pull_reduce_load(kernel, load_buffer, indexing, shape_str: str):
             f"symm_peer_buf_{i} + ({indexing.index_str}), "
             f"{indexing.mask_str}, other=0.0).to(tl.float32)"
         )
+
+
+# ------------------------------------------------------------------
+# Body codegen: two-shot reduce-scatter + allgather (device_cas_2_shot)
+# ------------------------------------------------------------------
+
+
+def _codegen_two_shot_reduce_load(kernel, load_buffer, indexing, shape_str: str):
+    """Two-shot allreduce: reduce-scatter then allgather via symm_mem buffers.
+
+    Each rank reduces its column chunk from all peers, writes the result back
+    to every peer buffer, syncs, then loads the full reduced row from its own
+    buffer.  Requires r0_numel % SYMM_WORLD_SIZE == 0.
+    """
+    in_var = kernel.args.input(kernel.symm_mem_input_name)
+
+    if (
+        not config._symm_mem_skip_prologue_copy
+        and not kernel._symm_mem_use_host_barriers
+    ):
+        load_buffer.splice(
+            f"""
+            for _symm_row in tl.static_range(XBLOCK):
+                _symm_row_idx = _symm_x_base + _symm_row
+                _symm_row_mask = _symm_row_idx < xnumel
+                _symm_idx = _symm_row_idx * r0_numel + _symm_cols
+                _symm_mask = _symm_col_mask & _symm_row_mask
+                _symm_val = tl.load({in_var} + _symm_idx, _symm_mask, other=0.0)
+                tl.store(_symm_local_buf + _symm_idx, _symm_val, _symm_mask)
+            """
+        )
+        load_buffer.writeline(
+            "_symm_mem_sync(symm_signal_pad_ptrs, None, SYMM_RANK, "
+            "SYMM_WORLD_SIZE, hasPreviousMemAccess=True, "
+            "hasSubsequentMemAccess=True)"
+        )
+
+    load_buffer.splice(
+        """
+        _2shot_chunk = r0_numel // SYMM_WORLD_SIZE
+        _2shot_start = SYMM_RANK * _2shot_chunk
+        _2shot_col_mask = (_symm_cols >= _2shot_start) & (_symm_cols < (_2shot_start + _2shot_chunk))
+        """
+    )
+
+    load_buffer.writeline("for _2shot_row in tl.static_range(XBLOCK):")
+    with load_buffer.indent():
+        load_buffer.splice(
+            """
+            _2shot_row_idx = _symm_x_base + _2shot_row
+            _2shot_row_mask = _2shot_row_idx < xnumel
+            _2shot_idx = _2shot_row_idx * r0_numel + _symm_cols
+            _2shot_mask = _2shot_col_mask & _2shot_row_mask
+            _2shot_acc = tl.zeros([R0_BLOCK], dtype=tl.float32)
+            """
+        )
+        for i in range(kernel.symm_mem_world_size):
+            load_buffer.writeline(
+                f"_2shot_acc = _2shot_acc + tl.load("
+                f"symm_peer_buf_{i} + _2shot_idx, "
+                f"_2shot_mask, other=0.0).to(tl.float32)"
+            )
+        for i in range(kernel.symm_mem_world_size):
+            load_buffer.writeline(
+                f"tl.store(symm_peer_buf_{i} + _2shot_idx, "
+                f"_2shot_acc, _2shot_mask)"
+            )
+
+    load_buffer.writeline(
+        "_symm_mem_sync(symm_signal_pad_ptrs, None, SYMM_RANK, "
+        "SYMM_WORLD_SIZE, hasPreviousMemAccess=True, "
+        "hasSubsequentMemAccess=True)"
+    )
+
+    load_buffer.writeline(
+        f"_symm_acc = tl.load("
+        f"_symm_local_buf + ({indexing.index_str}), "
+        f"{indexing.mask_str}, other=0.0).to(tl.float32)"
+    )
 
 
 # ------------------------------------------------------------------

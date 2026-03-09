@@ -671,6 +671,29 @@ class TestFusedAllReduceRMSNormDistributed(MultiProcContinuousTest):
             "device_cas", self._assert_device_cas_codegen
         )
 
+    # --- device_cas_2_shot ---
+
+    def _assert_device_cas_2_shot_codegen(self, code_list):
+        """Verify two-shot codegen: device-side CAS + reduce-scatter pattern."""
+        self._assert_device_cas_codegen(code_list)
+        code = "\n".join(code_list)
+        self.assertIn("_2shot_chunk", code,
+                       "Kernel should compute per-rank chunk size")
+        self.assertIn("_2shot_col_mask", code,
+                       "Kernel should mask columns to local rank's chunk")
+
+    @skip_if_lt_x_gpu(2)
+    def test_torch_compile_device_cas_2_shot_allreduce_sum(self):
+        self._compile_allreduce_sum_with_codegen(
+            "device_cas_2_shot", self._assert_device_cas_2_shot_codegen
+        )
+
+    @skip_if_lt_x_gpu(2)
+    def test_torch_compile_device_cas_2_shot_upstream_allreduce_sum(self):
+        self._compile_upstream_allreduce_sum_with_codegen(
+            "device_cas_2_shot", self._assert_device_cas_2_shot_codegen
+        )
+
     # --- host_barrier ---
 
     @skip_if_lt_x_gpu(2)

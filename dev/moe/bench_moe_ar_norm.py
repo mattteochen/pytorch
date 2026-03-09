@@ -277,14 +277,17 @@ def main():
         print("\n--- Path A: E2E compiled (MoE v2 + Lamport fused) ---", flush=True)
 
     @torch.compile(options={
+        "trace.enabled": True,
         "combo_kernels": True,
         "_fuse_symm_mem_comms": True,
-        "_symm_mem_sync_mode": "lamport",
+        "_symm_mem_sync_mode": "device_cas",
         "max_autotune_gemm": True,
-        "max_autotune_gemm_backends": "TRITON"
+        "max_autotune_gemm_backends": "TRITON",
+        "triton.enable_pdl": True,
     })
     def e2e_compiled(hs, tw, ti, w13, w13b, w2, w2b, res, w, gn):
         moe = moe_forward(hs, tw, ti, w13, w13b, w2, w2b, NUM_EXPERTS)
+        torch._dynamo.graph_break()
         reduced = all_reduce(moe, "sum", group=gn)
         h = reduced + res
         normed = F.rms_norm(h, w.shape, w, EPS)
@@ -303,6 +306,42 @@ def main():
         normed_a, pre_norm_a = path_a_call()
     check_correctness("Path A normed", normed_a, ref_normed, rank)
     check_correctness("Path A pre_norm", pre_norm_a, ref_pre_norm, rank)
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Path A2: E2E compiled, two-shot reduce-scatter + allgather
+    # ══════════════════════════════════════════════════════════════════════
+    if rank == 0:
+        print("\n--- Path A2: E2E compiled (MoE v2 + 2-shot fused) ---", flush=True)
+
+    @torch.compile(options={
+        "trace.enabled": True,
+        "combo_kernels": True,
+        "_fuse_symm_mem_comms": True,
+        "_symm_mem_sync_mode": "device_cas_2_shot",
+        "max_autotune_gemm": True,
+        "max_autotune_gemm_backends": "TRITON",
+        "triton.enable_pdl": True,
+    })
+    def e2e_compiled_2shot(hs, tw, ti, w13, w13b, w2, w2b, res, w, gn):
+        moe = moe_forward(hs, tw, ti, w13, w13b, w2, w2b, NUM_EXPERTS)
+        torch._dynamo.graph_break()
+        reduced = all_reduce(moe, "sum", group=gn)
+        h = reduced + res
+        normed = F.rms_norm(h, w.shape, w, EPS)
+        return normed, h
+
+    def path_a2_call():
+        return e2e_compiled_2shot(
+            hidden_states, topk_weights, topk_ids,
+            layer.w13_weight, layer.w13_weight_bias,
+            layer.w2_weight, layer.w2_weight_bias,
+            residual, norm_weight, group_name,
+        )
+
+    with torch.inference_mode():
+        normed_a2, pre_norm_a2 = path_a2_call()
+    check_correctness("Path A2 normed", normed_a2, ref_normed, rank)
+    check_correctness("Path A2 pre_norm", pre_norm_a2, ref_pre_norm, rank)
 
     # ══════════════════════════════════════════════════════════════════════
     # Path B: SGLang fused_triton MoE + FlashInfer AR+norm
@@ -410,8 +449,14 @@ def main():
                 cuda_graph=use_cg, cuda_graph_batch=args.cuda_graph_batch,
             )
         a_us, a_graph = benchmark(
-            "Path A: compiled MoE v2 + Lamport AR+norm",
+            "Path A: compiled MoE v2 + 1-shot AR+norm",
             path_a_call, rank,
+            warmup=args.warmup, iters=args.iters,
+            cuda_graph=use_cg, cuda_graph_batch=args.cuda_graph_batch,
+        )
+        a2_us, a2_graph = benchmark(
+            "Path A2: compiled MoE v2 + 2-shot AR+norm",
+            path_a2_call, rank,
             warmup=args.warmup, iters=args.iters,
             cuda_graph=use_cg, cuda_graph_batch=args.cuda_graph_batch,
         )
@@ -419,6 +464,9 @@ def main():
     if rank == 0 and path_b_ok:
         speedup = b_us / a_us if a_us > 0 else float("inf")
         print(f"\n  Speedup (A vs B): {speedup:.2f}x")
+    if rank == 0:
+        speedup_a2_a = a_us / a2_us if a2_us > 0 else float("inf")
+        print(f"  Speedup (A2 vs A): {speedup_a2_a:.2f}x")
 
     # ── NVTX-marked single replay for nsys profiling ──
     if args.nvtx:
@@ -428,14 +476,17 @@ def main():
         torch.cuda.synchronize()
         dist.barrier()
         torch.cuda.cudart().cudaProfilerStart()
-        with torch.cuda.nvtx.range("path_a_compiled_moe_v2_lamport"):
+        with torch.cuda.nvtx.range("path_a_compiled_moe_v2_1shot"):
             a_graph.replay()
+        torch.cuda.synchronize()
+        with torch.cuda.nvtx.range("path_a2_compiled_moe_v2_2shot"):
+            a2_graph.replay()
         torch.cuda.synchronize()
         if b_graph is not None:
             with torch.cuda.nvtx.range("path_b_fused_triton_flashinfer"):
                 b_graph.replay()
             torch.cuda.synchronize()
-        torch.cuda.cudart().cudaProfilerStop()
+        # torch.cuda.cudart().cudaProfilerStop()
 
         if rank == 0:
             print("Done. Use 'nsys profile ...' to capture the trace.")

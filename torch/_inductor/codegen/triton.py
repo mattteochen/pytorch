@@ -5372,7 +5372,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             if sync_mode == "lamport":
                 self._symm_mem_use_lamport = True
                 self._symm_mem_use_host_barriers = False
-            elif sync_mode == "device_cas":
+            elif sync_mode in ("device_cas", "device_cas_2_shot"):
                 self._symm_mem_use_lamport = False
                 self._symm_mem_use_host_barriers = False
             else:

@@ -1012,9 +1012,11 @@ _symm_mem_host_barrier_threshold: int = 0
 _symm_mem_grid_cap: int = 0
 
 # Synchronization mode for P2P allreduce kernels.
-# "host_barrier" = host-side sm.barrier() before/after kernel (default).
-# "device_cas"   = device-side per-block CAS atomics (kraken).
-# "lamport"      = Lamport push-model with -0.0 sentinel, zero barriers.
+# "host_barrier"      = host-side sm.barrier() before/after kernel (default).
+# "device_cas"        = device-side per-block CAS atomics, one-shot pull (kraken).
+# "device_cas_2_shot" = device-side CAS, two-shot reduce-scatter+allgather (kraken).
+#                       Requires r0_numel divisible by world_size.
+# "lamport"           = Lamport push-model with -0.0 sentinel, zero barriers.
 # When set to "lamport", _symm_mem_host_barrier_threshold is ignored.
 _symm_mem_sync_mode: str = "host_barrier"
 
