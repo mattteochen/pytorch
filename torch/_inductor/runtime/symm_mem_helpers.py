@@ -23,13 +23,11 @@ def _get_cached(
     if key in _symm_mem_cache:
         cached = _symm_mem_cache[key]
         sm = cached[0]
-        cached_bytes = sm.buffer_size
-        assert cached_bytes >= workspace_bytes, (
-            f"Cached symmetric memory workspace for group '{group_name}' is too "
-            f"small ({cached_bytes} bytes) for input ({workspace_bytes} bytes). "
-            f"Allocate a larger workspace with get_symm_mem_workspace(min_size=...)."
-        )
-        return cached
+        if sm.buffer_size >= workspace_bytes:
+            return cached
+        # Workspace too small for this input — evict and re-allocate.
+        # get_symm_mem_workspace will grow the underlying P2P allocation
+        del _symm_mem_cache[key]
 
     import torch.distributed as dist
     import torch.distributed._symmetric_memory as symm_mem_mod
