@@ -768,5 +768,205 @@ class TestFusedAllReduceRMSNormDistributed(MultiProcContinuousTest):
         self._assert_host_barrier_codegen(code)
 
 
+# ── NVSHMEM tests ────────────────────────────────────────────────────────
+
+from torch.testing._internal.common_utils import skip_but_pass_in_sandcastle_if
+
+
+@requires_cuda_p2p_access()
+class NVSHMEMFusedAllReduceTest(MultiProcContinuousTest):
+    """Multi-process tests for NVSHMEM signal-based allreduce codegen."""
+
+    @property
+    def device(self) -> torch.device:
+        return torch.device(device_type, self.rank)
+
+    def _init_process(self):
+        torch.cuda.set_device(self.device)
+        torch.manual_seed(42 + self.rank)
+
+    def _reference_allreduce_sum(self, x, residual=None):
+        reduced = torch.ops._c10d_functional.all_reduce(x, "sum", "0")
+        reduced = torch.ops._c10d_functional.wait_tensor(reduced)
+        if residual is not None:
+            reduced = reduced + residual
+        return reduced.sum(dim=-1), reduced
+
+    def _reference_allreduce_rmsnorm(self, x, weight, eps, residual=None):
+        group_name = dist.group.WORLD.group_name
+        reduced = torch.ops._c10d_functional.all_reduce(x, "sum", group_name)
+        reduced = torch.ops._c10d_functional.wait_tensor(reduced)
+        pre_norm = None
+        if residual is not None:
+            reduced = reduced + residual
+            pre_norm = reduced.clone()
+        normed = F.rms_norm(reduced, weight.shape, weight, eps)
+        return normed, pre_norm
+
+    @skip_if_lt_x_gpu(4)
+    @skip_but_pass_in_sandcastle_if(
+        not symm_mem.is_nvshmem_available(), "NVSHMEM not available"
+    )
+    def test_nvshmem_allreduce_correctness(self):
+        """NVSHMEM allreduce: compare vs NCCL reference."""
+        self._init_process()
+        hidden = 2880
+        x = torch.randn(1, hidden, device=self.device, dtype=torch.bfloat16)
+        residual = torch.randn(1, hidden, device=self.device, dtype=torch.bfloat16)
+
+        group_name = dist.group.WORLD.group_name
+        symm_mem.enable_symm_mem_for_group(group_name)
+        symm_mem.get_symm_mem_workspace(
+            group_name, min_size=x.numel() * x.element_size()
+        )
+        expected_sum, expected_h = self._reference_allreduce_sum(x, residual)
+
+        @torch.compile(options={
+            "_fuse_symm_mem_comms": True,
+            "_symm_mem_sync_mode": "nvshmem",
+        })
+        def fn(inp, res, gn):
+            reduced = all_reduce(inp, "sum", group=gn)
+            h = reduced + res
+            return h.sum(dim=-1), h
+
+        with torch.inference_mode():
+            result_sum, result_h = fn(x, residual, group_name)
+
+        torch.testing.assert_close(result_sum, expected_sum, atol=0.2, rtol=0.1)
+        torch.testing.assert_close(result_h, expected_h, atol=4e-2, rtol=4e-2)
+
+    @skip_if_lt_x_gpu(4)
+    @skip_but_pass_in_sandcastle_if(
+        not symm_mem.is_nvshmem_available(), "NVSHMEM not available"
+    )
+    def test_nvshmem_fused_allreduce_rmsnorm(self):
+        """E2E compile: allreduce + add_residual + rmsnorm via NVSHMEM."""
+        self._init_process()
+        hidden = 2880
+        eps = 1e-5
+        x = torch.randn(1, hidden, device=self.device, dtype=torch.bfloat16)
+        residual = torch.randn(1, hidden, device=self.device, dtype=torch.bfloat16)
+        weight = torch.ones(hidden, device=self.device, dtype=torch.float32)
+
+        group_name = dist.group.WORLD.group_name
+        symm_mem.enable_symm_mem_for_group(group_name)
+        symm_mem.get_symm_mem_workspace(
+            group_name, min_size=x.numel() * x.element_size()
+        )
+        expected_normed, _ = self._reference_allreduce_rmsnorm(
+            x, weight, eps, residual
+        )
+
+        @torch.compile(options={
+            "_fuse_symm_mem_comms": True,
+            "_symm_mem_sync_mode": "nvshmem",
+        })
+        def fn(inp, res, w, gn):
+            reduced = all_reduce(inp, "sum", group=gn)
+            h = reduced + res
+            return F.rms_norm(h, w.shape, w, eps)
+
+        with torch.inference_mode():
+            result = fn(x, residual, weight, group_name)
+
+        torch.testing.assert_close(result, expected_normed, atol=4e-2, rtol=4e-2)
+
+    @skip_if_lt_x_gpu(4)
+    @skip_but_pass_in_sandcastle_if(
+        not symm_mem.is_nvshmem_available(), "NVSHMEM not available"
+    )
+    def test_nvshmem_codegen_contains_signal_ops(self):
+        """Verify generated kernel contains NVSHMEM signal primitives."""
+        self._init_process()
+        hidden = 64
+        x = torch.randn(4, hidden, device=self.device, dtype=torch.bfloat16)
+        residual = torch.randn(4, hidden, device=self.device, dtype=torch.bfloat16)
+
+        group_name = dist.group.WORLD.group_name
+        symm_mem.enable_symm_mem_for_group(group_name)
+        symm_mem.get_symm_mem_workspace(
+            group_name, min_size=x.numel() * x.element_size()
+        )
+
+        @torch.compile(options={
+            "_fuse_symm_mem_comms": True,
+            "_symm_mem_sync_mode": "nvshmem",
+        })
+        def fn(inp, res, gn):
+            reduced = all_reduce(inp, "sum", group=gn)
+            h = reduced + res
+            return h.sum(dim=-1), h
+
+        with torch.inference_mode():
+            _, code = run_and_get_code(fn, x, residual, group_name)
+
+        code_str = "\n".join(code)
+        self.assertIn("_nvshmem_signal_op", code_str,
+                       "Kernel should call _nvshmem_signal_op")
+        self.assertIn("_nvshmem_signal_wait_until", code_str,
+                       "Kernel should call _nvshmem_signal_wait_until")
+        self.assertIn("_nvshmem_fence", code_str,
+                       "Kernel should call _nvshmem_fence")
+        self.assertIn("nvshmem_peer_bufs", code_str,
+                       "Wrapper should call nvshmem_peer_bufs")
+        self.assertIn("nvshmem_get_epoch", code_str,
+                       "Wrapper should call nvshmem_get_epoch")
+        self.assertNotIn("_symm_mem_sync", code_str,
+                          "Kernel should NOT use device-side CAS sync")
+        self.assertNotIn("symm_mem_host_barrier", code_str,
+                          "Wrapper should NOT use host barriers")
+        self.assertNotIn("_lamport_poll_all_peers", code_str,
+                          "Kernel should NOT use Lamport reduce")
+
+    @skip_if_lt_x_gpu(4)
+    @skip_but_pass_in_sandcastle_if(
+        not symm_mem.is_nvshmem_available(), "NVSHMEM not available"
+    )
+    def test_nvshmem_cuda_graph(self):
+        """CUDA graph capture/replay with epoch tracking."""
+        self._init_process()
+        hidden = 2880
+        x = torch.randn(1, hidden, device=self.device, dtype=torch.bfloat16)
+        residual = torch.randn(1, hidden, device=self.device, dtype=torch.bfloat16)
+
+        group_name = dist.group.WORLD.group_name
+        symm_mem.enable_symm_mem_for_group(group_name)
+        symm_mem.get_symm_mem_workspace(
+            group_name, min_size=x.numel() * x.element_size()
+        )
+
+        @torch.compile(options={
+            "_fuse_symm_mem_comms": True,
+            "_symm_mem_sync_mode": "nvshmem",
+        })
+        def fn(inp, res, gn):
+            reduced = all_reduce(inp, "sum", group=gn)
+            h = reduced + res
+            return h.sum(dim=-1), h
+
+        # Warmup
+        with torch.inference_mode():
+            fn(x, residual, group_name)
+
+        # Capture
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph), torch.inference_mode():
+            result_sum, result_h = fn(x, residual, group_name)
+
+        # Multi-iteration replay
+        for _ in range(3):
+            x.copy_(torch.randn_like(x))
+            residual.copy_(torch.randn_like(residual))
+            expected_sum, expected_h = self._reference_allreduce_sum(x, residual)
+            graph.replay()
+            torch.testing.assert_close(
+                result_sum, expected_sum, atol=0.2, rtol=0.1
+            )
+            torch.testing.assert_close(
+                result_h, expected_h, atol=4e-2, rtol=4e-2
+            )
+
+
 if __name__ == "__main__":
     run_tests()

@@ -11,6 +11,7 @@ Profiles variants:
   3c. compiled_gridcap36 – compiled + device CAS + grid cap at 36 CTAs
   3d. compiled_lamport   – compiled + Lamport push-model (zero barriers, inductor codegen)
   3e. compiled_2shot     – compiled + two-shot reduce-scatter+allgather (device CAS sync)
+  3f. compiled_nvshmem   – compiled + NVSHMEM signal-based device-side sync
   4. compiled_plain      – torch.compile default settings (no fused allreduce+rmsnorm option)
   5. compiled_mempool    – compiled + mempool zero-copy (matmul → symm mem, single kernel)
   6. mempool             – mem pool zero-copy with handwritten kernel (host-side barriers)
@@ -545,6 +546,43 @@ def main():
                 two_shot_ok,
             )
         )
+
+        # --- Variant 3f: compiled + NVSHMEM signal-based sync ---
+        if symm_mem.is_nvshmem_available():
+
+            def _make_nvshmem_ar_norm(eps_val):
+                def _fn(x, residual, weight, group_name):
+                    reduced = funcol.all_reduce(x, "sum", group_name)
+                    h = reduced + residual
+                    normed = F.rms_norm(h, weight.shape, weight, eps_val)
+                    return normed, h
+                return torch.compile(_fn, options={
+                    "_fuse_symm_mem_comms": True,
+                    "_symm_mem_sync_mode": "nvshmem",
+                })
+
+            ar_norm_nvshmem = _make_nvshmem_ar_norm(EPS)
+
+            def compiled_nvshmem_call():
+                h = x
+                return ar_norm_nvshmem(h, residual, weight, group_name)
+
+            nvshmem_ok = _check_correctness(compiled_nvshmem_call, ref_normed, "compiled_nvshmem")
+            results.append(
+                (
+                    "compiled_nvshmem",
+                    _profile(
+                        "compiled_nvshmem",
+                        compiled_nvshmem_call,
+                        rank,
+                        warmup=WARMUP_ITERS + 5,
+                        cuda_graph=True,
+                        nsys_mode=nsys_mode,
+                        timer_mode=timer_mode,
+                    ),
+                    nvshmem_ok,
+                )
+            )
 
         # --- Variant 4: torch.compile plain (default options) ---
         ar_norm_compiled_plain = _make_compiled_plain_ar_norm(EPS)

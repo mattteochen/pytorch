@@ -863,6 +863,9 @@ class CachingAutotuner(KernelInterface):
 
         options = self._create_compile_options(cfg, compile_meta)
 
+        if "extern_libs" in compile_meta:
+            options["extern_libs"] = compile_meta["extern_libs"]
+
         compile_kwargs = {
             "target": target,
             "options": options,
@@ -878,6 +881,13 @@ class CachingAutotuner(KernelInterface):
                 compile_meta,
             )
             raise
+
+        if self.inductor_meta.get("nvshmem_init", False):
+            _ = binary.run  # force module loading
+            if binary.module is not None:
+                from torch._C._distributed_c10d import _nvshmemx_cumodule_init
+
+                _nvshmemx_cumodule_init(binary.module)
 
         # Simulate JIT Hook call
         if (
