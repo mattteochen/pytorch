@@ -1017,6 +1017,9 @@ _symm_mem_grid_cap: int = 0
 # "device_cas_2_shot" = device-side CAS, two-shot reduce-scatter+allgather (kraken).
 #                       Requires r0_numel divisible by world_size.
 # "lamport"           = Lamport push-model with -0.0 sentinel, zero barriers.
+# "nvshmem"           = NVSHMEM signal-based device-side sync.
+#                       Uses signal_op + signal_wait_until from _nvshmem_triton.
+#                       Works intra-node (NVLink) and inter-node (RDMA).
 # When set to "lamport", _symm_mem_host_barrier_threshold is ignored.
 _symm_mem_sync_mode: str = "host_barrier"
 

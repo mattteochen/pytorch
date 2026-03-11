@@ -767,6 +767,40 @@ class TestFusedAllReduceRMSNormDistributed(MultiProcContinuousTest):
         torch.testing.assert_close(result, expected_sum, atol=0.2, rtol=0.1)
         self._assert_host_barrier_codegen(code)
 
+    # --- nvshmem ---
+
+    def _assert_nvshmem_codegen(self, code_list):
+        """Verify the generated code uses NVSHMEM signals, not CAS or Lamport."""
+        code = "\n".join(code_list)
+        self.assertIn("_nvshmem_signal_op", code,
+                       "Kernel should call _nvshmem_signal_op")
+        self.assertIn("_nvshmem_signal_wait_until", code,
+                       "Kernel should call _nvshmem_signal_wait_until")
+        self.assertIn("_nvshmem_fence", code,
+                       "Kernel should call _nvshmem_fence")
+        self.assertIn("nvshmem_peer_bufs", code,
+                       "Wrapper should call nvshmem_peer_bufs")
+        self.assertIn("nvshmem_get_epoch", code,
+                       "Wrapper should call nvshmem_get_epoch")
+        self.assertNotIn("symm_mem_host_barrier", code,
+                          "Should NOT use host barrier")
+        self.assertNotIn("_symm_mem_sync", code,
+                          "Should NOT use device-side CAS sync")
+        self.assertNotIn("_lamport_poll_all_peers", code,
+                          "Should NOT use Lamport reduce")
+
+    @skip_if_lt_x_gpu(2)
+    def test_torch_compile_nvshmem_allreduce_sum(self):
+        self._compile_allreduce_sum_with_codegen(
+            "nvshmem", self._assert_nvshmem_codegen
+        )
+
+    @skip_if_lt_x_gpu(2)
+    def test_torch_compile_nvshmem_upstream_allreduce_sum(self):
+        self._compile_upstream_allreduce_sum_with_codegen(
+            "nvshmem", self._assert_nvshmem_codegen
+        )
+
 
 if __name__ == "__main__":
     run_tests()

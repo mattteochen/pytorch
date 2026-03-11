@@ -1,7 +1,7 @@
 """
 Symmetric memory P2P allreduce codegen for TritonKernel.
 
-Four sync modes: host_barrier (default), device_cas, device_cas_2_shot, lamport.
+Five sync modes: host_barrier (default), device_cas, device_cas_2_shot, lamport, nvshmem.
 All functions take an explicit kernel argument instead of using self.
 """
 
@@ -47,6 +47,7 @@ def init_symm_mem_state(kernel: TritonKernel):
     kernel._symm_group_name: str = ""
     kernel._symm_mem_use_host_barriers: bool = False
     kernel._symm_mem_use_lamport: bool = False
+    kernel._symm_mem_use_nvshmem: bool = False
 
 
 # ------------------------------------------------------------------
@@ -72,6 +73,10 @@ def symm_mem_p2p_reduce_load(
     sync_mode = config._symm_mem_sync_mode
     if sync_mode == "lamport":
         kernel._symm_mem_use_lamport = True
+        kernel._symm_mem_use_host_barriers = False
+    elif sync_mode == "nvshmem":
+        kernel._symm_mem_use_nvshmem = True
+        kernel._symm_mem_use_lamport = False
         kernel._symm_mem_use_host_barriers = False
     elif sync_mode in ("device_cas", "device_cas_2_shot"):
         kernel._symm_mem_use_lamport = False
@@ -115,6 +120,8 @@ def symm_mem_p2p_reduce_load(
 
     if config._symm_mem_sync_mode == "lamport":
         _codegen_lamport_reduce_load(kernel, load_buffer, indexing, shape_str)
+    elif config._symm_mem_sync_mode == "nvshmem":
+        _codegen_nvshmem_reduce_load(kernel, load_buffer, indexing, shape_str)
     elif config._symm_mem_sync_mode == "device_cas_2_shot":
         _codegen_two_shot_reduce_load(kernel, load_buffer, indexing, shape_str)
     else:
@@ -167,6 +174,72 @@ def _codegen_pull_reduce_load(kernel, load_buffer, indexing, shape_str: str):
         f"_symm_acc = tl.zeros([{shape_str}], dtype=tl.float32)"
     )
     for i in range(kernel.symm_mem_world_size):
+        load_buffer.writeline(
+            f"_symm_acc = _symm_acc + tl.load("
+            f"symm_peer_buf_{i} + ({indexing.index_str}), "
+            f"{indexing.mask_str}, other=0.0).to(tl.float32)"
+        )
+
+
+# ------------------------------------------------------------------
+# Body codegen: NVSHMEM signal-based pull model
+# ------------------------------------------------------------------
+
+
+def _codegen_nvshmem_reduce_load(kernel, load_buffer, indexing, shape_str: str):
+    """NVSHMEM pull-model allreduce using signal_op + signal_wait_until.
+
+    Signal layout per rank: 2 * world_size uint64 slots in signal_pad.
+      [0 .. world_size-1]             : prologue (data-ready) signals
+      [world_size .. 2*world_size-1]  : epilogue (reads-done) signals
+    Epoch increments each invocation so signals never need resetting.
+    """
+    in_var = kernel.args.input(kernel.symm_mem_input_name)
+    ws = kernel.symm_mem_world_size
+
+    # 1. Copy input to local symm_mem buffer
+    load_buffer.splice(
+        f"""
+        for _symm_row in tl.static_range(XBLOCK):
+            _symm_row_idx = _symm_x_base + _symm_row
+            _symm_row_mask = _symm_row_idx < xnumel
+            _symm_idx = _symm_row_idx * r0_numel + _symm_cols
+            _symm_mask = _symm_col_mask & _symm_row_mask
+            _symm_val = tl.load({in_var} + _symm_idx, _symm_mask, other=0.0)
+            tl.store(_symm_local_buf + _symm_idx, _symm_val, _symm_mask)
+        """
+    )
+
+    # 2. Fence to ensure stores are visible before signaling
+    load_buffer.writeline("_nvshmem_fence()")
+
+    # 3. Signal each peer that our data is ready (prologue slots)
+    for i in range(ws):
+        load_buffer.writeline(f"if {i} != SYMM_RANK:")
+        with load_buffer.indent():
+            load_buffer.writeline(
+                f"_nvshmem_signal_op("
+                f"tl.load(symm_signal_pad_ptrs + {i}).to(tl.uint64) "
+                f"+ (SYMM_RANK * 8).to(tl.uint64), "
+                f"1, 5, {i})"
+            )
+
+    # 4. Wait for each peer's data-ready signal (prologue slots on our pad)
+    for i in range(ws):
+        load_buffer.writeline(f"if {i} != SYMM_RANK:")
+        with load_buffer.indent():
+            load_buffer.writeline(
+                f"_nvshmem_signal_wait_until("
+                f"tl.load(symm_signal_pad_ptrs + SYMM_RANK).to(tl.uint64) "
+                f"+ ({i} * 8).to(tl.uint64), "
+                f"3, _nvshmem_epoch.to(tl.uint64))"
+            )
+
+    # 5. Accumulate from all peer buffers
+    load_buffer.writeline(
+        f"_symm_acc = tl.zeros([{shape_str}], dtype=tl.float32)"
+    )
+    for i in range(ws):
         load_buffer.writeline(
             f"_symm_acc = _symm_acc + tl.load("
             f"symm_peer_buf_{i} + ({indexing.index_str}), "
@@ -392,6 +465,54 @@ def codegen_symm_mem_epilogue(kernel, code):
         _symm_mem_sync(symm_signal_pad_ptrs, None, SYMM_RANK, SYMM_WORLD_SIZE, hasPreviousMemAccess=True)
         """
     )
+
+
+# ------------------------------------------------------------------
+# Prologue / epilogue: NVSHMEM signal-based pull model
+# ------------------------------------------------------------------
+
+
+def codegen_nvshmem_prologue(kernel, code):
+    assert kernel.symm_mem_input_name is not None
+
+    code.writeline("# --- nvshmem prologue: setup ---")
+    for i in range(kernel.symm_mem_world_size):
+        prefix = "if" if i == 0 else "elif"
+        code.writeline(f"{prefix} SYMM_RANK == {i}:")
+        with code.indent():
+            code.writeline(f"_symm_local_buf = symm_peer_buf_{i}")
+
+    code.writeline("_symm_x_base = tl.program_id(0).to(tl.int64) * XBLOCK")
+    code.splice(
+        """
+        _symm_cols = tl.arange(0, R0_BLOCK)
+        _symm_col_mask = _symm_cols < r0_numel
+        """
+    )
+
+
+def codegen_nvshmem_epilogue(kernel, code):
+    ws = kernel.symm_mem_world_size
+    code.writeline("# --- nvshmem epilogue: signal reads complete ---")
+    code.writeline("_nvshmem_fence()")
+    for i in range(ws):
+        code.writeline(f"if {i} != SYMM_RANK:")
+        with code.indent():
+            code.writeline(
+                f"_nvshmem_signal_op("
+                f"tl.load(symm_signal_pad_ptrs + {i}).to(tl.uint64) "
+                f"+ ((SYMM_WORLD_SIZE + SYMM_RANK) * 8).to(tl.uint64), "
+                f"1, 5, {i})"
+            )
+    for i in range(ws):
+        code.writeline(f"if {i} != SYMM_RANK:")
+        with code.indent():
+            code.writeline(
+                f"_nvshmem_signal_wait_until("
+                f"tl.load(symm_signal_pad_ptrs + SYMM_RANK).to(tl.uint64) "
+                f"+ ((SYMM_WORLD_SIZE + {i}) * 8).to(tl.uint64), "
+                f"3, _nvshmem_epoch.to(tl.uint64))"
+            )
 
 
 # ------------------------------------------------------------------
@@ -637,3 +758,24 @@ def emit_lamport_setup(kernel, wrapper, call_args: list):
     for i in range(kernel.symm_mem_world_size):
         call_args.append(f"_lam_peer_bufs[{i}]")
     call_args.append("_lam_meta")
+
+
+def emit_nvshmem_setup(kernel, wrapper, call_args: list):
+    in_var = _resolve_input_wrapper_name(kernel)
+
+    wrapper.imports.writeline(
+        "from torch._inductor.runtime.nvshmem_helpers import "
+        "nvshmem_peer_bufs, nvshmem_get_epoch"
+    )
+    wrapper.writeline(
+        f"_nvshmem_peer_bufs, _nvshmem_sig_ptrs, _, _ = "
+        f'nvshmem_peer_bufs({in_var}, "{kernel._symm_group_name}")'
+    )
+    wrapper.writeline(
+        f'_nvshmem_epoch_val = nvshmem_get_epoch("{kernel._symm_group_name}")'
+    )
+
+    for i in range(kernel.symm_mem_world_size):
+        call_args.append(f"_nvshmem_peer_bufs[{i}]")
+    call_args.append("_nvshmem_sig_ptrs")
+    call_args.append("_nvshmem_epoch_val")

@@ -868,6 +868,9 @@ class CachingAutotuner(KernelInterface):
             "options": options,
         }
 
+        if "extern_libs" in compile_meta:
+            compile_kwargs["extern_libs"] = compile_meta["extern_libs"]
+
         try:
             binary = triton.compile(*compile_args, **compile_kwargs)
         except Exception:
@@ -878,6 +881,13 @@ class CachingAutotuner(KernelInterface):
                 compile_meta,
             )
             raise
+
+        if self.inductor_meta.get("nvshmem_init", False):
+            _ = binary.run  # force module loading
+            if getattr(binary, "module", None) is not None:
+                from torch._C._distributed_c10d import _nvshmemx_cumodule_init
+
+                _nvshmemx_cumodule_init(binary.module)
 
         # Simulate JIT Hook call
         if (

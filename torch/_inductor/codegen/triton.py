@@ -5372,6 +5372,10 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             if sync_mode == "lamport":
                 self._symm_mem_use_lamport = True
                 self._symm_mem_use_host_barriers = False
+            elif sync_mode == "nvshmem":
+                self._symm_mem_use_nvshmem = True
+                self._symm_mem_use_lamport = False
+                self._symm_mem_use_host_barriers = False
             elif sync_mode in ("device_cas", "device_cas_2_shot"):
                 self._symm_mem_use_lamport = False
                 self._symm_mem_use_host_barriers = False
@@ -5408,6 +5412,16 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                         _lamport_clear_old_slot,
                         _lamport_block_arrive,
                         _lamport_advance_flag_block0,
+                    )
+                    """
+                )
+            elif self.has_symm_mem_p2p and self._symm_mem_use_nvshmem:
+                code.splice(
+                    """
+                    from torch.distributed._symmetric_memory._nvshmem_triton import (
+                        fence as _nvshmem_fence,
+                        signal_op as _nvshmem_signal_op,
+                        signal_wait_until as _nvshmem_signal_wait_until,
                     )
                     """
                 )
@@ -5537,6 +5551,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                     )
                 )
                 argdefs.append(ArgName("symm_signal_pad_ptrs"))
+            if self._symm_mem_use_nvshmem:
+                signature.append(SizeArg("_nvshmem_epoch", sympy.Integer(1)))
+                argdefs.append(ArgName("_nvshmem_epoch"))
             add_constexpr_arg("SYMM_RANK")
             add_constexpr_arg("SYMM_WORLD_SIZE")
             if self._symm_mem_use_lamport:
@@ -5573,6 +5590,15 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             # CUDA graph batched replay from overrunning the 3-slot headroom.
             triton_meta["launch_pdl"] = True
 
+        if self.has_symm_mem_p2p and self._symm_mem_use_nvshmem:
+            from torch.distributed._symmetric_memory._nvshmem_triton import (
+                NvshmemLibFinder,
+            )
+
+            triton_meta["extern_libs"] = {
+                "libnvshmem_device": NvshmemLibFinder.find_device_library()
+            }
+
         # Skip memory optimization for forward of the training loop where we expect
         # every new node will increase the peak memory and our greedy approach would
         # introduce a lot of unnecessary cpu copies.
@@ -5596,9 +5622,13 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         if self.mix_order_reduction:
             inductor_meta["RSPLIT_SIZE"] = self.rsplit_size
 
+        if self.has_symm_mem_p2p and self._symm_mem_use_nvshmem:
+            inductor_meta["nvshmem_init"] = True
+
         if (
             self.has_symm_mem_p2p
             and not self._symm_mem_use_host_barriers
+            and not self._symm_mem_use_nvshmem
             and config._symm_mem_grid_cap > 0
         ):
             inductor_meta["symm_mem_grid_cap"] = config._symm_mem_grid_cap
@@ -5758,12 +5788,15 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 code.writeline(f"{old} = {new}")
             if self.has_symm_mem_p2p and self._symm_mem_use_lamport:
                 _symm_mem.codegen_lamport_prologue(self, code)
+            elif self.has_symm_mem_p2p and self._symm_mem_use_nvshmem:
+                _symm_mem.codegen_nvshmem_prologue(self, code)
             elif self.has_symm_mem_p2p and not self._symm_mem_use_host_barriers:
                 _symm_mem.codegen_symm_mem_prologue(self, code)
             if (
                 self.has_symm_mem_p2p
                 and not self._symm_mem_use_host_barriers
                 and not self._symm_mem_use_lamport
+                and not self._symm_mem_use_nvshmem
                 and config._symm_mem_grid_cap > 0
             ):
                 if config._symm_mem_sync_mode == "device_cas_2_shot":
@@ -5774,6 +5807,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 code.splice(self.body)
             if self.has_symm_mem_p2p and self._symm_mem_use_lamport:
                 _symm_mem.codegen_lamport_epilogue(self, code)
+            elif self.has_symm_mem_p2p and self._symm_mem_use_nvshmem:
+                _symm_mem.codegen_nvshmem_epilogue(self, code)
             elif self.has_symm_mem_p2p and not self._symm_mem_use_host_barriers:
                 _symm_mem.codegen_symm_mem_epilogue(self, code)
             if config.triton.proton_profiling:
@@ -5894,6 +5929,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         if self.has_symm_mem_p2p:
             if self._symm_mem_use_lamport:
                 _symm_mem.emit_lamport_setup(self, wrapper, call_args)
+            elif self._symm_mem_use_nvshmem:
+                _symm_mem.emit_nvshmem_setup(self, wrapper, call_args)
             elif self._symm_mem_use_host_barriers:
                 _symm_mem.emit_symm_mem_host_barrier_setup(self, wrapper, call_args)
             else:
