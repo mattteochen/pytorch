@@ -219,9 +219,9 @@ def _codegen_nvshmem_reduce_load(kernel, load_buffer, indexing, shape_str: str):
         with load_buffer.indent():
             load_buffer.writeline(
                 f"_nvshmem_signal_op("
-                f"tl.load(symm_signal_pad_ptrs + {i}).to(tl.uint64) "
-                f"+ (SYMM_RANK * 8).to(tl.uint64), "
-                f"1, 5, {i})"
+                f"tl.load(symm_signal_pad_ptrs + {i}).to(tl.int64) "
+                f"+ tl.cast(SYMM_RANK * 8, tl.int64), "
+                f"tl.cast(1, tl.int64), 5, {i})"
             )
 
     # 4. Wait for each peer's data-ready signal (prologue slots on our pad)
@@ -230,9 +230,9 @@ def _codegen_nvshmem_reduce_load(kernel, load_buffer, indexing, shape_str: str):
         with load_buffer.indent():
             load_buffer.writeline(
                 f"_nvshmem_signal_wait_until("
-                f"tl.load(symm_signal_pad_ptrs + SYMM_RANK).to(tl.uint64) "
-                f"+ ({i} * 8).to(tl.uint64), "
-                f"3, _nvshmem_epoch.to(tl.uint64))"
+                f"tl.load(symm_signal_pad_ptrs + SYMM_RANK).to(tl.int64) "
+                f"+ tl.cast({i} * 8, tl.int64), "
+                f"3, _nvshmem_epoch)"
             )
 
     # 5. Accumulate from all peer buffers
@@ -500,18 +500,18 @@ def codegen_nvshmem_epilogue(kernel, code):
         with code.indent():
             code.writeline(
                 f"_nvshmem_signal_op("
-                f"tl.load(symm_signal_pad_ptrs + {i}).to(tl.uint64) "
-                f"+ ((SYMM_WORLD_SIZE + SYMM_RANK) * 8).to(tl.uint64), "
-                f"1, 5, {i})"
+                f"tl.load(symm_signal_pad_ptrs + {i}).to(tl.int64) "
+                f"+ tl.cast((SYMM_WORLD_SIZE + SYMM_RANK) * 8, tl.int64), "
+                f"tl.cast(1, tl.int64), 5, {i})"
             )
     for i in range(ws):
         code.writeline(f"if {i} != SYMM_RANK:")
         with code.indent():
             code.writeline(
                 f"_nvshmem_signal_wait_until("
-                f"tl.load(symm_signal_pad_ptrs + SYMM_RANK).to(tl.uint64) "
-                f"+ ((SYMM_WORLD_SIZE + {i}) * 8).to(tl.uint64), "
-                f"3, _nvshmem_epoch.to(tl.uint64))"
+                f"tl.load(symm_signal_pad_ptrs + SYMM_RANK).to(tl.int64) "
+                f"+ tl.cast((SYMM_WORLD_SIZE + {i}) * 8, tl.int64), "
+                f"3, _nvshmem_epoch)"
             )
 
 

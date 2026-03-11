@@ -35,7 +35,12 @@ def _get_cached(
     import torch.distributed as dist
     import torch.distributed._symmetric_memory as symm_mem_mod
 
-    sm = symm_mem_mod.get_symm_mem_workspace(group_name, min_size=workspace_bytes)
+    # NVSHMEM allocator does not accept group_name — use symm_mem.empty()
+    # + rendezvous() instead of get_symm_mem_workspace().
+    tensor = symm_mem_mod.empty(
+        workspace_bytes, dtype=torch.uint8, device=input_tensor.device
+    )
+    sm = symm_mem_mod.rendezvous(tensor, group=group_name)
 
     rank = dist.get_rank()
     world_size = sm.world_size

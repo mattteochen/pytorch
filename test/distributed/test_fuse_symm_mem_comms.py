@@ -789,16 +789,69 @@ class TestFusedAllReduceRMSNormDistributed(MultiProcContinuousTest):
         self.assertNotIn("_lamport_poll_all_peers", code,
                           "Should NOT use Lamport reduce")
 
+    def _compile_nvshmem_allreduce_sum_with_codegen(
+        self, assert_codegen_fn, upstream=False,
+    ):
+        self._init_process()
+        symm_mem.set_backend("NVSHMEM")
+        hidden = 64
+
+        x = torch.randn(4, hidden, device=self.device, dtype=torch.bfloat16)
+        residual = torch.randn(4, hidden, device=self.device, dtype=torch.bfloat16)
+
+        group_name = dist.group.WORLD.group_name
+        symm_mem.enable_symm_mem_for_group(group_name)
+
+        if upstream:
+            ref_input = x * 2.0
+        else:
+            ref_input = x
+        expected_sum, expected_h = self._reference_allreduce_sum(
+            ref_input, residual=residual,
+        )
+
+        compile_options = {
+            "_fuse_symm_mem_comms": True,
+            "_symm_mem_sync_mode": "nvshmem",
+        }
+
+        if upstream:
+            @torch.compile(options=compile_options)
+            def fn(inp, res, gn):
+                up = inp * 2.0
+                reduced = all_reduce(up, "sum", group=gn)
+                h = reduced + res
+                return h.sum(dim=-1), h
+        else:
+            @torch.compile(options=compile_options)
+            def fn(inp, res, gn):
+                reduced = all_reduce(inp, "sum", group=gn)
+                h = reduced + res
+                return h.sum(dim=-1), h
+
+        with torch.inference_mode():
+            (result_sum, result_h), code = run_and_get_code(
+                fn, x, residual, group_name
+            )
+
+        torch.testing.assert_close(result_sum, expected_sum, atol=0.2, rtol=0.1)
+        torch.testing.assert_close(result_h, expected_h, atol=4e-2, rtol=4e-2)
+        assert_codegen_fn(code)
+
     @skip_if_lt_x_gpu(2)
     def test_torch_compile_nvshmem_allreduce_sum(self):
-        self._compile_allreduce_sum_with_codegen(
-            "nvshmem", self._assert_nvshmem_codegen
+        if not symm_mem.is_nvshmem_available():
+            self.skipTest("NVSHMEM not available")
+        self._compile_nvshmem_allreduce_sum_with_codegen(
+            self._assert_nvshmem_codegen
         )
 
     @skip_if_lt_x_gpu(2)
     def test_torch_compile_nvshmem_upstream_allreduce_sum(self):
-        self._compile_upstream_allreduce_sum_with_codegen(
-            "nvshmem", self._assert_nvshmem_codegen
+        if not symm_mem.is_nvshmem_available():
+            self.skipTest("NVSHMEM not available")
+        self._compile_nvshmem_allreduce_sum_with_codegen(
+            self._assert_nvshmem_codegen, upstream=True,
         )
 
 

@@ -823,6 +823,9 @@ class CachingAutotuner(KernelInterface):
         if self.device_props.type == "xpu" and XPU_KERNEL_FORMAT == "zebin":
             options["generate_native_code"] = True
 
+        if "extern_libs" in compile_meta:
+            options["extern_libs"] = compile_meta["extern_libs"]
+
         return options
 
     def _precompile_config(self, cfg: Config) -> CompileResult[_KernelType]:
@@ -867,9 +870,6 @@ class CachingAutotuner(KernelInterface):
             "target": target,
             "options": options,
         }
-
-        if "extern_libs" in compile_meta:
-            compile_kwargs["extern_libs"] = compile_meta["extern_libs"]
 
         try:
             binary = triton.compile(*compile_args, **compile_kwargs)
