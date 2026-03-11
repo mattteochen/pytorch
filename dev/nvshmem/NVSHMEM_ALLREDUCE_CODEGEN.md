@@ -1,7 +1,7 @@
 # NVSHMEM Allreduce Codegen for PyTorch Inductor
 
 **Authors:** (authored with Claude)
-**Status:** Implementation complete
+**Status:** Codegen and compilation working; signal address issue under investigation
 **Oncall:** distributed
 
 ## Overview
@@ -54,8 +54,8 @@ CUDA graph replay.
 
 | File | Change |
 |------|--------|
-| `torch/_inductor/runtime/nvshmem_helpers.py` | **New file.** Mirrors `symm_mem_helpers.py`. Provides `nvshmem_peer_bufs()` (returns peer buffer views + signal pad pointers) and `nvshmem_get_epoch()` (monotonic epoch counter). Uses `get_symm_mem_workspace()` for buffer allocation. |
-| `torch/_inductor/runtime/triton_heuristics.py` | Passes `extern_libs` through to `triton.compile()` kwargs. Calls `_nvshmemx_cumodule_init()` on the compiled binary's CU module when `nvshmem_init` is set. |
+| `torch/_inductor/runtime/nvshmem_helpers.py` | **New file.** Provides `nvshmem_peer_bufs()` (returns peer buffer views + signal pad pointers), `nvshmem_get_epoch()` (monotonic epoch counter), and `set_nvshmem_workspace()` for pre-registering the NVSHMEM workspace handle. |
+| `torch/_inductor/runtime/triton_heuristics.py` | Passes `extern_libs` into `CUDAOptions` (the `options` dict for `triton.compile`). Calls `_nvshmemx_cumodule_init()` on the compiled binary's CU module when `nvshmem_init` is set. |
 
 ### Tests
 
@@ -99,14 +99,64 @@ codegen (triton.py)
   → inductor_meta["nvshmem_init"] = True
 
 triton_heuristics.py (_precompile_config)
-  → compile_kwargs["extern_libs"] = compile_meta["extern_libs"]
-  → binary = triton.compile(..., extern_libs=...)
+  → options["extern_libs"] = compile_meta["extern_libs"]   # goes into CUDAOptions
+  → binary = triton.compile(src, target, options)
+  → binary.run                                              # force module loading
   → _nvshmemx_cumodule_init(binary.module)
 ```
+
+Note: `extern_libs` is a field on Triton's `CUDAOptions` dataclass, not a
+top-level kwarg to `triton.compile()`.
+
+## NVSHMEM Workspace Pre-allocation
+
+Unlike other sync modes that use `get_symm_mem_workspace()` (which passes
+`group_name` to `empty_strided_p2p`), the NVSHMEM allocator rejects
+`group_name`. NVSHMEM allocation is also a collective operation requiring all
+ranks to participate simultaneously, so it cannot happen lazily inside the
+inductor-generated wrapper code.
+
+The solution: pre-allocate the workspace before `torch.compile`:
+
+```python
+import torch.distributed._symmetric_memory as symm_mem
+from torch._inductor.runtime.nvshmem_helpers import set_nvshmem_workspace
+
+symm_mem.set_backend("NVSHMEM")
+ws_tensor = symm_mem.empty(size_bytes, dtype=torch.uint8, device=device)
+sm_handle = symm_mem.rendezvous(ws_tensor, group=group_name)
+set_nvshmem_workspace(group_name, sm_handle)
+```
+
+The runtime helper `nvshmem_peer_bufs()` then looks up the pre-registered
+workspace via `_nvshmem_workspace[group_name]`.
+
+## Triton Type Casting
+
+NVSHMEM extern functions expect specific Triton types:
+
+- `signal_op(int64, int64, int32, int32)` — address, value, op, pe
+- `signal_wait_until(int64, int32, uint64)` (via JIT wrapper that casts internally)
+- `fence()` — no args
+
+Constexpr int expressions (e.g. `SYMM_RANK * 8`) and scalar kernel args
+(e.g. `_nvshmem_epoch`) don't support `.to()` in Triton. Use `tl.cast(expr,
+tl.int64)` instead. The `signal_wait_until` JIT wrapper handles `cmp_val`
+casting internally, so pass `_nvshmem_epoch` directly without casting.
 
 ## Usage
 
 ```python
+import torch.distributed._symmetric_memory as symm_mem
+from torch._inductor.runtime.nvshmem_helpers import set_nvshmem_workspace
+
+# 1. Set up NVSHMEM workspace (collective, before compile)
+symm_mem.set_backend("NVSHMEM")
+ws = symm_mem.empty(workspace_bytes, dtype=torch.uint8, device=device)
+sm = symm_mem.rendezvous(ws, group=group_name)
+set_nvshmem_workspace(group_name, sm)
+
+# 2. Compile with NVSHMEM sync mode
 @torch.compile(options={
     "_fuse_symm_mem_comms": True,
     "_symm_mem_sync_mode": "nvshmem",
@@ -117,13 +167,37 @@ def fn(x, residual, group_name):
     return rms_norm(h, weight, eps)
 ```
 
-Prerequisite: the user must have NVSHMEM installed and the symmetric memory
-backend set to NVSHMEM (`symm_mem.set_backend("NVSHMEM")`).
+## Current Status
+
+**Working end-to-end:**
+- FX pass fires and replaces `all_reduce + wait` with `p2p_allreduce`
+- Codegen produces correct NVSHMEM Triton kernel with signal ops
+- Triton compilation succeeds with `extern_libs` linking `libnvshmem_device.bc`
+- `_nvshmemx_cumodule_init` called on the compiled CU module
+- Runtime workspace pre-allocation via `set_nvshmem_workspace()`
+- Kernel launches on GPU
+
+**Open issue — signal address computation:**
+
+The kernel hits `cudaErrorIllegalAddress` during NVSHMEM signal operations.
+The `signal_pad_ptrs` from `NVSHMEMSymmetricMemory` are derived via
+`nvshmem_ptr(signal_pad_ptr, remote_rank)`, which returns local-mapped
+addresses of remote signal pads. The open question is whether
+`nvshmemx_signal_op(addr, ...)` expects:
+
+- (a) The **symmetric** base address (same virtual address on all PEs), or
+- (b) The **local-mapped** address from `nvshmem_ptr()`
+
+The existing `_nvshmem_triton.py` tests use `get_signal_pad(rank, shape,
+dtype)` which returns a tensor view — its `.data_ptr()` is a symmetric
+address. The `signal_pad_ptrs` vector from `NVSHMEMSymmetricMemory` may use a
+different address space. This needs investigation to determine the correct
+address derivation for the inductor codegen path.
 
 ## Verification
 
 ```bash
-# Unit tests (codegen correctness, no NVSHMEM hardware needed for codegen tests)
+# Unit tests
 python test/distributed/test_fuse_symm_mem_comms.py -k nvshmem
 
 # Generated code inspection
@@ -132,3 +206,27 @@ TORCH_LOGS=output_code torchrun --nproc_per_node=4 your_script.py
 # Profiling
 torchrun --nproc_per_node=4 dev/profile_fused_allreduce_rmsnorm.py --timer --num-tokens 1
 ```
+
+## Issues Encountered During Implementation
+
+1. **`triton.compile()` does not accept `extern_libs` as a kwarg** — it must
+   go into the `options` dict (becomes `CUDAOptions.extern_libs`).
+
+2. **Triton type errors with `.to()` on ints** — constexpr products like
+   `SYMM_RANK * 8` and scalar args like `_nvshmem_epoch` are plain ints in
+   Triton, not tensors. Use `tl.cast()` for address arithmetic; pass epoch
+   directly to `signal_wait_until` (the JIT wrapper casts internally).
+
+3. **`signal_op` type dispatch** — the extern expects `(int64, int64, int32,
+   int32)`. Literal `1` infers as `int32`, so the signal value must be
+   explicitly cast: `tl.cast(1, tl.int64)`.
+
+4. **NVSHMEM allocator rejects `group_name`** — `get_symm_mem_workspace()`
+   passes `group_name` to `empty_strided_p2p`, which the NVSHMEM allocator
+   does not support. Workspace must be pre-allocated via `symm_mem.empty()` +
+   `rendezvous()`.
+
+5. **NVSHMEM init is collective** — `set_backend("NVSHMEM")` +
+   `symm_mem.empty()` triggers `nvshmemx_init_attr()` which all ranks must
+   call together. This cannot happen inside the inductor wrapper (runs
+   per-rank asynchronously). Solution: pre-allocate before `torch.compile`.
