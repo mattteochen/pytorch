@@ -16,6 +16,16 @@ import torch
 
 _nvshmem_cache: dict[str, Any] = {}
 _nvshmem_epoch: dict[str, int] = {}
+_nvshmem_workspace: dict[str, Any] = {}
+
+
+def set_nvshmem_workspace(group_name: str, sm_handle: Any) -> None:
+    """Pre-register an NVSHMEM symmetric memory handle for a group.
+
+    Must be called collectively (all ranks) before torch.compile, since
+    NVSHMEM allocation is a collective operation.
+    """
+    _nvshmem_workspace[group_name] = sm_handle
 
 
 def _get_cached(
@@ -35,12 +45,26 @@ def _get_cached(
     import torch.distributed as dist
     import torch.distributed._symmetric_memory as symm_mem_mod
 
-    # NVSHMEM allocator does not accept group_name — use symm_mem.empty()
-    # + rendezvous() instead of get_symm_mem_workspace().
-    tensor = symm_mem_mod.empty(
-        workspace_bytes, dtype=torch.uint8, device=input_tensor.device
-    )
-    sm = symm_mem_mod.rendezvous(tensor, group=group_name)
+    # For NVSHMEM, the workspace must be pre-allocated before compilation
+    # via set_nvshmem_workspace() since NVSHMEM alloc is collective.
+    if key in _nvshmem_workspace:
+        sm = _nvshmem_workspace[key]
+        if sm.buffer_size >= workspace_bytes:
+            pass  # reuse
+        else:
+            raise RuntimeError(
+                f"NVSHMEM workspace for group '{key}' is too small "
+                f"({sm.buffer_size} < {workspace_bytes}). "
+                "Call set_nvshmem_workspace() with a larger size."
+            )
+    else:
+        raise RuntimeError(
+            f"No NVSHMEM workspace for group '{key}'. "
+            "Call torch._inductor.runtime.nvshmem_helpers."
+            "set_nvshmem_workspace() before compilation."
+        )
+
+    sm = _nvshmem_workspace[key]
 
     rank = dist.get_rank()
     world_size = sm.world_size

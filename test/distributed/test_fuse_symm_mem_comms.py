@@ -793,7 +793,6 @@ class TestFusedAllReduceRMSNormDistributed(MultiProcContinuousTest):
         self, assert_codegen_fn, upstream=False,
     ):
         self._init_process()
-        symm_mem.set_backend("NVSHMEM")
         hidden = 64
 
         x = torch.randn(4, hidden, device=self.device, dtype=torch.bfloat16)
@@ -801,6 +800,15 @@ class TestFusedAllReduceRMSNormDistributed(MultiProcContinuousTest):
 
         group_name = dist.group.WORLD.group_name
         symm_mem.enable_symm_mem_for_group(group_name)
+
+        # Pre-allocate NVSHMEM workspace (collective operation).
+        symm_mem.set_backend("NVSHMEM")
+        ws_tensor = symm_mem.empty(
+            x.numel() * x.element_size(), dtype=torch.uint8, device=self.device
+        )
+        sm_handle = symm_mem.rendezvous(ws_tensor, group=group_name)
+        from torch._inductor.runtime.nvshmem_helpers import set_nvshmem_workspace
+        set_nvshmem_workspace(group_name, sm_handle)
 
         if upstream:
             ref_input = x * 2.0
