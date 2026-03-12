@@ -780,8 +780,8 @@ class TestLamportAllReduceRMSNormResidualAdd(MultiProcContinuousTest):
     workspace is cached per-group and dimensioned on first allocation.
     """
 
-    _ROWS = 4
-    _HIDDEN = 128
+    _ROWS = 2
+    _HIDDEN = 2048
 
     @property
     def device(self) -> torch.device:
@@ -968,13 +968,14 @@ class TestLamportAllReduceRMSNormResidualAdd(MultiProcContinuousTest):
     def test_lamport_allreduce_rmsnorm_cudagraph(self):
         """allreduce → residual_add → rmsnorm under CUDA graph replay.
 
-        Enables cudagraph trees to exercise graph capture and batched
+        Enables cudagraph to exercise graph capture and batched
         replay with the Lamport triple-buffer protocol.
         """
         import torch._inductor.config as inductor_config
 
         self._init_process()
         eps = 1e-5
+        iters = 10
 
         group_name = dist.group.WORLD.group_name
         symm_mem.enable_symm_mem_for_group(group_name)
@@ -1012,7 +1013,7 @@ class TestLamportAllReduceRMSNormResidualAdd(MultiProcContinuousTest):
 
         # Replay with fresh data — exercises triple-buffer cycling.
         with torch.inference_mode():
-            for _ in range(6):
+            for _ in range(iters):
                 x_new = torch.randn(
                     self._ROWS, self._HIDDEN,
                     device=self.device, dtype=torch.bfloat16,
@@ -1033,7 +1034,5 @@ class TestLamportAllReduceRMSNormResidualAdd(MultiProcContinuousTest):
                 torch.testing.assert_close(
                     result_h, expected_pre_norm, atol=2e-2, rtol=2e-2,
                 )
-
-
 if __name__ == "__main__":
     run_tests()
