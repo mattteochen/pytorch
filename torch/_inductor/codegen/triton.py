@@ -6480,6 +6480,7 @@ class TritonScheduling(SIMDScheduling):
         # NVLink.  Forcing persistent at large hidden dims (2k-4k) causes
         # excessive register pressure with no NVLink benefit.
         if kernel_features.contains_op("symm_mem_p2p_reduce_load"):
+            # TODO(kaiximatteoc): this may cause hang
             if config._symm_mem_sync_mode != "lamport":
                 kernel_kwargs["override_persistent_reduction"] = True
             kernel_kwargs["override_cooperative_reduction"] = False
