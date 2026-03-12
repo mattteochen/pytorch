@@ -768,5 +768,278 @@ class TestFusedAllReduceRMSNormDistributed(MultiProcContinuousTest):
         self._assert_host_barrier_codegen(code)
 
 
+@requires_cuda_p2p_access()
+class TestLamportAllReduceRMSNormResidualAdd(MultiProcContinuousTest):
+    """Correctness tests for the allreduce → residual_add → rmsnorm fusion
+    under Lamport sync mode, including CUDA graph replay.
+
+    The Lamport protocol uses a triple-buffered workspace with -0.0 sentinels,
+    which is specifically designed to be safe under CUDA graph batched replay.
+
+    All tests in this class use (rows=4, hidden=128) because the Lamport
+    workspace is cached per-group and dimensioned on first allocation.
+    """
+
+    _ROWS = 4
+    _HIDDEN = 128
+
+    @property
+    def device(self) -> torch.device:
+        return torch.device(device_type, self.rank)
+
+    def _init_process(self):
+        torch.cuda.set_device(self.device)
+        torch.manual_seed(42 + self.rank)
+
+    def _reference(self, x, weight, eps, residual=None):
+        group_name = dist.group.WORLD.group_name
+        reduced = torch.ops._c10d_functional.all_reduce(x, "sum", group_name)
+        reduced = torch.ops._c10d_functional.wait_tensor(reduced)
+        pre_norm = None
+        if residual is not None:
+            reduced = reduced + residual
+            pre_norm = reduced.clone()
+        normed = F.rms_norm(reduced, weight.shape, weight, eps)
+        return normed, pre_norm
+
+    def _assert_lamport_codegen(self, code_list):
+        code = "\n".join(code_list)
+        self.assertIn("_lamport_poll_all_peers", code)
+        self.assertIn("_lamport_clear_old_slot", code)
+        self.assertIn("lamport_workspace_peer_bufs", code)
+        self.assertIn("_lamport_advance_flag_block0", code)
+
+    @skip_if_lt_x_gpu(2)
+    def test_lamport_allreduce_rmsnorm_residual_add(self):
+        """allreduce → residual_add → rmsnorm, Lamport mode."""
+        self._init_process()
+        eps = 1e-5
+
+        group_name = dist.group.WORLD.group_name
+        symm_mem.enable_symm_mem_for_group(group_name)
+
+        x = torch.randn(
+            self._ROWS, self._HIDDEN, device=self.device, dtype=torch.bfloat16,
+        )
+        residual = torch.randn(
+            self._ROWS, self._HIDDEN, device=self.device, dtype=torch.bfloat16,
+        )
+        weight = torch.ones(
+            self._HIDDEN, device=self.device, dtype=torch.float32,
+        )
+
+        symm_mem.get_symm_mem_workspace(
+            group_name, min_size=x.numel() * x.element_size()
+        )
+
+        expected_normed, expected_pre_norm = self._reference(
+            x, weight, eps, residual=residual,
+        )
+
+        @torch.compile(options={
+            "_fuse_symm_mem_comms": True,
+            "_symm_mem_sync_mode": "lamport",
+        })
+        def fn(inp, res, w, gn):
+            reduced = all_reduce(inp, "sum", group=gn)
+            h = reduced + res
+            normed = F.rms_norm(h, w.shape, w, eps)
+            return normed, h
+
+        with torch.inference_mode():
+            (result_normed, result_h), code = run_and_get_code(
+                fn, x, residual, weight, group_name,
+            )
+
+        torch.testing.assert_close(
+            result_normed, expected_normed, atol=2e-2, rtol=2e-2,
+        )
+        torch.testing.assert_close(
+            result_h, expected_pre_norm, atol=2e-2, rtol=2e-2,
+        )
+        self._assert_lamport_codegen(code)
+
+    @skip_if_lt_x_gpu(2)
+    def test_lamport_allreduce_rmsnorm_no_residual(self):
+        """allreduce → rmsnorm (no residual), Lamport mode."""
+        self._init_process()
+        eps = 1e-5
+
+        group_name = dist.group.WORLD.group_name
+        symm_mem.enable_symm_mem_for_group(group_name)
+
+        x = torch.randn(
+            self._ROWS, self._HIDDEN, device=self.device, dtype=torch.bfloat16,
+        )
+        weight = torch.ones(
+            self._HIDDEN, device=self.device, dtype=torch.float32,
+        )
+
+        symm_mem.get_symm_mem_workspace(
+            group_name, min_size=x.numel() * x.element_size()
+        )
+
+        expected_normed, _ = self._reference(x, weight, eps)
+
+        @torch.compile(options={
+            "_fuse_symm_mem_comms": True,
+            "_symm_mem_sync_mode": "lamport",
+        })
+        def fn(inp, w, gn):
+            reduced = all_reduce(inp, "sum", group=gn)
+            normed = F.rms_norm(reduced, w.shape, w, eps)
+            return normed
+
+        with torch.inference_mode():
+            result_normed, code = run_and_get_code(
+                fn, x, weight, group_name,
+            )
+
+        torch.testing.assert_close(
+            result_normed, expected_normed, atol=2e-2, rtol=2e-2,
+        )
+        self._assert_lamport_codegen(code)
+
+    @skip_if_lt_x_gpu(2)
+    def test_lamport_allreduce_rmsnorm_repeated(self):
+        """allreduce → residual_add → rmsnorm, repeated with fresh data.
+
+        Verifies correctness across multiple invocations of the compiled
+        function — each call advances the Lamport triple-buffer flag,
+        testing the modulo-3 slot cycling.
+        """
+        self._init_process()
+        eps = 1e-5
+
+        group_name = dist.group.WORLD.group_name
+        symm_mem.enable_symm_mem_for_group(group_name)
+
+        x = torch.randn(
+            self._ROWS, self._HIDDEN, device=self.device, dtype=torch.bfloat16,
+        )
+        residual = torch.randn(
+            self._ROWS, self._HIDDEN, device=self.device, dtype=torch.bfloat16,
+        )
+        weight = torch.ones(
+            self._HIDDEN, device=self.device, dtype=torch.float32,
+        )
+
+        symm_mem.get_symm_mem_workspace(
+            group_name, min_size=x.numel() * x.element_size()
+        )
+
+        @torch.compile(options={
+            "_fuse_symm_mem_comms": True,
+            "_symm_mem_sync_mode": "lamport",
+        })
+        def fn(inp, res, w, gn):
+            reduced = all_reduce(inp, "sum", group=gn)
+            h = reduced + res
+            normed = F.rms_norm(h, w.shape, w, eps)
+            return normed, h
+
+        # Run 6 iterations to cycle through all 3 triple-buffer slots twice.
+        with torch.inference_mode():
+            for i in range(6):
+                x_new = torch.randn(
+                    self._ROWS, self._HIDDEN,
+                    device=self.device, dtype=torch.bfloat16,
+                )
+                res_new = torch.randn(
+                    self._ROWS, self._HIDDEN,
+                    device=self.device, dtype=torch.bfloat16,
+                )
+                expected_normed, expected_pre_norm = self._reference(
+                    x_new, weight, eps, residual=res_new,
+                )
+                result_normed, result_h = fn(
+                    x_new, res_new, weight, group_name,
+                )
+                torch.testing.assert_close(
+                    result_normed, expected_normed, atol=2e-2, rtol=2e-2,
+                    msg=f"Mismatch on iteration {i}",
+                )
+                torch.testing.assert_close(
+                    result_h, expected_pre_norm, atol=2e-2, rtol=2e-2,
+                    msg=f"Mismatch on iteration {i}",
+                )
+
+    @skip_if_lt_x_gpu(2)
+    def test_lamport_allreduce_rmsnorm_cudagraph(self):
+        """allreduce → residual_add → rmsnorm under CUDA graph replay.
+
+        Enables cudagraph trees to exercise graph capture and batched
+        replay with the Lamport triple-buffer protocol.
+        """
+        import torch._inductor.config as inductor_config
+
+        self._init_process()
+        eps = 1e-5
+
+        group_name = dist.group.WORLD.group_name
+        symm_mem.enable_symm_mem_for_group(group_name)
+
+        x = torch.randn(
+            self._ROWS, self._HIDDEN, device=self.device, dtype=torch.bfloat16,
+        )
+        residual = torch.randn(
+            self._ROWS, self._HIDDEN, device=self.device, dtype=torch.bfloat16,
+        )
+        weight = torch.ones(
+            self._HIDDEN, device=self.device, dtype=torch.float32,
+        )
+
+        symm_mem.get_symm_mem_workspace(
+            group_name, min_size=x.numel() * x.element_size()
+        )
+
+        # Symmetric memory workspace tensors live outside the cudagraph
+        # pool, so disable the strict pool check that flags them.
+        with inductor_config.patch({
+            "triton.slow_path_cudagraph_asserts": False,
+            "triton.fast_path_cudagraph_asserts": False,
+        }):
+            @torch.compile(options={
+                "_fuse_symm_mem_comms": True,
+                "_symm_mem_sync_mode": "lamport",
+                "triton.cudagraphs": True,
+                "triton.cudagraph_trees": True,
+            })
+            def fn(inp, res, w, gn):
+                reduced = all_reduce(inp, "sum", group=gn)
+                h = reduced + res
+                normed = F.rms_norm(h, w.shape, w, eps)
+                return normed, h
+
+            # Warmup so cudagraph trees capture the graph.
+            with torch.inference_mode():
+                for _ in range(3):
+                    fn(x, residual, weight, group_name)
+
+            # Replay with fresh data — exercises triple-buffer cycling.
+            with torch.inference_mode():
+                for _ in range(4):
+                    x_new = torch.randn(
+                        self._ROWS, self._HIDDEN,
+                        device=self.device, dtype=torch.bfloat16,
+                    )
+                    res_new = torch.randn(
+                        self._ROWS, self._HIDDEN,
+                        device=self.device, dtype=torch.bfloat16,
+                    )
+                    expected_normed, expected_pre_norm = self._reference(
+                        x_new, weight, eps, residual=res_new,
+                    )
+                    result_normed, result_h = fn(
+                        x_new, res_new, weight, group_name,
+                    )
+                    torch.testing.assert_close(
+                        result_normed, expected_normed, atol=2e-2, rtol=2e-2,
+                    )
+                    torch.testing.assert_close(
+                        result_h, expected_pre_norm, atol=2e-2, rtol=2e-2,
+                    )
+
+
 if __name__ == "__main__":
     run_tests()
