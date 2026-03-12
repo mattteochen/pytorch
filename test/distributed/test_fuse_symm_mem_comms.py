@@ -993,52 +993,46 @@ class TestLamportAllReduceRMSNormResidualAdd(MultiProcContinuousTest):
             group_name, min_size=x.numel() * x.element_size()
         )
 
-        # Symmetric memory workspace tensors live outside the cudagraph
-        # pool, so disable the strict pool check that flags them.
-        with inductor_config.patch({
-            "triton.slow_path_cudagraph_asserts": False,
-            "triton.fast_path_cudagraph_asserts": False,
-        }):
-            @torch.compile(options={
-                "_fuse_symm_mem_comms": True,
-                "_symm_mem_sync_mode": "lamport",
-                "triton.cudagraphs": True,
-                "triton.cudagraph_trees": True,
-            })
-            def fn(inp, res, w, gn):
-                reduced = all_reduce(inp, "sum", group=gn)
-                h = reduced + res
-                normed = F.rms_norm(h, w.shape, w, eps)
-                return normed, h
+        @torch.compile(options={
+            "_fuse_symm_mem_comms": True,
+            "_symm_mem_sync_mode": "lamport",
+            "triton.cudagraphs": True,
+            "triton.cudagraph_trees": False,
+        })
+        def fn(inp, res, w, gn):
+            reduced = all_reduce(inp, "sum", group=gn)
+            h = reduced + res
+            normed = F.rms_norm(h, w.shape, w, eps)
+            return normed, h
 
-            # Warmup so cudagraph trees capture the graph.
-            with torch.inference_mode():
-                for _ in range(3):
-                    fn(x, residual, weight, group_name)
+        # Warmup so cudagraph trees capture the graph.
+        with torch.inference_mode():
+            for _ in range(3):
+                fn(x, residual, weight, group_name)
 
-            # Replay with fresh data — exercises triple-buffer cycling.
-            with torch.inference_mode():
-                for _ in range(4):
-                    x_new = torch.randn(
-                        self._ROWS, self._HIDDEN,
-                        device=self.device, dtype=torch.bfloat16,
-                    )
-                    res_new = torch.randn(
-                        self._ROWS, self._HIDDEN,
-                        device=self.device, dtype=torch.bfloat16,
-                    )
-                    expected_normed, expected_pre_norm = self._reference(
-                        x_new, weight, eps, residual=res_new,
-                    )
-                    result_normed, result_h = fn(
-                        x_new, res_new, weight, group_name,
-                    )
-                    torch.testing.assert_close(
-                        result_normed, expected_normed, atol=2e-2, rtol=2e-2,
-                    )
-                    torch.testing.assert_close(
-                        result_h, expected_pre_norm, atol=2e-2, rtol=2e-2,
-                    )
+        # Replay with fresh data — exercises triple-buffer cycling.
+        with torch.inference_mode():
+            for _ in range(6):
+                x_new = torch.randn(
+                    self._ROWS, self._HIDDEN,
+                    device=self.device, dtype=torch.bfloat16,
+                )
+                res_new = torch.randn(
+                    self._ROWS, self._HIDDEN,
+                    device=self.device, dtype=torch.bfloat16,
+                )
+                expected_normed, expected_pre_norm = self._reference(
+                    x_new, weight, eps, residual=res_new,
+                )
+                result_normed, result_h = fn(
+                    x_new, res_new, weight, group_name,
+                )
+                torch.testing.assert_close(
+                    result_normed, expected_normed, atol=2e-2, rtol=2e-2,
+                )
+                torch.testing.assert_close(
+                    result_h, expected_pre_norm, atol=2e-2, rtol=2e-2,
+                )
 
 
 if __name__ == "__main__":
