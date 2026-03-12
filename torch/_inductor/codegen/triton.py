@@ -3399,7 +3399,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         # Lamport allreduce requires PDL across ALL kernels in the graph so
         # that every predecessor calls gdc_launch_dependents() — otherwise
         # the Lamport kernel's gdc_wait() in the prologue stalls forever.
-        if config._symm_mem_sync_mode == "lamport":
+        if config._symm_mem_sync_mode in ("lamport", "nvshmem"):
             return True
         return torch._inductor.config.triton.enable_pdl
 
@@ -5369,7 +5369,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
         if self.has_symm_mem_p2p:
             sync_mode = config._symm_mem_sync_mode
-            if sync_mode == "lamport":
+            if sync_mode in ("lamport", "nvshmem"):
                 self._symm_mem_use_lamport = True
                 self._symm_mem_use_host_barriers = False
             elif sync_mode in ("device_cas", "device_cas_2_shot"):
@@ -6469,13 +6469,6 @@ class TritonScheduling(SIMDScheduling):
         # ops.sort only works with persistent reduction, and is not bandwidth bound anyway
         # so taking the hit of non-coalesced loads is okay
         if kernel_features.contains_op("sort"):
-            kernel_kwargs["override_persistent_reduction"] = True
-            kernel_kwargs["override_cooperative_reduction"] = False
-
-        # P2P allreduce loads from peer NVLink buffers -- repeating these
-        # in a looped reduction is far more expensive than register spill.
-        # Force persistent so the P2P loads happen exactly once.
-        if kernel_features.contains_op("symm_mem_p2p_reduce_load"):
             kernel_kwargs["override_persistent_reduction"] = True
             kernel_kwargs["override_cooperative_reduction"] = False
 

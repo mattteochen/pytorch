@@ -1,7 +1,7 @@
 """
 Symmetric memory P2P allreduce codegen for TritonKernel.
 
-Four sync modes: host_barrier (default), device_cas, device_cas_2_shot, lamport.
+Five sync modes: host_barrier (default), device_cas, device_cas_2_shot, lamport, nvshmem.
 All functions take an explicit kernel argument instead of using self.
 """
 
@@ -70,7 +70,7 @@ def symm_mem_p2p_reduce_load(
     kernel._symm_group_name = group_name
 
     sync_mode = config._symm_mem_sync_mode
-    if sync_mode == "lamport":
+    if sync_mode in ("lamport", "nvshmem"):
         kernel._symm_mem_use_lamport = True
         kernel._symm_mem_use_host_barriers = False
     elif sync_mode in ("device_cas", "device_cas_2_shot"):
@@ -113,7 +113,7 @@ def symm_mem_p2p_reduce_load(
     shape = indexing.expand_shape or TritonSymbols.get_block_shape(indexing.index)
     shape_str = ", ".join(str(s) for s in shape) if shape else "1"
 
-    if config._symm_mem_sync_mode == "lamport":
+    if config._symm_mem_sync_mode in ("lamport", "nvshmem"):
         _codegen_lamport_reduce_load(kernel, load_buffer, indexing, shape_str)
     elif config._symm_mem_sync_mode == "device_cas_2_shot":
         _codegen_two_shot_reduce_load(kernel, load_buffer, indexing, shape_str)

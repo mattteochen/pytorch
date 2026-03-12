@@ -1017,7 +1017,9 @@ _symm_mem_grid_cap: int = 0
 # "device_cas_2_shot" = device-side CAS, two-shot reduce-scatter+allgather (kraken).
 #                       Requires r0_numel divisible by world_size.
 # "lamport"           = Lamport push-model with -0.0 sentinel, zero barriers.
-# When set to "lamport", _symm_mem_host_barrier_threshold is ignored.
+# "nvshmem"           = Lamport push-model over NVSHMEM-backed symm_mem buffers.
+#                       Requires symm_mem.set_backend("NVSHMEM") before compilation.
+# When set to "lamport" or "nvshmem", _symm_mem_host_barrier_threshold is ignored.
 _symm_mem_sync_mode: str = "host_barrier"
 
 # Maximum tensor size (in bytes) for the P2P allreduce FX pass to fire.
