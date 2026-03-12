@@ -6475,8 +6475,13 @@ class TritonScheduling(SIMDScheduling):
         # P2P allreduce loads from peer NVLink buffers -- repeating these
         # in a looped reduction is far more expensive than register spill.
         # Force persistent so the P2P loads happen exactly once.
+        # Exception: Lamport mode pushes data into the local buffer before
+        # accumulating, so the reduce-phase loads are local memory, not
+        # NVLink.  Forcing persistent at large hidden dims (2k-4k) causes
+        # excessive register pressure with no NVLink benefit.
         if kernel_features.contains_op("symm_mem_p2p_reduce_load"):
-            kernel_kwargs["override_persistent_reduction"] = True
+            if config._symm_mem_sync_mode != "lamport":
+                kernel_kwargs["override_persistent_reduction"] = True
             kernel_kwargs["override_cooperative_reduction"] = False
 
         if not TritonKernel.has_persistent_RBLOCK(kernel_features.reduction_numel):
