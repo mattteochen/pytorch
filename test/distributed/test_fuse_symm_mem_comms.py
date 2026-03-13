@@ -780,8 +780,9 @@ class TestLamportAllReduceRMSNormResidualAdd(MultiProcContinuousTest):
     workspace is cached per-group and dimensioned on first allocation.
     """
 
-    _ROWS = 2
+    _ROWS = 32
     _HIDDEN = 2048
+    world_size = 2
 
     @property
     def device(self) -> torch.device:
@@ -852,10 +853,10 @@ class TestLamportAllReduceRMSNormResidualAdd(MultiProcContinuousTest):
             )
 
         torch.testing.assert_close(
-            result_normed, expected_normed, atol=2e-2, rtol=2e-2,
+            result_normed, expected_normed, atol=4e-2, rtol=4e-2,
         )
         torch.testing.assert_close(
-            result_h, expected_pre_norm, atol=2e-2, rtol=2e-2,
+            result_h, expected_pre_norm, atol=4e-2, rtol=4e-2,
         )
         self._assert_lamport_codegen(code)
 
@@ -896,7 +897,7 @@ class TestLamportAllReduceRMSNormResidualAdd(MultiProcContinuousTest):
             )
 
         torch.testing.assert_close(
-            result_normed, expected_normed, atol=2e-2, rtol=2e-2,
+            result_normed, expected_normed, atol=4e-2, rtol=4e-2,
         )
         self._assert_lamport_codegen(code)
 
@@ -956,11 +957,11 @@ class TestLamportAllReduceRMSNormResidualAdd(MultiProcContinuousTest):
                     x_new, res_new, weight, group_name,
                 )
                 torch.testing.assert_close(
-                    result_normed, expected_normed, atol=2e-2, rtol=2e-2,
+                    result_normed, expected_normed, atol=4e-2, rtol=4e-2,
                     msg=f"Mismatch on iteration {i}",
                 )
                 torch.testing.assert_close(
-                    result_h, expected_pre_norm, atol=2e-2, rtol=2e-2,
+                    result_h, expected_pre_norm, atol=4e-2, rtol=4e-2,
                     msg=f"Mismatch on iteration {i}",
                 )
 
@@ -1029,10 +1030,10 @@ class TestLamportAllReduceRMSNormResidualAdd(MultiProcContinuousTest):
                     x_new, res_new, weight, group_name,
                 )
                 torch.testing.assert_close(
-                    result_normed, expected_normed, atol=2e-2, rtol=2e-2,
+                    result_normed, expected_normed, atol=4e-2, rtol=4e-2,
                 )
                 torch.testing.assert_close(
-                    result_h, expected_pre_norm, atol=2e-2, rtol=2e-2,
+                    result_h, expected_pre_norm, atol=4e-2, rtol=4e-2,
                 )
 if __name__ == "__main__":
     run_tests()

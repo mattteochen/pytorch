@@ -3451,8 +3451,10 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
     def _filter_pdl(self, code: IndentedBuffer):
         # Keep first gdc_wait + last gdc_launch_dependents (in-place).
-        # Lamport kernels: strip all waits (prologue has its own).
+        # Lamport kernels: strip all waits (prologue has its own) and
+        # strip all launches (epilogue emits its own after flag advance).
         strip_wait = self.has_symm_mem_p2p and self._symm_mem_use_lamport
+        strip_launch = self.has_symm_mem_p2p and self._symm_mem_use_lamport
         new_lines = []
         has_wait = False
         previous_launch = None
@@ -3463,6 +3465,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 else:
                     has_wait = True
             if type(l) is str and self.GDC_LAUNCH in l:
+                if strip_launch:
+                    continue
                 if previous_launch is not None:
                     new_lines.pop(previous_launch)
                 previous_launch = len(new_lines)
@@ -6475,14 +6479,13 @@ class TritonScheduling(SIMDScheduling):
         # P2P allreduce loads from peer NVLink buffers -- repeating these
         # in a looped reduction is far more expensive than register spill.
         # Force persistent so the P2P loads happen exactly once.
-        # Exception: Lamport mode pushes data into the local buffer before
-        # accumulating, so the reduce-phase loads are local memory, not
-        # NVLink.  Forcing persistent at large hidden dims (2k-4k) causes
-        # excessive register pressure with no NVLink benefit.
+        # Lamport mode also requires persistent reduction: the push/poll/
+        # arrive protocol assumes it runs exactly once per block per kernel
+        # invocation. A looped reduction would re-execute the protocol on
+        # each R0_BLOCK tile, corrupting the block-arrival counter and
+        # triple-buffer state.
         if kernel_features.contains_op("symm_mem_p2p_reduce_load"):
-            # TODO(kaiximatteoc): this may cause hang
-            if config._symm_mem_sync_mode != "lamport":
-                kernel_kwargs["override_persistent_reduction"] = True
+            kernel_kwargs["override_persistent_reduction"] = True
             kernel_kwargs["override_cooperative_reduction"] = False
 
         if not TritonKernel.has_persistent_RBLOCK(kernel_features.reduction_numel):

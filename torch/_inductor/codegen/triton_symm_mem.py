@@ -452,10 +452,20 @@ def codegen_lamport_epilogue(kernel, code):
     code.splice(
         """
         # ═══ Lamport epilogue ═══════════════════════════════════════════
-        # Block 0 spins until all blocks have arrived, then advances
-        # the triple-buffer flag: meta[1] = (flag + 1) % 3, meta[0] = 0.
+        # Block 0 waits for all blocks, then advances the triple-buffer
+        # flag. All blocks must wait for the flag advance before calling
+        # gdc_launch_dependents, otherwise the successor kernel reads
+        # a stale flag.
         _lamport_advance_flag_block0(_lam_meta_i32, _lam_flag)
-        # gdc_launch_dependents is emitted by Inductor PDL codegen
+        # Non-block-0 blocks poll meta[0] until block 0 resets it to 0
+        # (which happens inside _lamport_advance_flag_block0 after the
+        # flag is advanced). Block 0 already reset it, so it sees 0.
+        if tl.program_id(0) != 0:
+            _lam_epilogue_done = tl.full([], 0, dtype=tl.int32)
+            while _lam_epilogue_done == 0:
+                _lam_cval = _lamport_volatile_load_u32(_lam_meta_i32)
+                _lam_epilogue_done = (_lam_cval == 0).to(tl.int32)
+        tl.extra.cuda.gdc_launch_dependents()
         # ═══ end epilogue ═══════════════════════════════════════════════
         """
     )
