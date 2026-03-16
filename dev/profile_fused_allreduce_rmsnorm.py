@@ -481,7 +481,7 @@ def main():
             return torch.compile(_fn, options={
                 "_fuse_symm_mem_comms": True,
                 "_symm_mem_sync_mode": "lamport",
-                # "trace.enabled": True,
+                "trace.enabled": True,
             })
 
         ar_norm_lamport = _make_lamport_ar_norm(EPS)

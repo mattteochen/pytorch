@@ -371,6 +371,18 @@ def _codegen_lamport_reduce_load(kernel, load_buffer, indexing, shape_str: str):
                 f"{indexing.mask_str}, R0_BLOCK).to(tl.float32)"
             )
 
+    load_buffer.splice(
+        """
+        # ─── Lamport flag advance: all blocks arrived, advance triple-buffer ───
+        _lamport_advance_flag_block0(_lam_meta_i32, _lam_flag)
+        if tl.program_id(0) != 0:
+            _lam_epilogue_done = tl.full([], 0, dtype=tl.int32)
+            while _lam_epilogue_done == 0:
+                _lam_cval = _lamport_volatile_load_u32(_lam_meta_i32)
+                _lam_epilogue_done = (_lam_cval == 0).to(tl.int32)
+        """
+    )
+
 
 # ------------------------------------------------------------------
 # Prologue / epilogue: pull model (device_cas)
@@ -464,29 +476,6 @@ def codegen_lamport_prologue(kernel, code):
         _lam_cols = tl.arange(0, R0_BLOCK)
         _lam_col_mask = _lam_cols < r0_numel
         # ═══ end prologue ═══════════════════════════════════════════════
-        """
-    )
-
-
-def codegen_lamport_epilogue(kernel, code):
-    code.splice(
-        """
-        # ═══ Lamport epilogue ═══════════════════════════════════════════
-        # Block 0 waits for all blocks, then advances the triple-buffer
-        # flag. All blocks must wait for the flag advance before calling
-        # gdc_launch_dependents, otherwise the successor kernel reads
-        # a stale flag.
-        _lamport_advance_flag_block0(_lam_meta_i32, _lam_flag)
-        # Non-block-0 blocks poll meta[0] until block 0 resets it to 0
-        # (which happens inside _lamport_advance_flag_block0 after the
-        # flag is advanced). Block 0 already reset it, so it sees 0.
-        if tl.program_id(0) != 0:
-            _lam_epilogue_done = tl.full([], 0, dtype=tl.int32)
-            while _lam_epilogue_done == 0:
-                _lam_cval = _lamport_volatile_load_u32(_lam_meta_i32)
-                _lam_epilogue_done = (_lam_cval == 0).to(tl.int32)
-        tl.extra.cuda.gdc_launch_dependents()
-        # ═══ end epilogue ═══════════════════════════════════════════════
         """
     )
 
