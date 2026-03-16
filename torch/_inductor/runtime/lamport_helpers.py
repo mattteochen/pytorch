@@ -3,6 +3,12 @@ Lamport push-model P2P allreduce helpers for inductor-generated Triton kernels.
 
 @triton.jit helpers for the sentinel protocol (push, volatile poll, fence,
 clear) and Python workspace management (triple-buffered symmetric memory).
+
+Key correctness invariant: the poll must check one sentinel word per cache
+line (128 bytes = 32 u32 words) across the row, not just the first or last
+word.  NVLink delivers cache-line writes out of order, so a single sentinel
+cannot guarantee that the entire row is visible.  See the codegen comment in
+triton_symm_mem.py for the full rationale.
 """
 
 from __future__ import annotations
@@ -163,27 +169,40 @@ def _lamport_poll_all_peers(
     XBLOCK: tl.constexpr,
     xnumel,
 ):
-    # Simultaneous poll: single while-loop checks all non-self peers per row.
+    # Poll sentinel words spread across every cache line (128 bytes = 32 u32
+    # words) for each peer per row.  A single sentinel (first or last) is
+    # insufficient because NVLink can deliver cache-line writes out of order.
+    _STRIDE: tl.constexpr = 32  # u32 words per cache line
     for row in tl.static_range(XBLOCK):
         row_idx = x_base + row
         if row_idx < xnumel:
             row_offset = row_idx * r0_numel
-            _lam_done = tl.full([], 0, dtype=tl.int32)
-            while _lam_done == 0:
-                _lam_cnt = tl.full([], 0, dtype=tl.int32)
-                for peer in tl.static_range(WORLD_SIZE):
-                    if peer != RANK:
-                        slot_bf16 = my_buf_base + peer * chunk + row_offset
-                        slot_u32 = slot_bf16.to(tl.pointer_type(tl.uint32))
-                        last_addr = slot_u32 + (n_words - 1)
-                        w = _volatile_load_u32_scalar(last_addr)
-                        lo = w & 0xFFFF
-                        hi = (w >> 16) & 0xFFFF
-                        peer_ready = ((lo != _NEG_ZERO) & (hi != _NEG_ZERO)).to(
+            for peer in tl.static_range(WORLD_SIZE):
+                if peer != RANK:
+                    slot_bf16 = my_buf_base + peer * chunk + row_offset
+                    slot_u32 = slot_bf16.to(tl.pointer_type(tl.uint32))
+                    # Poll every _STRIDE-th word, plus the last word.
+                    # word_pos steps: 0, 32, 64, ..., and n_words-1.
+                    word_pos = tl.full([], 0, dtype=tl.int32)
+                    while word_pos < n_words:
+                        _word_ready = tl.full([], 0, dtype=tl.int32)
+                        while _word_ready == 0:
+                            w = _volatile_load_u32_scalar(slot_u32 + word_pos)
+                            lo = w & 0xFFFF
+                            hi = (w >> 16) & 0xFFFF
+                            _word_ready = ((lo != _NEG_ZERO) & (hi != _NEG_ZERO)).to(
+                                tl.int32
+                            )
+                        word_pos = word_pos + _STRIDE
+                    # Always check the very last word too.
+                    _last_ready = tl.full([], 0, dtype=tl.int32)
+                    while _last_ready == 0:
+                        wL = _volatile_load_u32_scalar(slot_u32 + (n_words - 1))
+                        loL = wL & 0xFFFF
+                        hiL = (wL >> 16) & 0xFFFF
+                        _last_ready = ((loL != _NEG_ZERO) & (hiL != _NEG_ZERO)).to(
                             tl.int32
                         )
-                        _lam_cnt = _lam_cnt + peer_ready
-                _lam_done = (_lam_cnt == WORLD_SIZE - 1).to(tl.int32)
     _fence_acquire_sys()
 
 

@@ -270,6 +270,36 @@ def _codegen_two_shot_reduce_load(kernel, load_buffer, indexing, shape_str: str)
 
 # ------------------------------------------------------------------
 # Body codegen: Lamport push model
+#
+# The Lamport allreduce uses a push-based protocol with negative-zero
+# sentinels (bf16 bit pattern 0x8000) instead of explicit barriers.
+# Each rank writes its local data into every peer's symmetric memory
+# buffer, and peers poll until the sentinel is overwritten with real
+# data.  Triple-buffering (3 slots) allows overlap with CUDA graphs.
+#
+# Generated kernel structure:
+#   1. Push  – load local input, strip -0.0, store into each peer's
+#              buffer at [buf_offset + my_rank * chunk + row * N + col].
+#   2. Clear – re-arm the oldest triple-buffer slot ((flag+2)%3) with
+#              -0.0 sentinels so it is ready for reuse two calls later.
+#   3. Fence + arrive – fence.sc.sys makes stores visible system-wide;
+#              block_arrive counts blocks for the in-kernel flag advance.
+#   4. Poll  – volatile-load one sentinel word per cache line (128 B)
+#              per peer per row.  Checking only one word per row is
+#              insufficient: NVLink can deliver cache-line writes out of
+#              order, so earlier cache lines may still be in flight when
+#              the last one lands.  After all sentinels are non-sentinel,
+#              fence.acquire.sys ensures subsequent regular loads see the
+#              committed data.
+#   5. Accumulate – load own input + peer data from the local buffer,
+#              sum into _symm_acc for downstream consumers (rmsnorm etc).
+#
+# Reference: cutlass/examples/python/CuTeDSL/distributed/
+#            all_reduce_one_shot_lamport.py
+# The reference uses .SYS + .VOLATILE on every 128-bit load/store, so
+# it implicitly checks every element.  Here we use regular tl.store +
+# fence.sc.sys for the push, so the poll must explicitly cover every
+# cache line to avoid reading stale sentinels.
 # ------------------------------------------------------------------
 
 

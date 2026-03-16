@@ -1025,7 +1025,7 @@ _symm_mem_sync_mode: str = "host_barrier"
 # NVLink traffic scales as world_size * data_size. For large tensors
 # this loses to NCCL ring/tree allreduce (2 * data_size). Setting to 0
 # disables the gate (always use P2P regardless of size).
-_fuse_symm_mem_comms_max_bytes: int = 1048576  # 1 MB
+_fuse_symm_mem_comms_max_bytes: int = 0  # 1 MB
 
 
 # Enable/disable partitioned scatter optimization for atomic add kernels
