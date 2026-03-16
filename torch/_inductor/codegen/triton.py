@@ -6475,14 +6475,16 @@ class TritonScheduling(SIMDScheduling):
             kernel_kwargs["override_persistent_reduction"] = True
             kernel_kwargs["override_cooperative_reduction"] = False
 
-        # P2P allreduce loads from peer NVLink buffers -- repeating these
-        # in a looped reduction is far more expensive than register spill.
-        # Force persistent so the P2P loads happen exactly once.
-        # Lamport mode also requires persistent reduction: the push/poll/
-        # arrive protocol assumes it runs exactly once per block per kernel
-        # invocation. A looped reduction would re-execute the protocol on
-        # each R0_BLOCK tile, corrupting the block-arrival counter and
-        # triple-buffer state.
+        # Lamport mode requires persistent reduction for correctness:
+        # _lamport_block_arrive increments an atomic counter and
+        # _lamport_advance_flag_block0 expects exactly tl.num_programs(0)
+        # arrivals. A looped reduction would call arrive once per R0_BLOCK
+        # tile, overcounting and advancing the triple-buffer flag early.
+        #
+        # Pull-mode P2P loads are hoisted above the reduction loop by
+        # get_load_buffer (no rindex), so they wouldn't literally repeat,
+        # but we force persistent uniformly to avoid fragile dependence on
+        # that routing and to keep device-side sync barriers out of the loop.
         if kernel_features.contains_op("symm_mem_p2p_reduce_load"):
             kernel_kwargs["override_persistent_reduction"] = True
             kernel_kwargs["override_cooperative_reduction"] = False
