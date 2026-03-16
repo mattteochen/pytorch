@@ -100,7 +100,7 @@ class TestLamportAllReduce(TestCase):
 
     def _assert_lamport_codegen(self, code_list):
         code = "\n".join(code_list)
-        self.assertIn("_lamport_poll_all_peers", code)
+        self.assertIn("_lamport_poll_load", code)
         self.assertIn("_lamport_clear_old_slot", code)
         self.assertIn("lamport_workspace_peer_bufs", code)
         self.assertIn("_lamport_advance_flag_block0", code)

@@ -526,8 +526,8 @@ class TestFusedAllReduceRMSNormDistributed(MultiProcContinuousTest):
     def _assert_lamport_codegen(self, code_list):
         """Verify the generated code uses Lamport helpers, not pull model."""
         code = "\n".join(code_list)
-        self.assertIn("_lamport_poll_all_peers", code,
-                       "Kernel should call _lamport_poll_all_peers")
+        self.assertIn("_lamport_poll_load", code,
+                       "Kernel should call _lamport_poll_load")
         self.assertIn("_lamport_clear_old_slot", code,
                        "Kernel should call _lamport_clear_old_slot (epilogue)")
         self.assertIn("lamport_workspace_peer_bufs", code,
@@ -556,7 +556,7 @@ class TestFusedAllReduceRMSNormDistributed(MultiProcContinuousTest):
                           "Wrapper should NOT use host barriers")
         self.assertNotIn("lamport_workspace_peer_bufs", code,
                           "Wrapper should NOT use Lamport setup")
-        self.assertNotIn("_lamport_poll_all_peers", code,
+        self.assertNotIn("_lamport_poll_load", code,
                           "Kernel should NOT use Lamport reduce")
 
     def _assert_host_barrier_codegen(self, code_list):
@@ -570,7 +570,7 @@ class TestFusedAllReduceRMSNormDistributed(MultiProcContinuousTest):
                           "Kernel should NOT use device-side CAS sync")
         self.assertNotIn("lamport_workspace_peer_bufs", code,
                           "Wrapper should NOT use Lamport setup")
-        self.assertNotIn("_lamport_poll_all_peers", code,
+        self.assertNotIn("_lamport_poll_load", code,
                           "Kernel should NOT use Lamport reduce")
 
     def _compile_allreduce_sum_with_codegen(
@@ -805,7 +805,7 @@ class TestLamportAllReduceRMSNormResidualAdd(MultiProcContinuousTest):
 
     def _assert_lamport_codegen(self, code_list):
         code = "\n".join(code_list)
-        self.assertIn("_lamport_poll_all_peers", code)
+        self.assertIn("_lamport_poll_load", code)
         self.assertIn("_lamport_clear_old_slot", code)
         self.assertIn("lamport_workspace_peer_bufs", code)
         self.assertIn("_lamport_advance_flag_block0", code)

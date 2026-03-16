@@ -284,22 +284,18 @@ def _codegen_two_shot_reduce_load(kernel, load_buffer, indexing, shape_str: str)
 #              -0.0 sentinels so it is ready for reuse two calls later.
 #   3. Fence + arrive – fence.sc.sys makes stores visible system-wide;
 #              block_arrive counts blocks for the in-kernel flag advance.
-#   4. Poll  – volatile-load one sentinel word per cache line (128 B)
-#              per peer per row.  Checking only one word per row is
-#              insufficient: NVLink can deliver cache-line writes out of
-#              order, so earlier cache lines may still be in flight when
-#              the last one lands.  After all sentinels are non-sentinel,
-#              fence.acquire.sys ensures subsequent regular loads see the
-#              committed data.
-#   5. Accumulate – load own input + peer data from the local buffer,
-#              sum into _symm_acc for downstream consumers (rmsnorm etc).
+#   4. Poll-load + accumulate – for each peer, load the data and check
+#              every element for -0.0; retry until the entire vector is
+#              clean.  The poll IS the data read (no separate poll step).
+#              This matches FlashInfer's methodology and avoids relying
+#              on NVLink cache-line delivery order.
 #
 # Reference: cutlass/examples/python/CuTeDSL/distributed/
 #            all_reduce_one_shot_lamport.py
-# The reference uses .SYS + .VOLATILE on every 128-bit load/store, so
-# it implicitly checks every element.  Here we use regular tl.store +
-# fence.sc.sys for the push, so the poll must explicitly cover every
-# cache line to avoid reading stale sentinels.
+# The reference uses .SYS + .VOLATILE on every 128-bit load/store.
+# FlashInfer (third_party/flashinfer/include/flashinfer/comm/
+# trtllm_allreduce.cuh) also checks every element of each volatile
+# load via has_neg_zero() — the poll is the data read.
 # ------------------------------------------------------------------
 
 
@@ -356,16 +352,11 @@ def _codegen_lamport_reduce_load(kernel, load_buffer, indexing, shape_str: str):
     )
 
     load_buffer.writeline(
-        "# ─── Lamport poll + accumulate: wait for peers, sum all shards ─────"
+        "# ─── Lamport poll-load + accumulate: load peer data, retry on sentinel ──"
     )
     load_buffer.writeline(
         f"_symm_acc = tl.load({in_var} + ({indexing.index_str}), "
         f"{indexing.mask_str}, other=0.0).to(tl.float32)"
-    )
-    load_buffer.writeline(
-        "_lamport_poll_all_peers("
-        "_lam_my_buf_base, _lam_x_base, r0_numel, _lam_chunk, _lam_n_words, "
-        "SYMM_RANK, SYMM_WORLD_SIZE, XBLOCK, xnumel)"
     )
     for i in range(kernel.symm_mem_world_size):
         load_buffer.writeline(f"if {i} != SYMM_RANK:")
@@ -375,9 +366,9 @@ def _codegen_lamport_reduce_load(kernel, load_buffer, indexing, shape_str: str):
                 f".to(tl.pointer_type({tl_dtype}))"
             )
             load_buffer.writeline(
-                f"_symm_acc = _symm_acc + tl.load("
-                f"_symm_peer + ({indexing.index_str}), "
-                f"{indexing.mask_str}, other=0.0).to(tl.float32)"
+                f"_symm_acc = _symm_acc + _lamport_poll_load("
+                f"_symm_peer, ({indexing.index_str}), "
+                f"{indexing.mask_str}, R0_BLOCK).to(tl.float32)"
             )
 
 
@@ -472,7 +463,6 @@ def codegen_lamport_prologue(kernel, code):
         _lam_x_base = tl.program_id(0).to(tl.int64) * XBLOCK
         _lam_cols = tl.arange(0, R0_BLOCK)
         _lam_col_mask = _lam_cols < r0_numel
-        _lam_n_words = r0_numel // 2
         # ═══ end prologue ═══════════════════════════════════════════════
         """
     )
