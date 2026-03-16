@@ -3396,6 +3396,10 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             and torch.cuda.get_device_capability()[0] >= 9
         ):
             return False
+        # Lamport protocol requires PDL (gdc_wait/gdc_launch_dependents)
+        # for triple-buffer back-pressure, even when global PDL is off.
+        if getattr(V.kernel, '_symm_mem_use_lamport', False):
+            return True
         return torch._inductor.config.triton.enable_pdl
 
     def _handle_pdl_before_access(
@@ -3446,10 +3450,10 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
     def _filter_pdl(self, code: IndentedBuffer):
         # Keep first gdc_wait + last gdc_launch_dependents (in-place).
-        # Lamport kernels: strip all waits (prologue has its own) and
-        # strip all launches (epilogue emits its own after flag advance).
+        # Lamport kernels: strip all waits (prologue has its own).
+        # Launch dependents handled by standard PDL filter (keep last).
         strip_wait = self.has_symm_mem_p2p and self._symm_mem_use_lamport
-        strip_launch = self.has_symm_mem_p2p and self._symm_mem_use_lamport
+        strip_launch = False
         new_lines = []
         has_wait = False
         previous_launch = None
@@ -5567,8 +5571,11 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             triton_meta["launch_cooperative_grid"] = True
 
         if self.has_symm_mem_p2p and self._symm_mem_use_lamport:
-            # Lamport triple-buffered allreduce needs PDL to prevent
-            # CUDA graph batched replay from overrunning the 3-slot headroom.
+            # Lamport triple-buffered allreduce needs PDL for two reasons:
+            # 1. gdc_wait() in the prologue prevents CUDA graph batched
+            #    replay from overrunning the 3-slot headroom.
+            # 2. gdc_launch_dependents() after the flag advance lets the
+            #    successor kernel start before rmsnorm stores complete.
             triton_meta["launch_pdl"] = True
 
         # Skip memory optimization for forward of the training loop where we expect
@@ -5770,9 +5777,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                     _symm_mem.codegen_grid_stride_body(self, code)
             else:
                 code.splice(self.body)
-            if self.has_symm_mem_p2p and self._symm_mem_use_lamport:
-                _symm_mem.codegen_lamport_epilogue(self, code)
-            elif self.has_symm_mem_p2p and not self._symm_mem_use_host_barriers:
+            if self.has_symm_mem_p2p and not self._symm_mem_use_host_barriers and not self._symm_mem_use_lamport:
                 _symm_mem.codegen_symm_mem_epilogue(self, code)
             if config.triton.proton_profiling:
                 code.writeline(f'pl.exit_scope("{kernel_name}")')
