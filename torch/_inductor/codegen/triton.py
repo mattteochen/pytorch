@@ -3396,11 +3396,6 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             and torch.cuda.get_device_capability()[0] >= 9
         ):
             return False
-        # Lamport allreduce requires PDL across ALL kernels in the graph so
-        # that every predecessor calls gdc_launch_dependents() — otherwise
-        # the Lamport kernel's gdc_wait() in the prologue stalls forever.
-        if config._symm_mem_sync_mode == "lamport":
-            return True
         return torch._inductor.config.triton.enable_pdl
 
     def _handle_pdl_before_access(
