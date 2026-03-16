@@ -83,20 +83,6 @@ def _find_all_reduce_wait_patterns(
 
 
 def _can_replace(all_reduce_node: fx.Node, wait_node: fx.Node) -> bool:
-    try:
-        from torch.distributed._symmetric_memory import is_symm_mem_enabled_for_group
-
-        group_name = _get_group_name(all_reduce_node)
-        if not is_symm_mem_enabled_for_group(group_name):
-            log.debug(
-                "Cannot replace: symmetric memory not enabled for group %s",
-                group_name,
-            )
-            return False
-    except ImportError:
-        log.debug("Cannot replace: symmetric memory module not available")
-        return False
-
     # Guard on supported dtypes — the codegen only supports float types.
     # Lamport mode further requires 2-byte types (bf16/fp16) for the
     # sentinel protocol; that is checked at codegen time.

@@ -270,6 +270,32 @@ def _codegen_two_shot_reduce_load(kernel, load_buffer, indexing, shape_str: str)
 
 # ------------------------------------------------------------------
 # Body codegen: Lamport push model
+#
+# The Lamport allreduce uses a push-based protocol with negative-zero
+# sentinels (bf16 bit pattern 0x8000) instead of explicit barriers.
+# Each rank writes its local data into every peer's symmetric memory
+# buffer, and peers poll until the sentinel is overwritten with real
+# data.  Triple-buffering (3 slots) allows overlap with CUDA graphs.
+#
+# Generated kernel structure:
+#   1. Push  – load local input, strip -0.0, store into each peer's
+#              buffer at [buf_offset + my_rank * chunk + row * N + col].
+#   2. Clear – re-arm the oldest triple-buffer slot ((flag+2)%3) with
+#              -0.0 sentinels so it is ready for reuse two calls later.
+#   3. Fence + arrive – fence.sc.sys makes stores visible system-wide;
+#              block_arrive counts blocks for the in-kernel flag advance.
+#   4. Poll-load + accumulate – for each peer, load the data and check
+#              every element for -0.0; retry until the entire vector is
+#              clean.  The poll IS the data read (no separate poll step).
+#              This matches FlashInfer's methodology and avoids relying
+#              on NVLink cache-line delivery order.
+#
+# Reference: cutlass/examples/python/CuTeDSL/distributed/
+#            all_reduce_one_shot_lamport.py
+# The reference uses .SYS + .VOLATILE on every 128-bit load/store.
+# FlashInfer (third_party/flashinfer/include/flashinfer/comm/
+# trtllm_allreduce.cuh) also checks every element of each volatile
+# load via has_neg_zero() — the poll is the data read.
 # ------------------------------------------------------------------
 
 
@@ -326,16 +352,11 @@ def _codegen_lamport_reduce_load(kernel, load_buffer, indexing, shape_str: str):
     )
 
     load_buffer.writeline(
-        "# ─── Lamport poll + accumulate: wait for peers, sum all shards ─────"
+        "# ─── Lamport poll-load + accumulate: load peer data, retry on sentinel ──"
     )
     load_buffer.writeline(
         f"_symm_acc = tl.load({in_var} + ({indexing.index_str}), "
         f"{indexing.mask_str}, other=0.0).to(tl.float32)"
-    )
-    load_buffer.writeline(
-        "_lamport_poll_all_peers("
-        "_lam_my_buf_base, _lam_x_base, r0_numel, _lam_chunk, _lam_n_words, "
-        "SYMM_RANK, SYMM_WORLD_SIZE, XBLOCK, xnumel)"
     )
     for i in range(kernel.symm_mem_world_size):
         load_buffer.writeline(f"if {i} != SYMM_RANK:")
@@ -345,10 +366,22 @@ def _codegen_lamport_reduce_load(kernel, load_buffer, indexing, shape_str: str):
                 f".to(tl.pointer_type({tl_dtype}))"
             )
             load_buffer.writeline(
-                f"_symm_acc = _symm_acc + tl.load("
-                f"_symm_peer + ({indexing.index_str}), "
-                f"{indexing.mask_str}, other=0.0).to(tl.float32)"
+                f"_symm_acc = _symm_acc + _lamport_poll_load("
+                f"_symm_peer, ({indexing.index_str}), "
+                f"{indexing.mask_str}, R0_BLOCK).to(tl.float32)"
             )
+
+    load_buffer.splice(
+        """
+        # ─── Lamport flag advance: all blocks arrived, advance triple-buffer ───
+        _lamport_advance_flag_block0(_lam_meta_i32, _lam_flag)
+        if tl.program_id(0) != 0:
+            _lam_epilogue_done = tl.full([], 0, dtype=tl.int32)
+            while _lam_epilogue_done == 0:
+                _lam_cval = _lamport_volatile_load_u32(_lam_meta_i32)
+                _lam_epilogue_done = (_lam_cval == 0).to(tl.int32)
+        """
+    )
 
 
 # ------------------------------------------------------------------
@@ -442,31 +475,7 @@ def codegen_lamport_prologue(kernel, code):
         _lam_x_base = tl.program_id(0).to(tl.int64) * XBLOCK
         _lam_cols = tl.arange(0, R0_BLOCK)
         _lam_col_mask = _lam_cols < r0_numel
-        _lam_n_words = r0_numel // 2
         # ═══ end prologue ═══════════════════════════════════════════════
-        """
-    )
-
-
-def codegen_lamport_epilogue(kernel, code):
-    code.splice(
-        """
-        # ═══ Lamport epilogue ═══════════════════════════════════════════
-        # Block 0 waits for all blocks, then advances the triple-buffer
-        # flag. All blocks must wait for the flag advance before calling
-        # gdc_launch_dependents, otherwise the successor kernel reads
-        # a stale flag.
-        _lamport_advance_flag_block0(_lam_meta_i32, _lam_flag)
-        # Non-block-0 blocks poll meta[0] until block 0 resets it to 0
-        # (which happens inside _lamport_advance_flag_block0 after the
-        # flag is advanced). Block 0 already reset it, so it sees 0.
-        if tl.program_id(0) != 0:
-            _lam_epilogue_done = tl.full([], 0, dtype=tl.int32)
-            while _lam_epilogue_done == 0:
-                _lam_cval = _lamport_volatile_load_u32(_lam_meta_i32)
-                _lam_epilogue_done = (_lam_cval == 0).to(tl.int32)
-        tl.extra.cuda.gdc_launch_dependents()
-        # ═══ end epilogue ═══════════════════════════════════════════════
         """
     )
 

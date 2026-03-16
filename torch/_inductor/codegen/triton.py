@@ -3396,10 +3396,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             and torch.cuda.get_device_capability()[0] >= 9
         ):
             return False
-        # Lamport allreduce requires PDL across ALL kernels in the graph so
-        # that every predecessor calls gdc_launch_dependents() — otherwise
-        # the Lamport kernel's gdc_wait() in the prologue stalls forever.
-        if config._symm_mem_sync_mode == "lamport":
+        # Lamport protocol requires PDL (gdc_wait/gdc_launch_dependents)
+        # for triple-buffer back-pressure, even when global PDL is off.
+        if getattr(V.kernel, '_symm_mem_use_lamport', False):
             return True
         return torch._inductor.config.triton.enable_pdl
 
@@ -3451,10 +3450,10 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
     def _filter_pdl(self, code: IndentedBuffer):
         # Keep first gdc_wait + last gdc_launch_dependents (in-place).
-        # Lamport kernels: strip all waits (prologue has its own) and
-        # strip all launches (epilogue emits its own after flag advance).
+        # Lamport kernels: strip all waits (prologue has its own).
+        # Launch dependents handled by standard PDL filter (keep last).
         strip_wait = self.has_symm_mem_p2p and self._symm_mem_use_lamport
-        strip_launch = self.has_symm_mem_p2p and self._symm_mem_use_lamport
+        strip_launch = False
         new_lines = []
         has_wait = False
         previous_launch = None
@@ -5407,8 +5406,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                         _fence_sys as _lamport_fence_sys,
                         _volatile_load_u32_scalar as _lamport_volatile_load_u32,
                         _remove_neg_zero as _lamport_remove_neg_zero,
-                        _lamport_poll_rows,
-                        _lamport_poll_all_peers,
+                        _lamport_poll_load,
                         _lamport_clear_old_slot,
                         _lamport_block_arrive,
                         _lamport_advance_flag_block0,
@@ -5573,8 +5571,11 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             triton_meta["launch_cooperative_grid"] = True
 
         if self.has_symm_mem_p2p and self._symm_mem_use_lamport:
-            # Lamport triple-buffered allreduce needs PDL to prevent
-            # CUDA graph batched replay from overrunning the 3-slot headroom.
+            # Lamport triple-buffered allreduce needs PDL for two reasons:
+            # 1. gdc_wait() in the prologue prevents CUDA graph batched
+            #    replay from overrunning the 3-slot headroom.
+            # 2. gdc_launch_dependents() after the flag advance lets the
+            #    successor kernel start before rmsnorm stores complete.
             triton_meta["launch_pdl"] = True
 
         # Skip memory optimization for forward of the training loop where we expect
@@ -5776,9 +5777,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                     _symm_mem.codegen_grid_stride_body(self, code)
             else:
                 code.splice(self.body)
-            if self.has_symm_mem_p2p and self._symm_mem_use_lamport:
-                _symm_mem.codegen_lamport_epilogue(self, code)
-            elif self.has_symm_mem_p2p and not self._symm_mem_use_host_barriers:
+            if self.has_symm_mem_p2p and not self._symm_mem_use_host_barriers and not self._symm_mem_use_lamport:
                 _symm_mem.codegen_symm_mem_epilogue(self, code)
             if config.triton.proton_profiling:
                 code.writeline(f'pl.exit_scope("{kernel_name}")')
@@ -6476,14 +6475,16 @@ class TritonScheduling(SIMDScheduling):
             kernel_kwargs["override_persistent_reduction"] = True
             kernel_kwargs["override_cooperative_reduction"] = False
 
-        # P2P allreduce loads from peer NVLink buffers -- repeating these
-        # in a looped reduction is far more expensive than register spill.
-        # Force persistent so the P2P loads happen exactly once.
-        # Lamport mode also requires persistent reduction: the push/poll/
-        # arrive protocol assumes it runs exactly once per block per kernel
-        # invocation. A looped reduction would re-execute the protocol on
-        # each R0_BLOCK tile, corrupting the block-arrival counter and
-        # triple-buffer state.
+        # Lamport mode requires persistent reduction for correctness:
+        # _lamport_block_arrive increments an atomic counter and
+        # _lamport_advance_flag_block0 expects exactly tl.num_programs(0)
+        # arrivals. A looped reduction would call arrive once per R0_BLOCK
+        # tile, overcounting and advancing the triple-buffer flag early.
+        #
+        # Pull-mode P2P loads are hoisted above the reduction loop by
+        # get_load_buffer (no rindex), so they wouldn't literally repeat,
+        # but we force persistent uniformly to avoid fragile dependence on
+        # that routing and to keep device-side sync barriers out of the loop.
         if kernel_features.contains_op("symm_mem_p2p_reduce_load"):
             kernel_kwargs["override_persistent_reduction"] = True
             kernel_kwargs["override_cooperative_reduction"] = False

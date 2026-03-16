@@ -3,6 +3,12 @@ Lamport push-model P2P allreduce helpers for inductor-generated Triton kernels.
 
 @triton.jit helpers for the sentinel protocol (push, volatile poll, fence,
 clear) and Python workspace management (triple-buffered symmetric memory).
+
+Key correctness invariant: the poll-load must check every element it reads for
+the -0.0 sentinel before using the data.  The poll IS the data read — there is
+no separate poll-then-load step.  This matches FlashInfer's methodology and
+avoids relying on NVLink cache-line delivery order.
+See triton_symm_mem.py for the full protocol description.
 """
 
 from __future__ import annotations
@@ -38,8 +44,6 @@ def _fence_sys():
 
 @triton.jit
 def _fence_acquire_sys():
-    # Pairs with writer's fence.sc.sys; needed after sentinel poll before
-    # non-volatile data loads to prevent stale L2 cache hits.
     tl.inline_asm_elementwise(
         "fence.acquire.sys;",
         "=r",
@@ -69,14 +73,11 @@ def _remove_neg_zero(val):
 
 
 @triton.jit
-def _poll_last_word(slot_u32_ptr, n_words):
-    last_addr = slot_u32_ptr + (n_words - 1)
-    ready = tl.full([], 0, dtype=tl.int32)
-    while ready == 0:
-        w = _volatile_load_u32_scalar(last_addr)
-        lo = w & 0xFFFF
-        hi = (w >> 16) & 0xFFFF
-        ready = ((lo != _NEG_ZERO) & (hi != _NEG_ZERO)).to(tl.int32)
+def _has_neg_zero(val):
+    """Return scalar int32 1 if any element in val is -0.0, else 0."""
+    bits = val.to(tl.uint16, bitcast=True)
+    has_sentinel = (bits == _NEG_ZERO).to(tl.int32)
+    return (tl.sum(has_sentinel) > 0).to(tl.int32)
 
 
 # ---------------------------------------------------------------------------
@@ -85,106 +86,28 @@ def _poll_last_word(slot_u32_ptr, n_words):
 
 
 @triton.jit
-def _lamport_push_to_peers(
-    buf_ptrs_u64,
-    data,
-    row_offset,
-    cols,
+def _lamport_poll_load(
+    buf_ptr,
+    idx,
     mask,
-    chunk,
-    buf_offset,
-    RANK: tl.constexpr,
-    WORLD_SIZE: tl.constexpr,
-):
-    for peer in tl.static_range(WORLD_SIZE):
-        if peer != RANK:
-            peer_buf = tl.load(buf_ptrs_u64 + peer).to(tl.pointer_type(tl.bfloat16))
-            tl.store(
-                peer_buf + buf_offset + RANK * chunk + row_offset + cols,
-                data,
-                mask=mask,
-            )
-
-
-@triton.jit
-def _lamport_poll_and_reduce(
-    my_buf_base,
-    row_offset,
-    cols,
-    mask,
-    chunk,
-    n_words,
-    WORLD_SIZE: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    acc = tl.zeros([BLOCK_N], dtype=tl.float32)
-    for peer in tl.static_range(WORLD_SIZE):
-        slot_bf16 = my_buf_base + peer * chunk + row_offset
-        slot_u32 = slot_bf16.to(tl.pointer_type(tl.uint32))
-        _poll_last_word(slot_u32, n_words)
-        val = tl.load(slot_bf16 + cols, mask=mask, other=0.0)
-        acc += val.to(tl.float32)
-    return acc
+    """Spin-load until all elements are non-sentinel, then return the data.
 
+    The poll IS the read: we load the data, check every element for -0.0,
+    and retry until the entire vector is clean.  This matches FlashInfer's
+    methodology — no separate poll + load steps, no assumptions about
+    NVLink cache-line delivery order.
 
-@triton.jit
-def _lamport_poll_rows(
-    my_buf_base,
-    x_base,
-    r0_numel,
-    chunk,
-    n_words,
-    RANK: tl.constexpr,
-    WORLD_SIZE: tl.constexpr,
-    XBLOCK: tl.constexpr,
-    xnumel,
-):
-    for row in tl.static_range(XBLOCK):
-        row_idx = x_base + row
-        if row_idx < xnumel:
-            row_offset = row_idx * r0_numel
-            for peer in tl.static_range(WORLD_SIZE):
-                if peer != RANK:
-                    slot_bf16 = my_buf_base + peer * chunk + row_offset
-                    slot_u32 = slot_bf16.to(tl.pointer_type(tl.uint32))
-                    _poll_last_word(slot_u32, n_words)
-    _fence_acquire_sys()
-
-
-@triton.jit
-def _lamport_poll_all_peers(
-    my_buf_base,
-    x_base,
-    r0_numel,
-    chunk,
-    n_words,
-    RANK: tl.constexpr,
-    WORLD_SIZE: tl.constexpr,
-    XBLOCK: tl.constexpr,
-    xnumel,
-):
-    # Simultaneous poll: single while-loop checks all non-self peers per row.
-    for row in tl.static_range(XBLOCK):
-        row_idx = x_base + row
-        if row_idx < xnumel:
-            row_offset = row_idx * r0_numel
-            _lam_done = tl.full([], 0, dtype=tl.int32)
-            while _lam_done == 0:
-                _lam_cnt = tl.full([], 0, dtype=tl.int32)
-                for peer in tl.static_range(WORLD_SIZE):
-                    if peer != RANK:
-                        slot_bf16 = my_buf_base + peer * chunk + row_offset
-                        slot_u32 = slot_bf16.to(tl.pointer_type(tl.uint32))
-                        last_addr = slot_u32 + (n_words - 1)
-                        w = _volatile_load_u32_scalar(last_addr)
-                        lo = w & 0xFFFF
-                        hi = (w >> 16) & 0xFFFF
-                        peer_ready = ((lo != _NEG_ZERO) & (hi != _NEG_ZERO)).to(
-                            tl.int32
-                        )
-                        _lam_cnt = _lam_cnt + peer_ready
-                _lam_done = (_lam_cnt == WORLD_SIZE - 1).to(tl.int32)
-    _fence_acquire_sys()
+    volatile=True prevents Triton from hoisting/CSE-ing the load out of
+    the spin loop.
+    """
+    val = tl.load(buf_ptr + idx, mask=mask, other=0.0, volatile=True)
+    has_sentinel = _has_neg_zero(val)
+    while has_sentinel == 1:
+        val = tl.load(buf_ptr + idx, mask=mask, other=0.0, volatile=True)
+        has_sentinel = _has_neg_zero(val)
+    return val
 
 
 @triton.jit
@@ -268,8 +191,8 @@ def lamport_workspace_setup(
     if N % 2 != 0:
         raise ValueError(
             f"Lamport allreduce requires even reduction dim, got {N}. "
-            "The sentinel protocol packs 2 bf16 elements per u32 word; "
-            "an odd dim causes _poll_last_word to deadlock."
+            "The sentinel protocol uses bf16 -0.0 (0x8000); "
+            "an odd dim would leave a dangling byte."
         )
     device = input_tensor.device
 

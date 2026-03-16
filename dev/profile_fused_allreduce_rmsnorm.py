@@ -62,8 +62,6 @@ from kraken.fused.one_shot_all_reduce_bias_rms_norm import (
 from kraken.fused.two_shot_all_reduce_bias_rms_norm import (
     two_shot_all_reduce_bias_rms_norm,
 )
-from compile import compile_with_debug
-
 
 HIDDEN = 2880
 NUM_TOKENS = 1  # decode tokens (flattened, no batch dim in SGLang)
@@ -483,6 +481,7 @@ def main():
             return torch.compile(_fn, options={
                 "_fuse_symm_mem_comms": True,
                 "_symm_mem_sync_mode": "lamport",
+                "trace.enabled": True,
             })
 
         ar_norm_lamport = _make_lamport_ar_norm(EPS)
@@ -520,7 +519,7 @@ def main():
                 "_fuse_symm_mem_comms_max_bytes": 0,
                 "_symm_mem_sync_mode": "device_cas_2_shot",
                 "_symm_mem_grid_cap": 128,
-                "trace.enabled": True,
+                # "trace.enabled": True,
             })
 
         ar_norm_2shot = _make_2shot_ar_norm(EPS)

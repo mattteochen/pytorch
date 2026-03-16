@@ -385,7 +385,7 @@ class TestFusedAllReduceRMSNormDistributed(MultiProcContinuousTest):
         eps = 1e-5
 
         group_name = dist.group.WORLD.group_name
-        symm_mem.enable_symm_mem_for_group(group_name)
+
         symm_mem.get_symm_mem_workspace(
             group_name, min_size=x.numel() * x.element_size()
         )
@@ -416,7 +416,7 @@ class TestFusedAllReduceRMSNormDistributed(MultiProcContinuousTest):
         eps = 1e-5
 
         group_name = dist.group.WORLD.group_name
-        symm_mem.enable_symm_mem_for_group(group_name)
+
         symm_mem.get_symm_mem_workspace(
             group_name, min_size=x.numel() * x.element_size()
         )
@@ -450,7 +450,7 @@ class TestFusedAllReduceRMSNormDistributed(MultiProcContinuousTest):
         x = torch.randn(4, hidden, device=self.device, dtype=torch.bfloat16)
 
         group_name = dist.group.WORLD.group_name
-        symm_mem.enable_symm_mem_for_group(group_name)
+
 
         expected = torch.ops._c10d_functional.all_reduce(x, "sum", group_name)
         expected = torch.ops._c10d_functional.wait_tensor(expected)
@@ -477,7 +477,7 @@ class TestFusedAllReduceRMSNormDistributed(MultiProcContinuousTest):
         residual = torch.randn(4, hidden, device=self.device, dtype=torch.bfloat16)
 
         group_name = dist.group.WORLD.group_name
-        symm_mem.enable_symm_mem_for_group(group_name)
+
         symm_mem.get_symm_mem_workspace(
             group_name, min_size=x.numel() * x.element_size()
         )
@@ -505,7 +505,7 @@ class TestFusedAllReduceRMSNormDistributed(MultiProcContinuousTest):
         x = torch.randn(4, hidden, device=self.device, dtype=torch.bfloat16)
 
         group_name = dist.group.WORLD.group_name
-        symm_mem.enable_symm_mem_for_group(group_name)
+
         symm_mem.get_symm_mem_workspace(
             group_name, min_size=x.numel() * x.element_size()
         )
@@ -526,8 +526,8 @@ class TestFusedAllReduceRMSNormDistributed(MultiProcContinuousTest):
     def _assert_lamport_codegen(self, code_list):
         """Verify the generated code uses Lamport helpers, not pull model."""
         code = "\n".join(code_list)
-        self.assertIn("_lamport_poll_all_peers", code,
-                       "Kernel should call _lamport_poll_all_peers")
+        self.assertIn("_lamport_poll_load", code,
+                       "Kernel should call _lamport_poll_load")
         self.assertIn("_lamport_clear_old_slot", code,
                        "Kernel should call _lamport_clear_old_slot (epilogue)")
         self.assertIn("lamport_workspace_peer_bufs", code,
@@ -556,7 +556,7 @@ class TestFusedAllReduceRMSNormDistributed(MultiProcContinuousTest):
                           "Wrapper should NOT use host barriers")
         self.assertNotIn("lamport_workspace_peer_bufs", code,
                           "Wrapper should NOT use Lamport setup")
-        self.assertNotIn("_lamport_poll_all_peers", code,
+        self.assertNotIn("_lamport_poll_load", code,
                           "Kernel should NOT use Lamport reduce")
 
     def _assert_host_barrier_codegen(self, code_list):
@@ -570,7 +570,7 @@ class TestFusedAllReduceRMSNormDistributed(MultiProcContinuousTest):
                           "Kernel should NOT use device-side CAS sync")
         self.assertNotIn("lamport_workspace_peer_bufs", code,
                           "Wrapper should NOT use Lamport setup")
-        self.assertNotIn("_lamport_poll_all_peers", code,
+        self.assertNotIn("_lamport_poll_load", code,
                           "Kernel should NOT use Lamport reduce")
 
     def _compile_allreduce_sum_with_codegen(
@@ -584,7 +584,7 @@ class TestFusedAllReduceRMSNormDistributed(MultiProcContinuousTest):
         residual = torch.randn(4, hidden, device=self.device, dtype=torch.bfloat16)
 
         group_name = dist.group.WORLD.group_name
-        symm_mem.enable_symm_mem_for_group(group_name)
+
         symm_mem.get_symm_mem_workspace(
             group_name, min_size=x.numel() * x.element_size()
         )
@@ -624,7 +624,7 @@ class TestFusedAllReduceRMSNormDistributed(MultiProcContinuousTest):
         residual = torch.randn(4, hidden, device=self.device, dtype=torch.bfloat16)
 
         group_name = dist.group.WORLD.group_name
-        symm_mem.enable_symm_mem_for_group(group_name)
+
         symm_mem.get_symm_mem_workspace(
             group_name, min_size=x.numel() * x.element_size()
         )
@@ -746,7 +746,7 @@ class TestFusedAllReduceRMSNormDistributed(MultiProcContinuousTest):
         x = torch.randn(4, hidden, device=self.device, dtype=torch.bfloat16)
 
         group_name = dist.group.WORLD.group_name
-        symm_mem.enable_symm_mem_for_group(group_name)
+
         symm_mem.get_symm_mem_workspace(
             group_name, min_size=x.numel() * x.element_size()
         )
@@ -768,6 +768,7 @@ class TestFusedAllReduceRMSNormDistributed(MultiProcContinuousTest):
         self._assert_host_barrier_codegen(code)
 
 
+@instantiate_parametrized_tests
 @requires_cuda_p2p_access()
 class TestLamportAllReduceRMSNormResidualAdd(MultiProcContinuousTest):
     """Correctness tests for the allreduce → residual_add → rmsnorm fusion
@@ -776,11 +777,12 @@ class TestLamportAllReduceRMSNormResidualAdd(MultiProcContinuousTest):
     The Lamport protocol uses a triple-buffered workspace with -0.0 sentinels,
     which is specifically designed to be safe under CUDA graph batched replay.
 
-    All tests in this class use (rows=4, hidden=128) because the Lamport
-    workspace is cached per-group and dimensioned on first allocation.
+    Correctness tests are parametrized over _ROWS_LIST to exercise different
+    XBLOCK / grid configurations. The CUDA graph test stays at fixed _ROWS.
     """
 
     _ROWS = 32
+    _ROWS_LIST = [2, 4, 8, 16, 32]
     _HIDDEN = 2048
     world_size = 2
 
@@ -791,6 +793,17 @@ class TestLamportAllReduceRMSNormResidualAdd(MultiProcContinuousTest):
     def _init_process(self):
         torch.cuda.set_device(self.device)
         torch.manual_seed(42 + self.rank)
+
+    def tearDown(self):
+        torch.cuda.synchronize()
+        super().tearDown()
+
+    def _fresh_compile(self):
+        from torch._inductor.runtime.lamport_helpers import _lamport_cache
+
+        torch.cuda.synchronize()
+        _lamport_cache.clear()
+        torch._dynamo.reset()
 
     def _reference(self, x, weight, eps, residual=None):
         group_name = dist.group.WORLD.group_name
@@ -805,32 +818,33 @@ class TestLamportAllReduceRMSNormResidualAdd(MultiProcContinuousTest):
 
     def _assert_lamport_codegen(self, code_list):
         code = "\n".join(code_list)
-        self.assertIn("_lamport_poll_all_peers", code)
+        self.assertIn("_lamport_poll_load", code)
         self.assertIn("_lamport_clear_old_slot", code)
         self.assertIn("lamport_workspace_peer_bufs", code)
         self.assertIn("_lamport_advance_flag_block0", code)
 
     @skip_if_lt_x_gpu(2)
-    def test_lamport_allreduce_rmsnorm_residual_add(self):
+    @parametrize("rows", _ROWS_LIST)
+    def test_lamport_allreduce_rmsnorm_residual_add(self, rows):
         """allreduce → residual_add → rmsnorm, Lamport mode."""
         self._init_process()
+        self._fresh_compile()
         eps = 1e-5
 
         group_name = dist.group.WORLD.group_name
-        symm_mem.enable_symm_mem_for_group(group_name)
 
         x = torch.randn(
-            self._ROWS, self._HIDDEN, device=self.device, dtype=torch.bfloat16,
+            rows, self._HIDDEN, device=self.device, dtype=torch.bfloat16,
         )
         residual = torch.randn(
-            self._ROWS, self._HIDDEN, device=self.device, dtype=torch.bfloat16,
+            rows, self._HIDDEN, device=self.device, dtype=torch.bfloat16,
         )
         weight = torch.ones(
             self._HIDDEN, device=self.device, dtype=torch.float32,
         )
 
         symm_mem.get_symm_mem_workspace(
-            group_name, min_size=x.numel() * x.element_size()
+            group_name, min_size=rows * self._HIDDEN * 2,
         )
 
         expected_normed, expected_pre_norm = self._reference(
@@ -861,23 +875,24 @@ class TestLamportAllReduceRMSNormResidualAdd(MultiProcContinuousTest):
         self._assert_lamport_codegen(code)
 
     @skip_if_lt_x_gpu(2)
-    def test_lamport_allreduce_rmsnorm_no_residual(self):
+    @parametrize("rows", _ROWS_LIST)
+    def test_lamport_allreduce_rmsnorm_no_residual(self, rows):
         """allreduce → rmsnorm (no residual), Lamport mode."""
         self._init_process()
+        self._fresh_compile()
         eps = 1e-5
 
         group_name = dist.group.WORLD.group_name
-        symm_mem.enable_symm_mem_for_group(group_name)
 
         x = torch.randn(
-            self._ROWS, self._HIDDEN, device=self.device, dtype=torch.bfloat16,
+            rows, self._HIDDEN, device=self.device, dtype=torch.bfloat16,
         )
         weight = torch.ones(
             self._HIDDEN, device=self.device, dtype=torch.float32,
         )
 
         symm_mem.get_symm_mem_workspace(
-            group_name, min_size=x.numel() * x.element_size()
+            group_name, min_size=rows * self._HIDDEN * 2,
         )
 
         expected_normed, _ = self._reference(x, weight, eps)
@@ -902,7 +917,8 @@ class TestLamportAllReduceRMSNormResidualAdd(MultiProcContinuousTest):
         self._assert_lamport_codegen(code)
 
     @skip_if_lt_x_gpu(2)
-    def test_lamport_allreduce_rmsnorm_repeated(self):
+    @parametrize("rows", _ROWS_LIST)
+    def test_lamport_allreduce_rmsnorm_repeated(self, rows):
         """allreduce → residual_add → rmsnorm, repeated with fresh data.
 
         Verifies correctness across multiple invocations of the compiled
@@ -910,23 +926,23 @@ class TestLamportAllReduceRMSNormResidualAdd(MultiProcContinuousTest):
         testing the modulo-3 slot cycling.
         """
         self._init_process()
+        self._fresh_compile()
         eps = 1e-5
 
         group_name = dist.group.WORLD.group_name
-        symm_mem.enable_symm_mem_for_group(group_name)
 
         x = torch.randn(
-            self._ROWS, self._HIDDEN, device=self.device, dtype=torch.bfloat16,
+            rows, self._HIDDEN, device=self.device, dtype=torch.bfloat16,
         )
         residual = torch.randn(
-            self._ROWS, self._HIDDEN, device=self.device, dtype=torch.bfloat16,
+            rows, self._HIDDEN, device=self.device, dtype=torch.bfloat16,
         )
         weight = torch.ones(
             self._HIDDEN, device=self.device, dtype=torch.float32,
         )
 
         symm_mem.get_symm_mem_workspace(
-            group_name, min_size=x.numel() * x.element_size()
+            group_name, min_size=rows * self._HIDDEN * 2,
         )
 
         @torch.compile(options={
@@ -943,11 +959,11 @@ class TestLamportAllReduceRMSNormResidualAdd(MultiProcContinuousTest):
         with torch.inference_mode():
             for i in range(6):
                 x_new = torch.randn(
-                    self._ROWS, self._HIDDEN,
+                    rows, self._HIDDEN,
                     device=self.device, dtype=torch.bfloat16,
                 )
                 res_new = torch.randn(
-                    self._ROWS, self._HIDDEN,
+                    rows, self._HIDDEN,
                     device=self.device, dtype=torch.bfloat16,
                 )
                 expected_normed, expected_pre_norm = self._reference(
@@ -979,7 +995,6 @@ class TestLamportAllReduceRMSNormResidualAdd(MultiProcContinuousTest):
         iters = 10
 
         group_name = dist.group.WORLD.group_name
-        symm_mem.enable_symm_mem_for_group(group_name)
 
         x = torch.randn(
             self._ROWS, self._HIDDEN, device=self.device, dtype=torch.bfloat16,
