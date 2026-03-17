@@ -2018,6 +2018,15 @@ class SIMDScheduling(BaseScheduling):
                 elif node is EnableReduction:
                     stack.close()
                 else:
+                    # Flush upstream code before an allreduce node so that
+                    # the Lamport push reads from in_var after upstream
+                    # pointwise ops have written to it.
+                    if (
+                        node._body.has_op("symm_mem_p2p_reduce_load")
+                        and (kernel.loads or kernel.compute or kernel.stores)
+                    ):
+                        kernel.codegen_body()
+
                     # TODO - use split ranges ?
                     indexing_dtype_strength_reduction(node._body)
                     index_vars = kernel.split_and_set_ranges(node.get_ranges())

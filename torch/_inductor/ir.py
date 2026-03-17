@@ -1108,6 +1108,59 @@ class Pointwise(Loops):
         )
 
 
+class SymmMemP2PAllReduce:
+    """
+    Factory that creates a fusible Pointwise node performing a P2P all-reduce
+    via symmetric memory.  The resulting Pointwise's inner_fn calls
+    ops.symm_mem_p2p_reduce_load, which the Triton codegen translates into a
+    loop over peer buffer P2P loads with kraken device-side synchronization.
+
+    The ``create`` method realizes the input and produces a ``Pointwise``
+    whose ``inner_fn`` calls ``ops.symm_mem_p2p_reduce_load(name, index,
+    world_size)``.  The input is expected to be in (or copyable to)
+    symmetric memory; the generated Triton kernel handles the copy-in
+    and device-side synchronization in its prologue/epilogue.
+    """
+
+    @staticmethod
+    def create(
+        input_buffer: TensorBox,
+        world_size: int,
+        group_name: str,
+        reduce_op: str = "sum",
+    ) -> TensorBox:
+        input_buffer.realize()
+        buf = input_buffer.data
+        assert isinstance(buf, StorageBox)
+        inner_buf = buf.data
+        while isinstance(inner_buf, ReinterpretView):
+            inner_buf = inner_buf.data
+        buf_name = inner_buf.get_name()
+        indexer = input_buffer.get_layout().make_indexer()
+        device = input_buffer.get_device()
+        dtype = input_buffer.get_dtype()
+
+        def inner_fn(index: Sequence[Expr]) -> OpsValue:
+            return ops.symm_mem_p2p_reduce_load(
+                buf_name, indexer(index), world_size, group_name
+            )
+
+        pw = Pointwise.create(
+            device=device,
+            dtype=dtype,
+            inner_fn=inner_fn,
+            ranges=list(input_buffer.get_size()),
+        )
+        # Tag the TensorBox so downstream code (wrapper) can find the
+        # metadata needed to generate the symm-mem setup.
+        pw._symm_mem_p2p_meta = {  # type: ignore[attr-defined]
+            "group_name": group_name,
+            "world_size": world_size,
+            "reduce_op": reduce_op,
+        }
+        return pw
+
+
 @ir_dataclass
 class Scatter(Pointwise):
     output_indexer: Callable[[Sequence[Expr]], Expr]

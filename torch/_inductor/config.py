@@ -988,6 +988,45 @@ _fuse_ddp_communication_passes: list[Union[Callable[..., None], str]] = [
 
 _micro_pipeline_tp: bool = False
 
+# Enable symmetric-memory communication fusion pass. Replaces eligible
+# collectives with P2P implementations via symmetric memory. Currently
+# only handles all_reduce -> wait_tensor -> p2p_allreduce; downstream
+# compute (RMSNorm, add, etc.) is fused by inductor's scheduler.
+_fuse_symm_mem_comms: bool = False
+
+# When True, the inductor-generated P2P allreduce kernel skips the
+# prologue copy (input → symmetric memory) because the input is already
+# in symmetric memory (e.g. via symm_mem.get_mem_pool()).
+_symm_mem_skip_prologue_copy: bool = False
+
+# xnumel threshold for host-side barriers in P2P allreduce kernels.
+# 0 = always use host barriers (recommended default).
+# -1 = never use host barriers (always device-side CAS).
+# N > 0 = use host barriers when xnumel > N or xnumel is dynamic.
+_symm_mem_host_barrier_threshold: int = 0
+
+# Grid cap for P2P allreduce kernels using device-side CAS sync.
+# 0 = no cap (current behavior).
+# N > 0 = cap the grid at N blocks; each block grid-strides over rows.
+# Only effective when device-side CAS is active (host_barrier_threshold=-1).
+_symm_mem_grid_cap: int = 0
+
+# Synchronization mode for P2P allreduce kernels.
+# "host_barrier"      = host-side sm.barrier() before/after kernel (default).
+# "device_cas"        = device-side per-block CAS atomics, one-shot pull (kraken).
+# "device_cas_2_shot" = device-side CAS, two-shot reduce-scatter+allgather (kraken).
+#                       Requires r0_numel divisible by world_size.
+# "lamport"           = Lamport push-model with -0.0 sentinel, zero barriers.
+# When set to "lamport", _symm_mem_host_barrier_threshold is ignored.
+_symm_mem_sync_mode: str = "host_barrier"
+
+# Maximum tensor size (in bytes) for the P2P allreduce FX pass to fire.
+# One-shot P2P reads the full tensor from every peer over NVLink, so
+# NVLink traffic scales as world_size * data_size. For large tensors
+# this loses to NCCL ring/tree allreduce (2 * data_size). Setting to 0
+# disables the gate (always use P2P regardless of size).
+_fuse_symm_mem_comms_max_bytes: int = 0  # 1 MB
+
 
 # Enable/disable partitioned scatter optimization for atomic add kernels
 # this will improve kernel performance at cost of memory usage.

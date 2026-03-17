@@ -408,13 +408,17 @@ def register_symm_mem_lowerings():
     Register lowerings for symmetric memory (symm_mem) operations.
     """
     try:
+        # Import the top-level package to ensure all symm_mem custom ops
+        # (one_shot_all_reduce, p2p_allreduce, fused_all_reduce_rmsnorm, …)
+        # are registered before we look them up in torch.ops.symm_mem.
+        # Without this, the first torch.compile may run before the user
+        # imports _symmetric_memory, and ops registered in submodules
+        # (like _p2p_allreduce) would be silently skipped.
+        import torch.distributed._symmetric_memory  # noqa: F401
+
         symm_mem = torch.ops.symm_mem
-        # Check for an actual operation, not just the namespace.
-        # torch.ops.symm_mem is a lazy namespace that always exists,
-        # but the operations may not exist on non-CUDA platforms or
-        # when USE_DISTRIBUTED is disabled.
         symm_mem.one_shot_all_reduce
-    except AttributeError:
+    except (AttributeError, ImportError):
         log.info("symm_mem ops not available, skipping symm_mem lowerings")
         return
 
@@ -755,3 +759,21 @@ def register_symm_mem_lowerings():
             reduce_op,
         )
         return None
+
+    try:
+        symm_mem.p2p_allreduce
+    except AttributeError:
+        pass
+    else:
+
+        @register_lowering(symm_mem.p2p_allreduce)
+        def _symm_mem_p2p_allreduce(
+            inp: ir.TensorBox,
+            reduce_op: str,
+            group_name: str,
+        ) -> ir.TensorBox:
+            """Lower p2p_allreduce to SymmMemP2PAllReduce Pointwise node."""
+            from torch.distributed.distributed_c10d import _get_group_size_by_name
+
+            world_size = _get_group_size_by_name(group_name)
+            return ir.SymmMemP2PAllReduce.create(inp, world_size, group_name, reduce_op)

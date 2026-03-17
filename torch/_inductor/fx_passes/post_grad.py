@@ -59,6 +59,7 @@ from ..utils import (
 from ..virtualized import V
 from .b2b_gemm import B2B_GEMM_PASS
 from .ddp_fusion import fuse_ddp_communication
+from .fuse_symm_mem_comms import fuse_symm_mem_comms_pass
 from .group_batch_fusion import group_batch_fusion_passes, POST_GRAD_FUSIONS
 from .micro_pipeline_tp import micro_pipeline_tp_pass
 from .pre_grad import is_same_dict, save_inductor_dict
@@ -206,6 +207,13 @@ def post_grad_passes(gm: torch.fx.GraphModule, is_inference: bool):
 
     if config._micro_pipeline_tp:
         micro_pipeline_tp_pass(gm.graph)
+
+    if config._fuse_symm_mem_comms:
+        GraphTransformObserver(
+            gm, "fuse_symm_mem_comms"
+        ).apply_graph_pass(
+            lambda graph: fuse_symm_mem_comms_pass(graph, is_inference)
+        )
 
     if config._fuse_ddp_communication:
         GraphTransformObserver(gm, "fuse_ddp_communication").apply_graph_pass(

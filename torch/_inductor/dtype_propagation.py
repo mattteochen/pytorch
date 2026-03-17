@@ -261,6 +261,12 @@ class DtypePropagationOpsHandler:
         return upcast_compute_type(V.graph.get_dtype(name))
 
     @staticmethod
+    def symm_mem_p2p_reduce_load(
+        name: str, index, world_size: int, group_name: str = ""
+    ) -> torch.dtype:
+        return upcast_compute_type(V.graph.get_dtype(name))
+
+    @staticmethod
     def floor(x: DTypeArg) -> torch.dtype:
         return promote_types(
             [x], type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT

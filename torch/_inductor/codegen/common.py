@@ -1060,6 +1060,13 @@ class OpOverrides(BasicMathOpsMixin, OpDecompositions, OpsHandler[Any]):
             f"{type(self).__name__}: load should be handled by CSEProxy"
         )
 
+    def symm_mem_p2p_reduce_load(
+        self, name: str, index: sympy.Expr, world_size: int, group_name: str = ""
+    ) -> OpVarT:
+        raise NotImplementedError(
+            f"{type(self).__name__}: symm_mem_p2p_reduce_load not implemented"
+        )
+
     def store(
         self, name: str, index: sympy.Expr, value: OpVarT, mode: StoreMode = None
     ) -> None:
@@ -2213,6 +2220,11 @@ class Kernel(CodeGen, Generic[CSEVariableType]):
     def load(self, name: str, index: sympy.Expr) -> CSEVariable:
         raise NotImplementedError
 
+    def symm_mem_p2p_reduce_load(
+        self, name: str, index: sympy.Expr, world_size: int, group_name: str = ""
+    ) -> CSEVariable:
+        raise NotImplementedError
+
     def indirect_load(self, name: str, index: sympy.Expr) -> CSEVariable:
         """A load the depends on an index we have read"""
         prior = self.loads
@@ -2826,6 +2838,14 @@ class CSEProxy(DefaultHandler):
         out = self.kernel.load(name, index)
         # count load that is not in the store_cache, and also not in the
         # cse cache.
+        if out.use_count == 1:
+            self.kernel.num_load += 1
+        return out
+
+    def symm_mem_p2p_reduce_load(
+        self, name: str, index: sympy.Expr, world_size: int, group_name: str = ""
+    ) -> CSEVariable:
+        out = self.kernel.symm_mem_p2p_reduce_load(name, index, world_size, group_name)
         if out.use_count == 1:
             self.kernel.num_load += 1
         return out

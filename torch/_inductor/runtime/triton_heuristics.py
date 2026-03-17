@@ -4092,7 +4092,16 @@ class GridExpr:
 
 class Grid1D(GridExpr):
     def generate(self, meta: dict[str, int]) -> None:
-        self.x_grid = self.ceildiv("xnumel", meta.get("XBLOCK"))
+        x_grid = self.ceildiv("xnumel", meta.get("XBLOCK"))
+        grid_cap = self.inductor_meta.get("symm_mem_grid_cap", 0)
+        if grid_cap > 0:
+            if isinstance(x_grid, int):
+                x_grid = min(x_grid, grid_cap)
+            elif self.mode == "python":
+                x_grid = f"min({x_grid}, {grid_cap})"
+            else:
+                x_grid = f"std::min({x_grid}, {grid_cap})"
+        self.x_grid = x_grid
 
 
 class Grid2D(GridExpr):

@@ -98,6 +98,7 @@ from .simd import (
     SIMDKernel,
     SIMDScheduling,
 )
+from . import triton_symm_mem as _symm_mem
 from .triton_utils import (
     config_of,
     equal_1_arg_indices,
@@ -1758,22 +1759,11 @@ class TritonOverrides(OpOverrides):
     @staticmethod
     def floordiv(a, b):
         # See the comment in lowering.div_mode. a and b are integer type.
-        # Notice that // in triton behaves as truncdiv instead of floordiv.
-        #
-        # We avoid feeding negative values into Triton's // operator because
-        # Triton's AxisInfo analysis incorrectly deduplicates signed division
-        # results for contiguous inputs (triton-lang/triton#XXXX). Instead we
-        # use bitwise complement (~) to make the dividend non-negative:
-        #   floor_div(a, b) = ~(~a // b) when a < 0, a // b when a >= 0
-        # For negative b we negate both operands first.
-        zero = ops.constant(0, torch.int32)
-        b_neg = ops.lt(b, zero)
-        a = ops.where(b_neg, ops.sub(zero, a), a)
-        b = ops.where(b_neg, ops.sub(zero, b), b)
-        a_neg = ops.lt(a, zero)
-        a = ops.where(a_neg, ops.bitwise_not(a), a)
-        quot = ops.truncdiv(a, b)
-        return ops.where(a_neg, ops.bitwise_not(quot), quot)
+        # Similar to div_floor_kernel_cuda in pytorch core.
+        # Notice that // in triton behaves as truncdiv instead of floordiv
+        quot = f"{a} // {b}"
+        rem = f"{a} % {b}"
+        return f"tl.where(({a} < 0) != ({b} < 0), tl.where({rem} != 0, {quot} - 1, {quot}), {quot})"
 
     @staticmethod
     def sign(x):
@@ -2579,6 +2569,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         self.has_load_with_contiguous_rdim = False
         # We track the store name since a store can be canceled later
         self.stores_with_contiguous_rdim: list[str] = []
+
+        _symm_mem.init_symm_mem_state(self)
 
     @staticmethod
     def _has_stride1_on_rdim(index) -> bool:
@@ -3394,17 +3386,21 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
     @staticmethod
     def _enable_pdl_codegen():
-        if not torch._inductor.config.triton.enable_pdl:
-            return False
         if isinstance(V.kernel, torch._inductor.select_algorithm.TritonTemplateKernel):
             return False
         # PDL uses CUDA-specific intrinsics (gdc_wait/gdc_launch), not available on ROCm
         if torch.version.hip:
             return False
-        return (
+        if not (
             V.graph.get_current_device_or_throw().type == "cuda"
             and torch.cuda.get_device_capability()[0] >= 9
-        )
+        ):
+            return False
+        # Lamport protocol requires PDL (gdc_wait/gdc_launch_dependents)
+        # for triple-buffer back-pressure, even when global PDL is off.
+        if getattr(V.kernel, '_symm_mem_use_lamport', False):
+            return True
+        return torch._inductor.config.triton.enable_pdl
 
     def _handle_pdl_before_access(
         self, wait_buffer, *dependencies, consider_reads=False
@@ -3453,16 +3449,23 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         launch_buffer.writeline(self.GDC_LAUNCH)
 
     def _filter_pdl(self, code: IndentedBuffer):
+        # Keep first gdc_wait + last gdc_launch_dependents (in-place).
+        # Lamport kernels: strip all waits (prologue has its own).
+        # Launch dependents handled by standard PDL filter (keep last).
+        strip_wait = self.has_symm_mem_p2p and self._symm_mem_use_lamport
+        strip_launch = False
         new_lines = []
         has_wait = False
         previous_launch = None
         for l in code._lines:
             if type(l) is str and self.GDC_WAIT in l:
-                if has_wait:
+                if strip_wait or has_wait:
                     continue
                 else:
                     has_wait = True
             if type(l) is str and self.GDC_LAUNCH in l:
+                if strip_launch:
+                    continue
                 if previous_launch is not None:
                     new_lines.pop(previous_launch)
                 previous_launch = len(new_lines)
@@ -3661,6 +3664,13 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             self.outside_loop_vars.add(result_var)
 
         return result_var
+
+    def symm_mem_p2p_reduce_load(
+        self, name, index, world_size, group_name="",
+    ):
+        return _symm_mem.symm_mem_p2p_reduce_load(
+            self, name, index, world_size, group_name,
+        )
 
     def store(
         self, name: str, index: sympy.Expr, value: CSEVariable, mode: StoreMode = None
@@ -3909,7 +3919,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         original_dtype = dtype
         if do_upcast:
             # Only promote FB16/BF16; do not promote other integer/boolean dtypes
-            pytree.tree_map_(maybe_upcast, value)
+            value = pytree.tree_map(maybe_upcast, value)
             src_dtype = torch.float32 if should_upcast(src_dtype) else src_dtype
             dtype = torch.float32 if should_upcast(dtype) else dtype
 
@@ -5325,6 +5335,10 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             )
         return inductor_meta
 
+
+
+
+
     def codegen_kernel(self, name=None) -> str:
         """
         Convert the TritonKernel from Inductor SIMD IR to triton code, including inductor triton heuristics, imports,
@@ -5356,6 +5370,27 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 size_hint = next_power_of_2(int(numel_hint))
             size_hints[prefix] = size_hint
 
+        if self.has_symm_mem_p2p:
+            sync_mode = config._symm_mem_sync_mode
+            if sync_mode == "lamport":
+                self._symm_mem_use_lamport = True
+                self._symm_mem_use_host_barriers = False
+            elif sync_mode in ("device_cas", "device_cas_2_shot"):
+                self._symm_mem_use_lamport = False
+                self._symm_mem_use_host_barriers = False
+            else:
+                threshold = config._symm_mem_host_barrier_threshold
+                if threshold == -1:
+                    self._symm_mem_use_host_barriers = False
+                elif threshold == 0:
+                    self._symm_mem_use_host_barriers = True
+                else:
+                    xnumel = V.graph.sizevars.simplify(self.numels["x"])
+                    is_static = isinstance(xnumel, (sympy.Integer, int))
+                    self._symm_mem_use_host_barriers = (
+                        not is_static or int(xnumel) > threshold
+                    )
+
         if name is None:
             code.splice(self.gen_common_triton_imports())
             device_type = V.graph.get_current_device_or_throw().type
@@ -5363,6 +5398,37 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 code.splice("triton_helpers.set_driver_to_cpu()")
             else:
                 code.splice("triton_helpers.set_driver_to_gpu()")
+
+            if self.has_symm_mem_p2p and self._symm_mem_use_lamport:
+                code.splice(
+                    """
+                    from torch._inductor.runtime.lamport_helpers import (
+                        _fence_sys as _lamport_fence_sys,
+                        _volatile_load_u32_scalar as _lamport_volatile_load_u32,
+                        _remove_neg_zero as _lamport_remove_neg_zero,
+                        _lamport_poll_load,
+                        _lamport_clear_old_slot,
+                        _lamport_block_arrive,
+                        _lamport_advance_flag_block0,
+                    )
+                    """
+                )
+            elif self.has_symm_mem_p2p and not self._symm_mem_use_host_barriers:
+                import pathlib
+
+                kraken_dir = str(
+                    pathlib.Path(__file__).resolve().parents[3]
+                    / "third_party"
+                    / "kraken"
+                )
+                code.splice(
+                    f"""
+                    import sys as _sys
+                    if {kraken_dir!r} not in _sys.path:
+                        _sys.path.insert(0, {kraken_dir!r})
+                    from kraken._ptx_utils.symm_mem_barrier import symm_mem_sync as _symm_mem_sync
+                    """
+                )
 
             if config.benchmark_kernel:
                 code.splice(self.imports_for_benchmark_kernel())
@@ -5450,6 +5516,41 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             add_constexpr_arg("RSPLIT_SIZE")
             add_constexpr_arg("NUM_STAGES")
 
+        if self.has_symm_mem_p2p:
+            for i in range(self.symm_mem_world_size):
+                arg_name = f"symm_peer_buf_{i}"
+                signature.append(
+                    TensorArg(
+                        name=arg_name,
+                        buffer=arg_name,
+                        dtype=self.symm_mem_input_dtype,
+                    )
+                )
+                argdefs.append(ArgName(arg_name))
+            if (
+                not self._symm_mem_use_lamport
+                and not self._symm_mem_use_host_barriers
+            ):
+                signature.append(
+                    TensorArg(
+                        name="symm_signal_pad_ptrs",
+                        buffer="symm_signal_pad_ptrs",
+                        dtype=torch.int64,
+                    )
+                )
+                argdefs.append(ArgName("symm_signal_pad_ptrs"))
+            add_constexpr_arg("SYMM_RANK")
+            add_constexpr_arg("SYMM_WORLD_SIZE")
+            if self._symm_mem_use_lamport:
+                signature.append(
+                    TensorArg(
+                        name="_lam_meta",
+                        buffer="_lam_meta",
+                        dtype=torch.int32,
+                    )
+                )
+                argdefs.append(ArgName("_lam_meta"))
+
         triton_meta_signature = signature_to_meta(
             signature, size_dtype=self.index_dtype, argdefs=argdefs
         )
@@ -5468,6 +5569,14 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             # Cooperative reductions rely on multi-block synchronization that
             # requires cooperative-grid launches to avoid hanging.
             triton_meta["launch_cooperative_grid"] = True
+
+        if self.has_symm_mem_p2p and self._symm_mem_use_lamport:
+            # Lamport triple-buffered allreduce needs PDL for two reasons:
+            # 1. gdc_wait() in the prologue prevents CUDA graph batched
+            #    replay from overrunning the 3-slot headroom.
+            # 2. gdc_launch_dependents() after the flag advance lets the
+            #    successor kernel start before rmsnorm stores complete.
+            triton_meta["launch_pdl"] = True
 
         # Skip memory optimization for forward of the training loop where we expect
         # every new node will increase the peak memory and our greedy approach would
@@ -5491,6 +5600,13 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
         if self.mix_order_reduction:
             inductor_meta["RSPLIT_SIZE"] = self.rsplit_size
+
+        if (
+            self.has_symm_mem_p2p
+            and not self._symm_mem_use_host_barriers
+            and config._symm_mem_grid_cap > 0
+        ):
+            inductor_meta["symm_mem_grid_cap"] = config._symm_mem_grid_cap
 
         if config.deterministic or config.test_configs.force_filter_reduction_configs:
             inductor_meta["has_loadstore_with_contiguous_rdim"] = (
@@ -5576,6 +5692,12 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         for arg_num in equal_1_arg_indices(signature):  # type: ignore[index]
             triton_meta["constants"][signature[arg_num].name] = 1  # type: ignore[index,union-attr]
 
+        if self.has_symm_mem_p2p:
+            import torch.distributed as _dist
+
+            triton_meta["constants"]["SYMM_RANK"] = _dist.get_rank()
+            triton_meta["constants"]["SYMM_WORLD_SIZE"] = self.symm_mem_world_size
+
         self.triton_meta = triton_meta
         self.inductor_meta = inductor_meta
 
@@ -5639,7 +5761,24 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             self.codegen_static_numels(code)
             for old, new in self.args.aliases():
                 code.writeline(f"{old} = {new}")
-            code.splice(self.body)
+            if self.has_symm_mem_p2p and self._symm_mem_use_lamport:
+                _symm_mem.codegen_lamport_prologue(self, code)
+            elif self.has_symm_mem_p2p and not self._symm_mem_use_host_barriers:
+                _symm_mem.codegen_symm_mem_prologue(self, code)
+            if (
+                self.has_symm_mem_p2p
+                and not self._symm_mem_use_host_barriers
+                and not self._symm_mem_use_lamport
+                and config._symm_mem_grid_cap > 0
+            ):
+                if config._symm_mem_sync_mode == "device_cas_2_shot":
+                    _symm_mem.codegen_two_shot_grid_stride_body(self, code)
+                else:
+                    _symm_mem.codegen_grid_stride_body(self, code)
+            else:
+                code.splice(self.body)
+            if self.has_symm_mem_p2p and not self._symm_mem_use_host_barriers and not self._symm_mem_use_lamport:
+                _symm_mem.codegen_symm_mem_epilogue(self, code)
             if config.triton.proton_profiling:
                 code.writeline(f'pl.exit_scope("{kernel_name}")')
 
@@ -5755,6 +5894,14 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         _, call_args, _, arg_types = self.args.python_argdefs()
         self.add_numel_to_call_args(name, call_args, arg_types)
 
+        if self.has_symm_mem_p2p:
+            if self._symm_mem_use_lamport:
+                _symm_mem.emit_lamport_setup(self, wrapper, call_args)
+            elif self._symm_mem_use_host_barriers:
+                _symm_mem.emit_symm_mem_host_barrier_setup(self, wrapper, call_args)
+            else:
+                _symm_mem.emit_symm_mem_setup(self, wrapper, call_args)
+
         for ws in self.args.workspace_args:
             wrapper.generate_workspace_allocation(ws)
 
@@ -5767,8 +5914,15 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             inductor_meta=self.inductor_meta,
         )
 
+        if self.has_symm_mem_p2p and self._symm_mem_use_host_barriers:
+            _symm_mem.emit_symm_mem_host_barrier_epilogue(self, wrapper)
+
         if deallocate_ws:
             self.deallocate_workspaces()
+
+
+
+
 
     def codegen_nan_check(self) -> None:
         wrapper = V.graph.wrapper_code
@@ -6318,6 +6472,20 @@ class TritonScheduling(SIMDScheduling):
         # ops.sort only works with persistent reduction, and is not bandwidth bound anyway
         # so taking the hit of non-coalesced loads is okay
         if kernel_features.contains_op("sort"):
+            kernel_kwargs["override_persistent_reduction"] = True
+            kernel_kwargs["override_cooperative_reduction"] = False
+
+        # Lamport mode requires persistent reduction for correctness:
+        # _lamport_block_arrive increments an atomic counter and
+        # _lamport_advance_flag_block0 expects exactly tl.num_programs(0)
+        # arrivals. A looped reduction would call arrive once per R0_BLOCK
+        # tile, overcounting and advancing the triple-buffer flag early.
+        #
+        # Pull-mode P2P loads are hoisted above the reduction loop by
+        # get_load_buffer (no rindex), so they wouldn't literally repeat,
+        # but we force persistent uniformly to avoid fragile dependence on
+        # that routing and to keep device-side sync barriers out of the loop.
+        if kernel_features.contains_op("symm_mem_p2p_reduce_load"):
             kernel_kwargs["override_persistent_reduction"] = True
             kernel_kwargs["override_cooperative_reduction"] = False
 

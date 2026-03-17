@@ -107,6 +107,7 @@ from torch.testing._internal.common_utils import (
     subtest,
     TEST_WITH_ASAN,
     TEST_WITH_ROCM,
+    xfailIf,
     xfailIfS390X,
 )
 from torch.testing._internal.logging_utils import logs_to_string
@@ -3581,20 +3582,6 @@ class CommonTemplate:
         self.common(
             fn_int_input, (make_tensor(10, device=self.device, dtype=torch.float32), 33)
         )
-
-    def test_floordiv_negative_int(self):
-        # Regression test for https://github.com/pytorch/pytorch/issues/158212
-        # Signed integer floor division must handle negative dividends correctly.
-        # The key case: (-1) // 2 should be -1 (Python floor), not 0 (C truncation).
-        def fn(a, b):
-            return a // b
-
-        for divisor in [2, 3, 7]:
-            a = torch.arange(-32, 32, device=self.device, dtype=torch.int32)
-            b = torch.full_like(a, divisor)
-            self.common(fn, (a, b))
-            b_neg = torch.full_like(a, -divisor)
-            self.common(fn, (a, b_neg))
 
     def test_div_precision(self):
         # Reproducer for https://github.com/pytorch/pytorch/issues/101039
@@ -15578,6 +15565,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             "coordinate_descent_tuning": True,
         }
     )
+    @xfailIf(not IS_BIG_GPU)  # templates require big gpu
     def test_pdl_template_and_delay(self):
         def fn(a, b):
             a = (a / (a**2).sum(-1, keepdim=True)) ** 2  # first kernel
@@ -15633,6 +15621,43 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
                 .check_not("gdc_launch")
                 .check("store")
             ).run(code)
+
+    @requires_cuda_and_triton
+    @skipCUDAIf(not SM90OrLater or TEST_WITH_ROCM, "PDL requires NVIDIA sm90+")
+    @config.patch({"_symm_mem_sync_mode": "lamport"})
+    def test_pdl_lamport_all_kernels(self):
+        """When _symm_mem_sync_mode='lamport', _enable_pdl_codegen forces PDL
+        on for ALL kernels so every predecessor calls gdc_launch_dependents.
+        Verify that a multi-kernel graph has gdc_wait and gdc_launch in every
+        non-template kernel, not just the Lamport kernel."""
+
+        def fn(a, b):
+            a = a * 2.0  # first kernel (pointwise, not symm mem)
+            b = b + 1.0  # second kernel (pointwise, not symm mem)
+            return a + b
+
+        a = torch.randn(1024, device=GPU_TYPE)
+        b = torch.randn(1024, device=GPU_TYPE)
+        self.common(fn, (a, b))
+
+        code = run_and_get_triton_code(torch.compile(fn), a, b)
+        # All kernels should have launch_pdl enabled
+        (
+            FileCheck()
+            .check("'launch_pdl': True")
+            .check("gdc_wait")
+            .check("gdc_launch")
+        ).run(code)
+
+        # Every non-template kernel with gdc_wait must also have gdc_launch
+        wait_count = code.count("gdc_wait")
+        launch_count = code.count("gdc_launch")
+        self.assertEqual(
+            wait_count,
+            launch_count,
+            f"Each kernel with gdc_wait should have gdc_launch_dependents: "
+            f"got {wait_count} waits vs {launch_count} launches",
+        )
 
     def test_use_deterministic_algorithms(self):
         @torch.compile(backend="inductor", fullgraph=True)

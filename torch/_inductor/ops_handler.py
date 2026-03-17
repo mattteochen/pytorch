@@ -229,6 +229,17 @@ class OpsHandler(Generic[T]):
         """
         raise NotImplementedError
 
+    def symm_mem_p2p_reduce_load(
+        self, name: str, index: sympy.Expr, world_size: int, group_name: str = ""
+    ) -> T:
+        """
+        Load from all peer symmetric memory buffers at 'index' and sum-reduce.
+        Used for P2P allreduce via symmetric memory with kraken device-side sync.
+        'name' refers to the original input buffer; the codegen backend is
+        responsible for emitting P2P loads from all peer buffers.
+        """
+        raise NotImplementedError
+
     def store(
         self,
         name: str,
@@ -1104,6 +1115,19 @@ class OpCounterCSE(DefaultHandler):
         val = self.parent_handler.load(name, index)
         if val not in self.var_names:
             self._used_ops.add("load")
+            self._read_names.append(name)
+            if not isinstance(index, (sympy.Integer, int)):
+                self._nontrivial_read_count += 1
+        return self._update_count(val)
+
+    def symm_mem_p2p_reduce_load(
+        self, name: str, index: sympy.Expr, world_size: int, group_name: str = ""
+    ) -> str:
+        val = self.parent_handler.symm_mem_p2p_reduce_load(
+            name, index, world_size, group_name
+        )
+        if val not in self.var_names:
+            self._used_ops.add("symm_mem_p2p_reduce_load")
             self._read_names.append(name)
             if not isinstance(index, (sympy.Integer, int)):
                 self._nontrivial_read_count += 1
