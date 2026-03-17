@@ -27,6 +27,13 @@ import torch._inductor.config as inductor_config
 
 torch._inductor.config.triton.cudagraphs = False
 
+
+# ── TE grouped_gemm v2 custom op (single-launch cuBLASLt, device offsets) ────
+import sys as _sys
+_sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "experimental"))
+from te_grouped_gemm_v2 import te_grouped_gemm_v2  # noqa: E402
+# Import registers the custom op torch.ops.te_v2.grouped_gemm
+
 def compile_with_debug(fn, compile_kwargs=None, dynamo_kwargs=None, inductor_kwargs=None):
     """Wrap a function with torch.compile and enable debug output.
 
@@ -133,6 +140,9 @@ class MockFusedMoELayer(torch.nn.Module):
                         dtype=dtype, device=device) * 0.01,
             requires_grad=False,
         )
+        # Precomputed transposed weights for TE grouped_gemm [G, K, N] layout
+        self.w13_weight_t = self.w13_weight.transpose(-1, -2).contiguous()
+        self.w2_weight_t = self.w2_weight.transpose(-1, -2).contiguous()
 
 
 # ── Server args init (needed by Triton config lookup) ────────────────────────
@@ -304,14 +314,79 @@ def run_native_grouped_mm_v2(layer, hidden_states, topk_weights, topk_ids):
         offsets, inv_perm, num_tokens, num_top_k, hidden_size,
     )
 
-run_native_grouped_mm_v2 = torch.compile(
-    run_native_grouped_mm_v2,
-    options={"combo_kernels": True, "max_autotune_gemm": True, "max_autotune_gemm_backends": "TRITON"},
-)
-# run_native_grouped_mm_v2 = compile_with_debug(
+# run_native_grouped_mm_v2 = torch.compile(
 #     run_native_grouped_mm_v2,
+#     options={"combo_kernels": True, "max_autotune_gemm": True},
+# )
+run_native_grouped_mm_v2 = compile_with_debug(
+    run_native_grouped_mm_v2,
+    inductor_kwargs={"combo_kernels": True, "max_autotune_gemm": True, "max_autotune_gemm_backends": "ATEN, TRITON"},
+)
+
+
+# ── 4. Native v2 with TE grouped_gemm (single-launch cuBLASLt, device offsets) ─
+def _run_native_te_v2_fn(
+    layer_w13_t, layer_w13_bias, layer_w2_t, layer_w2_bias,
+    num_experts, hidden_states, topk_weights, topk_ids,
+):
+    device = hidden_states.device
+    num_tokens, hidden_size = hidden_states.shape
+    num_top_k = topk_ids.size(-1)
+
+    expert_ids = topk_ids.reshape(-1)
+    token_idx = (
+        torch.arange(num_tokens, device=device)
+        .unsqueeze(1)
+        .expand(-1, num_top_k)
+        .reshape(-1)
+    )
+
+    sample_weights = topk_weights.reshape(-1)
+    current_hidden_states = hidden_states[token_idx]
+
+    perm = torch.argsort(expert_ids, stable=True)
+    inv_perm = torch.empty_like(perm)
+    inv_perm[perm] = torch.arange(perm.size(0), device=device, dtype=perm.dtype)
+
+    expert_ids_g = expert_ids[perm]
+    sample_weights_g = sample_weights[perm]
+    current_states_g = current_hidden_states[perm]
+
+    boundaries = torch.arange(1, num_experts + 1, device=device, dtype=expert_ids_g.dtype)
+    offsets = torch.searchsorted(expert_ids_g, boundaries).to(torch.int32)
+
+    gate_up_out = torch.ops.te_v2.grouped_gemm(current_states_g, layer_w13_t, offsets)
+    gate_up_out = gate_up_out + layer_w13_bias[expert_ids_g]
+
+    hidden_after_activation = swiglu_with_alpha_and_limit_compiled(
+        gate_up_out, GEMM1_ALPHA, SWIGLU_LIMIT
+    )
+    hidden_after_activation = hidden_after_activation.to(current_states_g.dtype)
+
+    out_per_sample_g = torch.ops.te_v2.grouped_gemm(hidden_after_activation, layer_w2_t, offsets)
+    out_per_sample_g = out_per_sample_g + layer_w2_bias[expert_ids_g]
+
+    out_per_sample_g = out_per_sample_g * sample_weights_g.unsqueeze(-1)
+    out_per_sample = out_per_sample_g[inv_perm]
+    return out_per_sample.view(num_tokens, num_top_k, hidden_size).sum(dim=1).to(current_states_g.dtype)
+
+run_native_te_v2 = torch.compile(
+    _run_native_te_v2_fn,
+    options={"combo_kernels": True, "max_autotune_gemm": True, "max_autotune_gemm_backends": "ATEN, TRITON"},
+)
+
+# run_native_te_v2 = compile_with_debug(
+#     _run_native_te_v2_fn,
 #     inductor_kwargs={"combo_kernels": True, "max_autotune_gemm": True, "max_autotune_gemm_backends": "ATEN, TRITON"},
 # )
+
+
+def _run_native_te_v2_wrapper(layer, hidden_states, topk_weights, topk_ids):
+    return run_native_te_v2(
+        layer.w13_weight_t, layer.w13_weight_bias,
+        layer.w2_weight_t, layer.w2_weight_bias,
+        layer.num_experts, hidden_states, topk_weights, topk_ids,
+    )
 
 
 def run_native_grouped_mm(layer, hidden_states, topk_weights, topk_ids):
@@ -350,7 +425,7 @@ def run_native_grouped_mm(layer, hidden_states, topk_weights, topk_ids):
     )
 
 # run_native_grouped_mm = compile_with_debug(run_native_grouped_mm, inductor_kwargs={"combo_kernels": True, "max_autotune_gemm": True})
-run_native_grouped_mm = torch.compile(run_native_grouped_mm, options={"combo_kernels": True, "max_autotune_gemm": True, "max_autotune_gemm_backends": "TRITON"})
+run_native_grouped_mm = torch.compile(run_native_grouped_mm, options={"combo_kernels": True, "max_autotune_gemm": True})
 
 
 # ── Synthetic routing ────────────────────────────────────────────────────────
@@ -452,6 +527,9 @@ def main():
     native_v2_fn = lambda: run_native_grouped_mm_v2(
         layer, hidden_states, topk_weights, topk_ids
     )
+    te_v2_fn = lambda: _run_native_te_v2_wrapper(
+        layer, hidden_states, topk_weights, topk_ids
+    )
 
     # ── Warmup all paths (torch.compile + triton autotune) ──
     print("Warming up torch.compile + Triton autotune...")
@@ -460,6 +538,7 @@ def main():
         tk_out = tk_fn()
         native_out = native_fn()
         native_v2_out = native_v2_fn()
+        te_v2_out = te_v2_fn()
     torch.cuda.synchronize()
 
     # ── Correctness ──
@@ -467,6 +546,7 @@ def main():
     tk_f = tk_out.float()
     native_f = native_out.float()
     native_v2_f = native_v2_out.float()
+    te_v2_f = te_v2_out.float()
 
     print(f"\nOutput comparison:")
     print(f"  {'Backend':40s}  {'norm':>10s}  {'max Δ vs Triton':>16s}")
@@ -477,6 +557,8 @@ def main():
           f"  {(native_f - triton_f).abs().max().item():16.6e}")
     print(f"  {'Native grouped_mm v2 (view+sum)':40s}  {native_v2_f.norm():10.4f}"
           f"  {(native_v2_f - triton_f).abs().max().item():16.6e}")
+    print(f"  {'Native TE v2 (cuBLASLt grouped)':40s}  {te_v2_f.norm():10.4f}"
+          f"  {(te_v2_f - triton_f).abs().max().item():16.6e}")
 
     # ── Eager benchmark ──
     print(f"\nEager latency:")
@@ -488,9 +570,11 @@ def main():
                                   "Native grouped_mm (compiled)")
     _, native_v2_eager = bench_eager(native_v2_fn, args.warmup, args.iters,
                                      "Native grouped_mm v2 (view+sum)")
+    _, te_v2_eager = bench_eager(te_v2_fn, args.warmup, args.iters,
+                                  "Native TE v2 (cuBLASLt grouped)")
 
     if args.no_cuda_graph:
-        _print_summary(triton_eager, tk_eager, native_eager, native_v2_eager, "Eager")
+        _print_summary(triton_eager, tk_eager, native_eager, native_v2_eager, te_v2_eager, "Eager")
         return
 
     # ── CUDA graph benchmark ──
@@ -499,6 +583,7 @@ def main():
     tk_graph, _ = capture_cuda_graph(tk_fn)
     native_graph, _ = capture_cuda_graph(native_fn)
     native_v2_graph, _ = capture_cuda_graph(native_v2_fn)
+    te_v2_graph, _ = capture_cuda_graph(te_v2_fn)
 
     print(f"\nCUDA graph latency:")
     triton_graph_us = bench_cuda_graph(
@@ -513,9 +598,12 @@ def main():
     native_v2_graph_us = bench_cuda_graph(
         native_v2_graph, args.warmup, args.iters, "Native grouped_mm v2 (view+sum)"
     )
+    te_v2_graph_us = bench_cuda_graph(
+        te_v2_graph, args.warmup, args.iters, "Native TE v2 (cuBLASLt grouped)"
+    )
 
-    _print_summary(triton_eager, tk_eager, native_eager, native_v2_eager, "Eager")
-    _print_summary(triton_graph_us, tk_graph_us, native_graph_us, native_v2_graph_us, "CUDA graph")
+    _print_summary(triton_eager, tk_eager, native_eager, native_v2_eager, te_v2_eager, "Eager")
+    _print_summary(triton_graph_us, tk_graph_us, native_graph_us, native_v2_graph_us, te_v2_graph_us, "CUDA graph")
 
     # ── NVTX-marked iteration (CUDA-graphed) for nsys profiling ──
     print("\nRunning NVTX-marked iterations (cuda-graphed, 1x each)...")
@@ -530,17 +618,21 @@ def main():
     with torch.cuda.nvtx.range("native_grouped_mm_v2"):
         native_v2_graph.replay()
     torch.cuda.synchronize()
+    with torch.cuda.nvtx.range("native_te_v2"):
+        te_v2_graph.replay()
+    torch.cuda.synchronize()
     torch.cuda.cudart().cudaProfilerStop()
     print("Done. Use 'nsys profile ...' to capture the trace.")
 
 
-def _print_summary(triton_us, tk_us, native_us, native_v2_us, mode):
-    fastest = min(triton_us, tk_us, native_us, native_v2_us)
+def _print_summary(triton_us, tk_us, native_us, native_v2_us, te_v2_us, mode):
+    fastest = min(triton_us, tk_us, native_us, native_v2_us, te_v2_us)
     print(f"\n  {mode} summary (lower is better):")
     print(f"    {'Triton fused_experts':40s}  {triton_us:8.1f} μs  ({triton_us/fastest:.2f}x)")
     print(f"    {'Triton-kernels matmul_ogs':40s}  {tk_us:8.1f} μs  ({tk_us/fastest:.2f}x)")
     print(f"    {'Native grouped_mm (compiled)':40s}  {native_us:8.1f} μs  ({native_us/fastest:.2f}x)")
     print(f"    {'Native grouped_mm v2 (view+sum)':40s}  {native_v2_us:8.1f} μs  ({native_v2_us/fastest:.2f}x)")
+    print(f"    {'Native TE v2 (cuBLASLt grouped)':40s}  {te_v2_us:8.1f} μs  ({te_v2_us/fastest:.2f}x)")
 
 
 if __name__ == "__main__":
