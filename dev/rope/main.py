@@ -217,7 +217,7 @@ def forward_sglang_rope_native(
     query: torch.Tensor,
     key: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    return type(rotary_emb).forward_native.__wrapped__(
+    return type(rotary_emb).forward_native(
         rotary_emb,
         positions,
         query,
