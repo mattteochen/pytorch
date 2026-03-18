@@ -275,7 +275,10 @@ pattern_matcher = True
 # set to True to enable the back-to-back GEMM pass
 b2b_gemm_pass = False
 
-# set to True to enable the fused GEMM+RoPE pass
+# set to True to enable the fused GEMM+RoPE pass.
+# Note: this path currently lowers to a Triton-only fused kernel. At small M,
+# the unfused baseline may still be faster because addmm can stay on the
+# default ATen/cuBLAS path while RoPE remains a separate compiled kernel.
 gemm_rope_pass = False
 
 # register custom graph optimization pass hook. so far, pre/post passes are
