@@ -366,6 +366,7 @@ def build_compiled(model: nn.Module, args: argparse.Namespace):
     }
     options = {
         "trace.enabled": True,
+        "max_autotune_gemm": True,
     }
     if args.compile_mode is not None:
         compile_kwargs["mode"] = args.compile_mode
