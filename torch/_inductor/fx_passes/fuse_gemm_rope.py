@@ -514,13 +514,19 @@ def _try_fuse_gemm_rope(
     else:
         positions = positions_list[0]
 
-    weight_meta = _node_meta_tensor(weight)
+    weight_meta = _node_meta_tensor(permuted_weight)
     if weight_meta is None or not getattr(weight_meta, "is_cuda", False):
         return False
 
     kv_cache_match = _match_kv_cache_index_put(k_match.final_node, getitems[2])
     plugin_name = GEMM_ROPE_PLUGIN
-    replacement_args = (hidden_states, weight, bias, cos_sin_cache, positions)
+    replacement_args = (
+        hidden_states,
+        permuted_weight,
+        bias,
+        cos_sin_cache,
+        positions,
+    )
     if kv_cache_match is not None and has_gemm_plugin(GEMM_ROPE_KV_CACHE_PLUGIN):
         plugin_name = GEMM_ROPE_KV_CACHE_PLUGIN
         replacement_args = replacement_args + (
@@ -542,8 +548,6 @@ def _try_fuse_gemm_rope(
     ]
     if plugin_name == GEMM_ROPE_KV_CACHE_PLUGIN and kv_cache_match is not None:
         nodes_to_remove.extend(kv_cache_match.nodes)
-    if weight is not permuted_weight:
-        nodes_to_remove.append(permuted_weight)
     seen = set()
     deduped_nodes = []
     for node in nodes_to_remove:

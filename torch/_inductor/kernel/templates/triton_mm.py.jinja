@@ -1,4 +1,4 @@
-{{def_kernel("A", "B")}}
+{{def_kernel_with_extra_inputs("A", "B")}}
     M = {{size("A", 0)}}
     N = {{size("B", 1)}}
     K = {{size("A", 1)}}
@@ -69,4 +69,4 @@
     mask = (idx_m < M) & (idx_n < N)
 
     # inductor generates a suffix
-    {{store_output(("idx_m", "idx_n"), "acc", "mask", val_shape=("BLOCK_M", "BLOCK_N"))}}
+    {{finalize_accumulation(("idx_m", "idx_n"), "acc", "mask", val_shape=("BLOCK_M", "BLOCK_N"))}}

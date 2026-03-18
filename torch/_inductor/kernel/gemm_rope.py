@@ -1,32 +1,25 @@
 # mypy: allow-untyped-defs
-from dataclasses import dataclass
 import functools
 
 import torch
 
-from ..ir import FixedLayout, TensorBox
-from ..lowering import empty_strided, lowerings
-from .gemm_plugin import register_gemm_plugin
-from ..select_algorithm import (
-    autotune_select_algorithm,
-    SymbolicGridFn,
-    TritonTemplate,
-    TritonTemplateCaller,
+from ..ir import TensorBox
+from ..kernel_inputs import MMKernelInputs
+from ..lowering import lowerings
+from .gemm_plugin import (
+    get_gemm_plugin_shared_mm_extra_inputs,
+    register_gemm_plugin,
 )
+from .mm import mm_template
+from ..select_algorithm import autotune_select_algorithm, TritonTemplateCaller
 
 
 aten = torch.ops.aten
+GEMM_ROPE_PLUGIN = "rope_neox"
+GEMM_ROPE_KV_CACHE_PLUGIN = "rope_neox_kv_cache"
 
 
-@dataclass(frozen=True)
-class GemmTemplatePlugin:
-    name: str
-    extra_inputs: tuple[str, ...]
-    mutated_inputs: tuple[str, ...]
-    body: str
-
-
-gemm_rope_configs = [
+shared_mm_rope_configs = [
     {"BLOCK_M": bm, "BLOCK_K": bk, "num_stages": ns, "num_warps": nw}
     for bm, bk, ns, nw in [
         (16, 64, 3, 4),
@@ -41,204 +34,124 @@ gemm_rope_configs = [
 ]
 
 
-@SymbolicGridFn
-def gemm_rope_grid(M, N, meta, *, cdiv):
-    return (cdiv(M, meta["BLOCK_M"]) * cdiv(N, meta["BLOCK_N"]), 1, 1)
+def _render_shared_mm_rope_output(
+    kernel,
+    indices,
+    val: str,
+    *,
+    mask: str | None = None,
+    indent_width: int = 4,
+    val_shape: tuple[str, ...] | None = None,
+    block_indexing: bool = False,
+    with_kv_cache: bool,
+) -> str:
+    assert tuple(indices) == ("idx_m", "idx_n")
+    assert val == "acc"
+    assert mask == "mask"
+    assert indent_width == 4
+    assert val_shape == ("BLOCK_M", "BLOCK_N")
+    assert not block_indexing
 
+    stride_out_m = kernel.stride(None, 0)
+    stride_out_n = kernel.stride(None, 1)
+    stride_cs = kernel.stride("COS_SIN", 0)
+    output_ptr = kernel.output_ptr()
 
-def _make_gemm_template(plugin: GemmTemplatePlugin) -> TritonTemplate:
-    extra_kernel_args = ", ".join(f'"{name}"' for name in plugin.extra_inputs)
-    def_kernel_args = '"A", "B"'
-    if extra_kernel_args:
-        def_kernel_args = f'{def_kernel_args}, {extra_kernel_args}'
-    return TritonTemplate(
-        name=plugin.name,
-        grid=gemm_rope_grid,
-        debug=False,
-        source=rf"""
-{{{{def_kernel({def_kernel_args})}}}}
+    lines = [
+        "mask_m = rm < M",
+        "mask_n = rn < N",
+        f"stride_out_m = {stride_out_m}",
+        f"stride_out_n = {stride_out_n}",
+        f"stride_cs = {stride_cs}",
+        "bias = tl.load(BIAS + rn, mask=mask_n, other=0.0).to(tl.float32)",
+        "acc = acc + bias[None, :]",
+        "col_start = pid_n * BLOCK_N",
+        "if col_start < (Q_SIZE + KV_SIZE):",
+        "    pos = tl.load(POS + rm, mask=mask_m, other=0)",
+        "    cos = tl.load(",
+        "        COS_SIN + pos[:, None] * stride_cs + tl.arange(0, HALF_ROTARY)[None, :],",
+        "        mask=mask_m[:, None],",
+        "        other=0.0,",
+        "    )",
+        "    sin = tl.load(",
+        "        COS_SIN + pos[:, None] * stride_cs + HALF_ROTARY + tl.arange(0, HALF_ROTARY)[None, :],",
+        "        mask=mask_m[:, None],",
+        "        other=0.0,",
+        "    )",
+        "    acc_3d = tl.reshape(acc, (BLOCK_M, 2, HALF_ROTARY))",
+        "    acc_t = tl.permute(acc_3d, (0, 2, 1))",
+        "    x1, x2 = tl.split(acc_t)",
+        "    o1 = x1 * cos - x2 * sin",
+        "    o2 = x2 * cos + x1 * sin",
+        "    out_joined = tl.join(o1, o2)",
+        "    out_t = tl.permute(out_joined, (0, 2, 1))",
+        "    acc = tl.reshape(out_t, (BLOCK_M, BLOCK_N))",
+    ]
 
-
-    # GEMM_ROPE_TRITON_ENTRANCE
-
-    M = {{{{size("A", 0)}}}}
-    K = {{{{size("A", 1)}}}}
-    N = Q_SIZE + 2 * KV_SIZE
-
-    stride_am = {{{{stride("A", 0)}}}}
-    stride_ak = {{{{stride("A", 1)}}}}
-    stride_bn = {{{{stride("B", 0)}}}}
-    stride_bk = {{{{stride("B", 1)}}}}
-
-    pid = tl.program_id(0)
-    grid_m = tl.cdiv(M, BLOCK_M)
-    grid_n = tl.cdiv(N, BLOCK_N)
-
-    width = GROUP_M * grid_n
-    group_id = pid // width
-    group_size = tl.minimum(grid_m - group_id * GROUP_M, GROUP_M)
-    pid_m = group_id * GROUP_M + (pid % group_size)
-    pid_n = (pid % width) // group_size
-
-    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    mask_m = rm < M
-    mask_n = rn < N
-    offs_k = tl.arange(0, BLOCK_K)
-
-    a_ptrs = A + rm[:, None] * stride_am + offs_k[None, :] * stride_ak
-    b_ptrs = B + rn[None, :] * stride_bn + offs_k[:, None] * stride_bk
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-
-    for k_idx in range(0, tl.cdiv(K, BLOCK_K)):
-        if EVEN_K:
-            a = tl.load(a_ptrs)
-            b = tl.load(b_ptrs)
-        else:
-            k_remaining = K - k_idx * BLOCK_K
-            a = tl.load(a_ptrs, mask=mask_m[:, None] & (offs_k[None, :] < k_remaining), other=0.0)
-            b = tl.load(b_ptrs, mask=mask_n[None, :] & (offs_k[:, None] < k_remaining), other=0.0)
-        acc += tl.dot(a, b, allow_tf32=ALLOW_TF32, out_dtype=tl.float32)
-        a_ptrs += BLOCK_K * stride_ak
-        b_ptrs += BLOCK_K * stride_bk
-
-{plugin.body}
-""",
-    )
-
-
-def _make_rope_plugin_body(*, with_kv_cache: bool) -> str:
-    cache_decl = ""
-    cache_k_store = ""
-    cache_v_store = ""
     if with_kv_cache:
-        cache_decl = """
-    stride_ckm = {{stride("K_CACHE", 0)}}
-    stride_ckn = {{stride("K_CACHE", 1)}}
-    stride_cvm = {{stride("V_CACHE", 0)}}
-    stride_cvn = {{stride("V_CACHE", 1)}}
-"""
-        cache_k_store = """
-            cache_rows = {{size("K_CACHE", 0)}}
-            cache_row = tl.load(CACHE_LOC + rm, mask=mask_m, other=0)
-            cache_row = tl.where(cache_row < 0, cache_row + cache_rows, cache_row)
-            cache_mask = mask_m & (cache_row >= 0) & (cache_row < cache_rows)
-            cache_row = tl.where(cache_mask, cache_row, 0)
-            tl.store(
-                K_CACHE + cache_row[:, None] * stride_ckm + rk[None, :] * stride_ckn,
-                acc,
-                mask=cache_mask[:, None] & (rk[None, :] < KV_SIZE),
-            )
-"""
-        cache_v_store = """
-        cache_rows = {{size("V_CACHE", 0)}}
-        cache_row = tl.load(CACHE_LOC + rm, mask=mask_m, other=0)
-        cache_row = tl.where(cache_row < 0, cache_row + cache_rows, cache_row)
-        cache_mask = mask_m & (cache_row >= 0) & (cache_row < cache_rows)
-        cache_row = tl.where(cache_mask, cache_row, 0)
-        tl.store(
-            V_CACHE + cache_row[:, None] * stride_cvm + rv[None, :] * stride_cvn,
-            acc,
-            mask=cache_mask[:, None] & (rv[None, :] < KV_SIZE),
+        stride_ckm = kernel.stride("K_CACHE", 0)
+        stride_ckn = kernel.stride("K_CACHE", 1)
+        stride_cvm = kernel.stride("V_CACHE", 0)
+        stride_cvn = kernel.stride("V_CACHE", 1)
+        k_cache_rows = kernel.size("K_CACHE", 0)
+        v_cache_rows = kernel.size("V_CACHE", 0)
+        lines.extend(
+            [
+                f"stride_ckm = {stride_ckm}",
+                f"stride_ckn = {stride_ckn}",
+                f"stride_cvm = {stride_cvm}",
+                f"stride_cvn = {stride_cvn}",
+            ]
         )
-"""
 
-    return (
-        """
-    stride_cs = {{stride("COS_SIN", 0)}}
-    stride_qm = {{stride(None, 0)}}
-    stride_qn = {{stride(None, 1)}}
-    stride_km = {{stride("K_BUF", 0)}}
-    stride_kn = {{stride("K_BUF", 1)}}
-    stride_vm = {{stride("V_BUF", 0)}}
-    stride_vn = {{stride("V_BUF", 1)}}
-"""
-        + cache_decl
-        + """
+    lines.extend(
+        [
+            f"# GEMM_ROPE_TRITON_ENTRANCE",
+            f"tl.store({output_ptr} + idx_m * stride_out_m + idx_n * stride_out_n, acc, mask=mask)",
+        ]
+    )
 
-    bias = tl.load(BIAS + rn, mask=mask_n, other=0.0).to(tl.float32)
-    acc = acc + bias[None, :]
-
-    col_start = pid_n * BLOCK_N
-    if col_start < (Q_SIZE + KV_SIZE):
-        pos = tl.load(POS + rm, mask=mask_m, other=0)
-        cos = tl.load(
-            COS_SIN + pos[:, None] * stride_cs + tl.arange(0, HALF_ROTARY)[None, :],
-            mask=mask_m[:, None],
-            other=0.0,
+    if with_kv_cache:
+        lines.extend(
+            [
+                "if col_start >= Q_SIZE and col_start < (Q_SIZE + KV_SIZE):",
+                f"    cache_rows = {k_cache_rows}",
+                "    cache_row = tl.load(CACHE_LOC + rm, mask=mask_m, other=0)",
+                "    cache_row = tl.where(cache_row < 0, cache_row + cache_rows, cache_row)",
+                "    cache_mask = mask_m & (cache_row >= 0) & (cache_row < cache_rows)",
+                "    cache_row = tl.where(cache_mask, cache_row, 0)",
+                "    rk = rn - Q_SIZE",
+                "    tl.store(",
+                "        K_CACHE + cache_row[:, None] * stride_ckm + rk[None, :] * stride_ckn,",
+                "        acc,",
+                "        mask=cache_mask[:, None] & (rk[None, :] < KV_SIZE),",
+                "    )",
+                "elif col_start >= (Q_SIZE + KV_SIZE):",
+                f"    cache_rows = {v_cache_rows}",
+                "    cache_row = tl.load(CACHE_LOC + rm, mask=mask_m, other=0)",
+                "    cache_row = tl.where(cache_row < 0, cache_row + cache_rows, cache_row)",
+                "    cache_mask = mask_m & (cache_row >= 0) & (cache_row < cache_rows)",
+                "    cache_row = tl.where(cache_mask, cache_row, 0)",
+                "    rv = rn - Q_SIZE - KV_SIZE",
+                "    tl.store(",
+                "        V_CACHE + cache_row[:, None] * stride_cvm + rv[None, :] * stride_cvn,",
+                "        acc,",
+                "        mask=cache_mask[:, None] & (rv[None, :] < KV_SIZE),",
+                "    )",
+            ]
         )
-        sin = tl.load(
-            COS_SIN
-            + pos[:, None] * stride_cs
-            + HALF_ROTARY
-            + tl.arange(0, HALF_ROTARY)[None, :],
-            mask=mask_m[:, None],
-            other=0.0,
-        )
-        acc_3d = tl.reshape(acc, (BLOCK_M, 2, HALF_ROTARY))
-        acc_t = tl.permute(acc_3d, (0, 2, 1))
-        x1, x2 = tl.split(acc_t)
-        o1 = x1 * cos - x2 * sin
-        o2 = x2 * cos + x1 * sin
-        out_joined = tl.join(o1, o2)
-        out_t = tl.permute(out_joined, (0, 2, 1))
-        acc = tl.reshape(out_t, (BLOCK_M, BLOCK_N))
 
-        if col_start < Q_SIZE:
-            tl.store(
-                {{output_ptr()}} + rm[:, None] * stride_qm + rn[None, :] * stride_qn,
-                acc,
-                mask=mask_m[:, None] & (rn[None, :] < Q_SIZE),
-            )
-        else:
-            rk = rn - Q_SIZE
-            tl.store(
-                K_BUF + rm[:, None] * stride_km + rk[None, :] * stride_kn,
-                acc,
-                mask=mask_m[:, None] & (rk[None, :] < KV_SIZE),
-            )
-"""
-        + cache_k_store
-        + """
-    elif col_start >= (Q_SIZE + KV_SIZE):
-        rv = rn - Q_SIZE - KV_SIZE
-        tl.store(
-            V_BUF + rm[:, None] * stride_vm + rv[None, :] * stride_vn,
-            acc,
-            mask=mask_m[:, None] & (rv[None, :] < KV_SIZE),
-        )
-"""
-        + cache_v_store
+    return "\n".join(
+        [lines[0], *((" " * indent_width) + line if line else "" for line in lines[1:])]
     )
 
 
-rope_plugin = GemmTemplatePlugin(
-    name="gemm_rope",
-    extra_inputs=("BIAS", "COS_SIN", "POS", "K_BUF", "V_BUF"),
-    mutated_inputs=("K_BUF", "V_BUF"),
-    body=_make_rope_plugin_body(with_kv_cache=False),
-)
+def render_shared_mm_rope_output(*args, **kwargs) -> str:
+    return _render_shared_mm_rope_output(*args, **kwargs, with_kv_cache=False)
 
 
-rope_kv_cache_plugin = GemmTemplatePlugin(
-    name="gemm_rope_kv_cache",
-    extra_inputs=(
-        "BIAS",
-        "COS_SIN",
-        "POS",
-        "K_BUF",
-        "V_BUF",
-        "CACHE_LOC",
-        "K_CACHE",
-        "V_CACHE",
-    ),
-    mutated_inputs=("K_BUF", "V_BUF", "K_CACHE", "V_CACHE"),
-    body=_make_rope_plugin_body(with_kv_cache=True),
-)
-
-
-gemm_rope_template = _make_gemm_template(rope_plugin)
-gemm_rope_kv_cache_template = _make_gemm_template(rope_kv_cache_plugin)
+def render_shared_mm_rope_kv_cache_output(*args, **kwargs) -> str:
+    return _render_shared_mm_rope_output(*args, **kwargs, with_kv_cache=True)
 
 
 def _fallback_rope(
@@ -272,12 +185,11 @@ def fallback_gemm_rope(
     head_dim: int,
     rotary_dim: int,
     hidden: TensorBox,
-    weight: TensorBox,
+    weight_t: TensorBox,
     bias: TensorBox,
     cos_sin_cache: TensorBox,
     positions: TensorBox,
 ):
-    weight_t = lowerings[aten.t.default](weight)
     qkv = lowerings[aten.addmm.default](bias, hidden, weight_t)
     q, k, v = lowerings[aten.split_with_sizes.default](qkv, [q_size, kv_size, kv_size], -1)
     cos_sin = lowerings[aten.index.Tensor](cos_sin_cache, [positions])
@@ -303,7 +215,7 @@ def fallback_gemm_rope_kv_cache(
     head_dim: int,
     rotary_dim: int,
     hidden: TensorBox,
-    weight: TensorBox,
+    weight_t: TensorBox,
     bias: TensorBox,
     cos_sin_cache: TensorBox,
     positions: TensorBox,
@@ -317,7 +229,7 @@ def fallback_gemm_rope_kv_cache(
         head_dim,
         rotary_dim,
         hidden,
-        weight,
+        weight_t,
         bias,
         cos_sin_cache,
         positions,
@@ -327,27 +239,61 @@ def fallback_gemm_rope_kv_cache(
     return (q, k, v)
 
 
-def _allocate_rope_outputs(
+def _can_use_fused_rope(
     q_size: int,
     kv_size: int,
-    hidden: TensorBox,
-    *,
-    layout=None,
-):
-    m_size = hidden.get_size()[0]
-    device = hidden.get_device_or_error()
-    hidden_dtype = hidden.get_dtype()
-    total_n = q_size + 2 * kv_size
-    layout = layout or FixedLayout(device, hidden_dtype, [m_size, q_size])
-    k_buf = empty_strided([m_size, kv_size], None, dtype=hidden_dtype, device=device)
-    # Match the original split view stride so inference can return V directly.
-    v_buf = empty_strided(
-        [m_size, kv_size],
-        [total_n, 1],
-        dtype=hidden_dtype,
-        device=device,
+    head_dim: int,
+    rotary_dim: int,
+) -> bool:
+    return (
+        rotary_dim == head_dim
+        and rotary_dim % 2 == 0
+        and q_size % head_dim == 0
+        and kv_size % head_dim == 0
     )
-    return m_size, total_n, layout, k_buf, v_buf
+
+
+def _build_shared_mm_rope_choices(
+    plugin_name: str,
+    kernel_inputs: MMKernelInputs,
+    *,
+    head_dim: int,
+    q_size: int,
+    kv_size: int,
+    rotary_dim: int,
+    layout,
+    mutated_inputs=None,
+) -> list[TritonTemplateCaller]:
+    m_size, _, _ = kernel_inputs.mnk_symbolic()
+    total_n = q_size + 2 * kv_size
+    input_nodes = tuple(kernel_inputs.nodes())
+    choices: list[TritonTemplateCaller] = []
+    extra_input_names = get_gemm_plugin_shared_mm_extra_inputs(plugin_name)
+
+    for config in shared_mm_rope_configs:
+        mm_template.maybe_append_choice(
+            choices,
+            input_nodes=input_nodes,
+            layout=layout,
+            mutated_inputs=mutated_inputs,
+            call_sizes=(m_size, total_n),
+            triton_meta={
+                "MM_TEMPLATE_PLUGIN": plugin_name,
+                "EXTRA_INPUT_NAMES": extra_input_names,
+            },
+            BLOCK_N=head_dim,
+            Q_SIZE=q_size,
+            KV_SIZE=kv_size,
+            HALF_ROTARY=rotary_dim // 2,
+            GROUP_M=8,
+            ALLOW_TF32=True,
+            EVEN_K=input_nodes[0].get_size()[1] % config["BLOCK_K"] == 0,
+            USE_FAST_ACCUM=False,
+            ACC_TYPE="tl.float32",
+            **config,
+        )
+
+    return choices
 
 
 def tuned_fused_gemm_rope(
@@ -356,55 +302,47 @@ def tuned_fused_gemm_rope(
     head_dim: int,
     rotary_dim: int,
     hidden: TensorBox,
-    weight: TensorBox,
+    weight_t: TensorBox,
     bias: TensorBox,
     cos_sin_cache: TensorBox,
     positions: TensorBox,
     *,
     layout=None,
 ):
-    if rotary_dim != head_dim or rotary_dim % 2 != 0:
+    if not _can_use_fused_rope(q_size, kv_size, head_dim, rotary_dim):
         return fallback_gemm_rope(
             q_size,
             kv_size,
             head_dim,
             rotary_dim,
             hidden,
-            weight,
+            weight_t,
             bias,
             cos_sin_cache,
             positions,
         )
 
     hidden.realize()
-    weight.realize()
+    weight_t.realize()
     bias.realize()
     cos_sin_cache.realize()
     positions.realize()
 
-    m_size, total_n, layout, k_buf, v_buf = _allocate_rope_outputs(
-        q_size,
-        kv_size,
-        hidden,
+    kernel_inputs = MMKernelInputs(
+        [hidden, weight_t, bias, cos_sin_cache, positions],
+        mat1_idx=0,
+        mat2_idx=1,
+    )
+    layout = layout or kernel_inputs.output_layout(flexible=False)
+    choices = _build_shared_mm_rope_choices(
+        GEMM_ROPE_PLUGIN,
+        kernel_inputs,
+        head_dim=head_dim,
+        q_size=q_size,
+        kv_size=kv_size,
+        rotary_dim=rotary_dim,
         layout=layout,
     )
-    choices: list[TritonTemplateCaller] = []
-    for config in gemm_rope_configs:
-        gemm_rope_template.maybe_append_choice(
-            choices,
-            input_nodes=(hidden, weight, bias, cos_sin_cache, positions, k_buf, v_buf),
-            layout=layout,
-            mutated_inputs=[k_buf, v_buf],
-            call_sizes=(m_size, total_n),
-            BLOCK_N=head_dim,
-            Q_SIZE=q_size,
-            KV_SIZE=kv_size,
-            HALF_ROTARY=rotary_dim // 2,
-            GROUP_M=8,
-            ALLOW_TF32=True,
-            EVEN_K=hidden.get_size()[1] % config["BLOCK_K"] == 0,
-            **config,
-        )
 
     if not choices:
         return fallback_gemm_rope(
@@ -413,19 +351,19 @@ def tuned_fused_gemm_rope(
             head_dim,
             rotary_dim,
             hidden,
-            weight,
+            weight_t,
             bias,
             cos_sin_cache,
             positions,
         )
 
-    q_out = autotune_select_algorithm(
-        "gemm_rope",
-        choices,
-        [hidden, weight, bias, cos_sin_cache, positions, k_buf, v_buf],
-        layout,
+    qkv_out = autotune_select_algorithm(
+        "gemm_rope", choices, kernel_inputs.nodes(), layout
     )
-    return (q_out, k_buf, v_buf)
+    q, k, v = lowerings[aten.split_with_sizes.default](
+        qkv_out, [q_size, kv_size, kv_size], -1
+    )
+    return (q, k, v)
 
 
 def tuned_fused_gemm_rope_kv_cache(
@@ -434,7 +372,7 @@ def tuned_fused_gemm_rope_kv_cache(
     head_dim: int,
     rotary_dim: int,
     hidden: TensorBox,
-    weight: TensorBox,
+    weight_t: TensorBox,
     bias: TensorBox,
     cos_sin_cache: TensorBox,
     positions: TensorBox,
@@ -444,14 +382,14 @@ def tuned_fused_gemm_rope_kv_cache(
     *,
     layout=None,
 ):
-    if rotary_dim != head_dim or rotary_dim % 2 != 0:
+    if not _can_use_fused_rope(q_size, kv_size, head_dim, rotary_dim):
         return fallback_gemm_rope_kv_cache(
             q_size,
             kv_size,
             head_dim,
             rotary_dim,
             hidden,
-            weight,
+            weight_t,
             bias,
             cos_sin_cache,
             positions,
@@ -461,7 +399,7 @@ def tuned_fused_gemm_rope_kv_cache(
         )
 
     hidden.realize()
-    weight.realize()
+    weight_t.realize()
     bias.realize()
     cos_sin_cache.realize()
     positions.realize()
@@ -469,40 +407,22 @@ def tuned_fused_gemm_rope_kv_cache(
     k_cache.realize()
     v_cache.realize()
 
-    m_size, total_n, layout, k_buf, v_buf = _allocate_rope_outputs(
-        q_size,
-        kv_size,
-        hidden,
-        layout=layout,
+    kernel_inputs = MMKernelInputs(
+        [hidden, weight_t, bias, cos_sin_cache, positions, cache_loc, k_cache, v_cache],
+        mat1_idx=0,
+        mat2_idx=1,
     )
-    choices: list[TritonTemplateCaller] = []
-    for config in gemm_rope_configs:
-        gemm_rope_kv_cache_template.maybe_append_choice(
-            choices,
-            input_nodes=(
-                hidden,
-                weight,
-                bias,
-                cos_sin_cache,
-                positions,
-                k_buf,
-                v_buf,
-                cache_loc,
-                k_cache,
-                v_cache,
-            ),
-            layout=layout,
-            mutated_inputs=[k_buf, v_buf, k_cache, v_cache],
-            call_sizes=(m_size, total_n),
-            BLOCK_N=head_dim,
-            Q_SIZE=q_size,
-            KV_SIZE=kv_size,
-            HALF_ROTARY=rotary_dim // 2,
-            GROUP_M=8,
-            ALLOW_TF32=True,
-            EVEN_K=hidden.get_size()[1] % config["BLOCK_K"] == 0,
-            **config,
-        )
+    layout = layout or kernel_inputs.output_layout(flexible=False)
+    choices = _build_shared_mm_rope_choices(
+        GEMM_ROPE_KV_CACHE_PLUGIN,
+        kernel_inputs,
+        head_dim=head_dim,
+        q_size=q_size,
+        kv_size=kv_size,
+        rotary_dim=rotary_dim,
+        layout=layout,
+        mutated_inputs=[k_cache, v_cache],
+    )
 
     if not choices:
         return fallback_gemm_rope_kv_cache(
@@ -511,7 +431,7 @@ def tuned_fused_gemm_rope_kv_cache(
             head_dim,
             rotary_dim,
             hidden,
-            weight,
+            weight_t,
             bias,
             cos_sin_cache,
             positions,
@@ -520,24 +440,13 @@ def tuned_fused_gemm_rope_kv_cache(
             v_cache,
         )
 
-    q_out = autotune_select_algorithm(
-        "gemm_rope_kv_cache",
-        choices,
-        [
-            hidden,
-            weight,
-            bias,
-            cos_sin_cache,
-            positions,
-            k_buf,
-            v_buf,
-            cache_loc,
-            k_cache,
-            v_cache,
-        ],
-        layout,
+    qkv_out = autotune_select_algorithm(
+        "gemm_rope_kv_cache", choices, kernel_inputs.nodes(), layout
     )
-    return (q_out, k_buf, v_buf)
+    q, k, v = lowerings[aten.split_with_sizes.default](
+        qkv_out, [q_size, kv_size, kv_size], -1
+    )
+    return (q, k, v)
 
 
 def gemm_rope_lowering_factory(
@@ -571,11 +480,15 @@ def gemm_rope_kv_cache_lowering_factory(
 
 
 register_gemm_plugin(
-    "rope_neox",
+    GEMM_ROPE_PLUGIN,
     lowering_factory=gemm_rope_lowering_factory,
+    shared_mm_extra_inputs=("BIAS", "COS_SIN", "POS"),
+    shared_mm_finalizer=render_shared_mm_rope_output,
 )
 
 register_gemm_plugin(
-    "rope_neox_kv_cache",
+    GEMM_ROPE_KV_CACHE_PLUGIN,
     lowering_factory=gemm_rope_kv_cache_lowering_factory,
+    shared_mm_extra_inputs=("BIAS", "COS_SIN", "POS", "CACHE_LOC", "K_CACHE", "V_CACHE"),
+    shared_mm_finalizer=render_shared_mm_rope_kv_cache_output,
 )

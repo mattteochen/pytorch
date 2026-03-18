@@ -747,6 +747,55 @@ class TritonTemplateKernel(TritonKernel):
         """Return the generated argument name for the primary template output."""
         return self.args.output(self.output_node.get_name())
 
+    def extra_input_names(self) -> list[str]:
+        template_meta = self.triton_meta or {}
+        extra_input_names = template_meta.get(
+            "EXTRA_INPUT_NAMES",
+            self.meta.get("EXTRA_INPUT_NAMES", ()),
+        )
+        assert isinstance(extra_input_names, (list, tuple))
+        return list(extra_input_names)
+
+    def def_kernel_with_extra_inputs(self, *base_argnames: str):
+        return self.def_kernel(*base_argnames, *self.extra_input_names())
+
+    def finalize_accumulation(
+        self,
+        indices,
+        val,
+        mask=None,
+        indent_width=4,
+        val_shape=None,
+        block_indexing=False,
+    ):
+        template_meta = self.triton_meta or {}
+        plugin_name = template_meta.get(
+            "MM_TEMPLATE_PLUGIN",
+            self.meta.get("MM_TEMPLATE_PLUGIN"),
+        )
+        if plugin_name is None:
+            return self.store_output(
+                indices,
+                val,
+                mask,
+                indent_width=indent_width,
+                val_shape=val_shape,
+                block_indexing=block_indexing,
+            )
+
+        from .kernel.gemm_plugin import render_gemm_plugin_shared_mm_output
+
+        return render_gemm_plugin_shared_mm_output(
+            plugin_name,
+            self,
+            indices,
+            val,
+            mask=mask,
+            indent_width=indent_width,
+            val_shape=val_shape,
+            block_indexing=block_indexing,
+        )
+
     def def_kernel(self, *argnames):
         """
         Hook called from template code to generate function def and
@@ -1454,9 +1503,12 @@ class TritonTemplateKernel(TritonKernel):
             )
             for fn in [
                 self.def_kernel,
+                self.def_kernel_with_extra_inputs,
                 self.size,
                 self.stride,
                 self.output_ptr,
+                self.extra_input_names,
+                self.finalize_accumulation,
                 self.store_output,
                 self.load_input,
                 self.make_load,
