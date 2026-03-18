@@ -92,12 +92,13 @@ class PackedQKVGemmRopeKVCache(PackedQKVGemmRope):
 class GemmRopeTest(TestCase):
     device = GPU_TYPE
     _ROPE_TOL_MULTIPLIER = 2.0
+    _HEAD_DIM = 32
 
     def _make_cos_sin_cache(
         self,
         *,
         max_position: int = 128,
-        rotary_dim: int = 8,
+        rotary_dim: int = _HEAD_DIM,
     ) -> torch.Tensor:
         base = 10000.0
         inv_freq = 1.0 / (
@@ -136,7 +137,7 @@ class GemmRopeTest(TestCase):
             hidden_size=128,
             num_heads=4,
             num_kv_heads=2,
-            head_dim=8,
+            head_dim=self._HEAD_DIM,
             dtype=dtype,
             device=self.device,
             apply_rope=apply_rope,
@@ -152,7 +153,7 @@ class GemmRopeTest(TestCase):
     ):
         with torch.inference_mode():
             with torch._inductor.config.patch(fx_graph_cache=False):
-                compiled = torch.compile(model, fullgraph=True)
+                compiled = torch.compile(model, fullgraph=True, options={"max_autotune_gemm": True})
             return run_and_get_code(compiled, *inputs)
 
     @skipIfXpu(msg="gemm_rope Triton template is CUDA-only")
@@ -217,7 +218,7 @@ class GemmRopeTest(TestCase):
                 hidden_size=128,
                 num_heads=4,
                 num_kv_heads=2,
-                head_dim=8,
+                head_dim=self._HEAD_DIM,
                 dtype=torch.bfloat16,
                 device=self.device,
             ).eval()

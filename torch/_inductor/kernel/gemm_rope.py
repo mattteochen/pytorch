@@ -3,9 +3,11 @@ import functools
 
 import torch
 
+from .. import config as inductor_config
 from ..ir import TensorBox
 from ..kernel_inputs import MMKernelInputs
 from ..lowering import lowerings
+from ..template_heuristics.registry import get_template_heuristic
 from .gemm_plugin import (
     get_gemm_plugin_shared_mm_extra_inputs,
     register_gemm_plugin,
@@ -269,8 +271,40 @@ def _build_shared_mm_rope_choices(
     input_nodes = tuple(kernel_inputs.nodes())
     choices: list[TritonTemplateCaller] = []
     extra_input_names = get_gemm_plugin_shared_mm_extra_inputs(plugin_name)
+    mm_heuristic = get_template_heuristic(
+        mm_template.uid,
+        kernel_inputs.device_type,
+        "mm",
+    )
+    heuristic_extra_kwargs = mm_heuristic.get_extra_kwargs(kernel_inputs, "mm")
+    config_kwargs_list: list[dict[str, object]] = []
 
-    for config in shared_mm_rope_configs:
+    if inductor_config.max_autotune_gemm:
+        for params in mm_heuristic.get_template_configs(kernel_inputs, "mm"):
+            config_kwargs = {
+                **heuristic_extra_kwargs,
+                **params.to_kwargs(),
+            }
+            if config_kwargs.get("BLOCK_N") != head_dim:
+                continue
+            config_kwargs_list.append(config_kwargs)
+
+    if not config_kwargs_list:
+        config_kwargs_list.extend(
+            {
+                **heuristic_extra_kwargs,
+                "BLOCK_N": head_dim,
+                "GROUP_M": 8,
+                "USE_FAST_ACCUM": False,
+                "ACC_TYPE": "tl.float32",
+                "ALLOW_TF32": heuristic_extra_kwargs["ALLOW_TF32"],
+                "EVEN_K": input_nodes[0].get_size()[1] % config["BLOCK_K"] == 0,
+                **config,
+            }
+            for config in shared_mm_rope_configs
+        )
+
+    for config_kwargs in config_kwargs_list:
         mm_template.maybe_append_choice(
             choices,
             input_nodes=input_nodes,
@@ -281,16 +315,10 @@ def _build_shared_mm_rope_choices(
                 "MM_TEMPLATE_PLUGIN": plugin_name,
                 "EXTRA_INPUT_NAMES": extra_input_names,
             },
-            BLOCK_N=head_dim,
             Q_SIZE=q_size,
             KV_SIZE=kv_size,
             HALF_ROTARY=rotary_dim // 2,
-            GROUP_M=8,
-            ALLOW_TF32=True,
-            EVEN_K=input_nodes[0].get_size()[1] % config["BLOCK_K"] == 0,
-            USE_FAST_ACCUM=False,
-            ACC_TYPE="tl.float32",
-            **config,
+            **config_kwargs,
         )
 
     return choices
