@@ -275,6 +275,9 @@ pattern_matcher = True
 # set to True to enable the back-to-back GEMM pass
 b2b_gemm_pass = False
 
+# set to True to enable the fused GEMM+RoPE pass
+gemm_rope_pass = False
+
 # register custom graph optimization pass hook. so far, pre/post passes are
 # only applied before/after pattern_matcher in post_grad_passes.
 #

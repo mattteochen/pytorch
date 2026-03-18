@@ -59,6 +59,7 @@ from ..utils import (
 from ..virtualized import V
 from .b2b_gemm import B2B_GEMM_PASS
 from .ddp_fusion import fuse_ddp_communication
+from .fuse_gemm_rope import apply_gemm_rope_pass, GEMM_ROPE_PASS
 from .fuse_symm_mem_comms import fuse_symm_mem_comms_pass
 from .group_batch_fusion import group_batch_fusion_passes, POST_GRAD_FUSIONS
 from .micro_pipeline_tp import micro_pipeline_tp_pass
@@ -204,6 +205,8 @@ def post_grad_passes(gm: torch.fx.GraphModule, is_inference: bool):
                 )
         if config.b2b_gemm_pass:
             B2B_GEMM_PASS.apply(gm.graph)  # type: ignore[arg-type]
+        if config.gemm_rope_pass and is_inference:
+            apply_gemm_rope_pass(gm.graph)  # type: ignore[arg-type]
 
     if config._micro_pipeline_tp:
         micro_pipeline_tp_pass(gm.graph)

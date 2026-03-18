@@ -743,6 +743,10 @@ class TritonTemplateKernel(TritonKernel):
     def gen_defines(self):
         return self.defines
 
+    def output_ptr(self):
+        """Return the generated argument name for the primary template output."""
+        return self.args.output(self.output_node.get_name())
+
     def def_kernel(self, *argnames):
         """
         Hook called from template code to generate function def and
@@ -1452,6 +1456,7 @@ class TritonTemplateKernel(TritonKernel):
                 self.def_kernel,
                 self.size,
                 self.stride,
+                self.output_ptr,
                 self.store_output,
                 self.load_input,
                 self.make_load,
@@ -1768,6 +1773,9 @@ class TritonTemplate(KernelTemplate):
         debug=False,
         cache_codegen_enabled_for_template=False,
         prologue_loads_all_inputs=False,
+        extra_template_env_fn_builders: Optional[
+            Sequence[Callable[[TritonTemplateKernel], Sequence[Callable[..., Any]]]]
+        ] = None,
     ) -> None:
         super().__init__(name, hash=hashlib.sha256(source.encode("utf-8")).hexdigest())
         self.grid = grid
@@ -1781,6 +1789,7 @@ class TritonTemplate(KernelTemplate):
         # When prologue_loads_all_inputs is true, prologue_supported_inputs is populated during def_kernel
         # by adding all inputs.
         self.prologue_loads_all_inputs = prologue_loads_all_inputs
+        self.extra_template_env_fn_builders = tuple(extra_template_env_fn_builders or ())
 
     # When this flag is on, we ensure that the cached results and the generated result if cache
     # was not used are the same.
@@ -1913,7 +1922,7 @@ class TritonTemplate(KernelTemplate):
             )
 
         def make_kernel():
-            return self.kernel_type(
+            kernel = self.kernel_type(
                 kernel_name=kernel_name,
                 output_node=fake_out,
                 workspace_arg=workspace_arg,
@@ -1924,6 +1933,9 @@ class TritonTemplate(KernelTemplate):
                 triton_meta=triton_meta,
                 **kernel_options,
             )
+            for builder in self.extra_template_env_fn_builders:
+                kernel._register_extra_template_env_fns(*builder(kernel))
+            return kernel
 
         def generate_code(kernel) -> Optional[tuple[str, str]]:
             def make_extra() -> str:

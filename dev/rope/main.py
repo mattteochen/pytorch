@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 # Example usage:
-# python3 benchmark/kernels/benchmark_qkv_gemm_rope.py --mode both
-# python3 benchmark/kernels/benchmark_qkv_gemm_rope.py --mode compile --num-tokens 1 --dtype bf16
-# TORCH_COMPILE_DEBUG=1 python3 benchmark/kernels/benchmark_qkv_gemm_rope.py --mode compile
+# python3 main.py --num-tokens 32 --dtype bf16
+# python3 main.py --num-tokens 1 32 --dtype bf16 --no-cuda-graphs
+# TORCH_COMPILE_DEBUG=1 python3 main.py --num-tokens 32 128 --nvtx
 
 import argparse
 import math
+from pathlib import Path
+import sys
 import time
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.server_args import (
     ServerArgs,
@@ -29,12 +30,6 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument(
-        "--mode",
-        choices=["eager", "compile", "both"],
-        default="both",
-        help="Which execution path to run.",
-    )
-    parser.add_argument(
         "--device",
         type=str,
         default=None,
@@ -46,7 +41,7 @@ def parse_args() -> argparse.Namespace:
         default="bf16",
         help="Tensor dtype. Defaults to gpt-oss-20b-bf16.",
     )
-    parser.add_argument("--num-tokens", type=int, default=4096)
+    parser.add_argument("--num-tokens", type=int, nargs="+", default=[1])
     parser.add_argument("--hidden-size", type=int, default=2880)
     parser.add_argument("--num-heads", type=int, default=64)
     parser.add_argument("--num-kv-heads", type=int, default=8)
@@ -135,6 +130,16 @@ def parse_args() -> argparse.Namespace:
         "--disable-bias",
         action="store_true",
         help="Disable QKV bias in the packed projection.",
+    )
+    parser.add_argument(
+        "--no-cuda-graphs",
+        action="store_true",
+        help="Disable CUDA graph replay benchmarking on CUDA.",
+    )
+    parser.add_argument(
+        "--nvtx",
+        action="store_true",
+        help="Emit NVTX ranges for 2 iterations per mode after benchmarking.",
     )
     return parser.parse_args()
 
@@ -312,9 +317,7 @@ def make_inputs(
 
 
 def benchmark_fn(
-    fn,
-    positions: torch.Tensor,
-    hidden_states: torch.Tensor,
+    fn: Callable[[], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
     device: torch.device,
     warmup: int,
     iters: int,
@@ -322,7 +325,7 @@ def benchmark_fn(
     outputs = None
     with torch.no_grad():
         for _ in range(warmup):
-            outputs = fn(positions, hidden_states)
+            outputs = fn()
         maybe_synchronize(device)
 
         if device.type == "cuda":
@@ -330,14 +333,14 @@ def benchmark_fn(
             end = torch.cuda.Event(enable_timing=True)
             start.record()
             for _ in range(iters):
-                outputs = fn(positions, hidden_states)
+                outputs = fn()
             end.record()
             torch.cuda.synchronize(device)
             avg_ms = start.elapsed_time(end) / iters
         else:
             t0 = time.perf_counter()
             for _ in range(iters):
-                outputs = fn(positions, hidden_states)
+                outputs = fn()
             maybe_synchronize(device)
             avg_ms = (time.perf_counter() - t0) * 1000.0 / iters
 
@@ -347,12 +350,12 @@ def benchmark_fn(
 
 
 def max_abs_diff(
-    eager_outputs: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    baseline_outputs: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     compiled_outputs: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
 ) -> float:
     return max(
         (a.float() - b.float()).abs().max().item()
-        for a, b in zip(eager_outputs, compiled_outputs)
+        for a, b in zip(baseline_outputs, compiled_outputs)
     )
 
 
@@ -362,14 +365,105 @@ def build_compiled(model: nn.Module, args: argparse.Namespace):
         "fullgraph": args.fullgraph,
     }
     options = {
-        "combo_kernels": True,
         "trace.enabled": True,
-        "max_autotune_gemm": True,
-        "max_autotune_gemm_backends": "TRITON",
     }
     if args.compile_mode is not None:
         compile_kwargs["mode"] = args.compile_mode
     return torch.compile(model, options=options, **compile_kwargs)
+
+
+def build_compiled_runner(
+    model: nn.Module,
+    args: argparse.Namespace,
+    positions: torch.Tensor,
+    hidden_states: torch.Tensor,
+    *,
+    gemm_rope_pass: bool,
+):
+    compiled = build_compiled(model, args)
+    with torch._inductor.config.patch(gemm_rope_pass=gemm_rope_pass):
+        compiled(positions, hidden_states)
+
+    def run(
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        with torch._inductor.config.patch(gemm_rope_pass=gemm_rope_pass):
+            return compiled(positions, hidden_states)
+
+    return run
+
+
+def make_zero_arg_runner(
+    fn: Callable[[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    positions: torch.Tensor,
+    hidden_states: torch.Tensor,
+) -> Callable[[], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    def run():
+        return fn(positions, hidden_states)
+
+    return run
+
+
+def make_cuda_graph_runner(
+    fn: Callable[[], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    device: torch.device,
+) -> Callable[[], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    if device.type != "cuda":
+        return fn
+
+    stream = torch.cuda.Stream(device=device)
+    stream.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(stream):
+        for _ in range(5):
+            outputs = fn()
+    torch.cuda.current_stream(device).wait_stream(stream)
+    torch.cuda.synchronize(device)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        static_outputs = fn()
+
+    def replay():
+        graph.replay()
+        return static_outputs
+
+    return replay
+
+
+def clone_outputs(
+    outputs: Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return tuple(x.clone() for x in outputs)
+
+
+def run_nvtx_trace(
+    runners: list[
+        tuple[
+            str,
+            Callable[[], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+        ]
+    ],
+    device: torch.device,
+    *,
+    use_cuda_graphs: bool,
+) -> None:
+    if device.type != "cuda":
+        return
+
+    print("\n=== NVTX Trace ===")
+    print("running 2 iterations per mode with NVTX ranges")
+    torch.cuda.cudart().cudaProfilerStart()
+    with torch.inference_mode():
+        for name, runner in runners:
+            for idx in range(2):
+                torch.cuda.nvtx.range_push(
+                    f"{name}_iter_{idx}_cudagraphs_{int(use_cuda_graphs)}"
+                )
+                runner()
+                torch.cuda.nvtx.range_pop()
+            torch.cuda.synchronize(device)
+    torch.cuda.cudart().cudaProfilerStop()
 
 
 def main() -> None:
@@ -397,7 +491,7 @@ def main() -> None:
         raise ValueError(f"rotary_dim ({rotary_dim}) must be even")
     if args.head_dim % 2 != 0:
         raise ValueError(f"head_dim ({args.head_dim}) must be even")
-    if args.num_tokens > args.max_position:
+    if max(args.num_tokens) > args.max_position:
         print(
             "warning: num_tokens exceeds max_position, positions will wrap modulo "
             f"{args.max_position}"
@@ -429,19 +523,11 @@ def main() -> None:
         rope_style=args.rope_style,
     ).eval()
 
-    positions, hidden_states = make_inputs(
-        num_tokens=args.num_tokens,
-        hidden_size=args.hidden_size,
-        max_position=args.max_position,
-        dtype=dtype,
-        device=device,
-    )
-
     print("=== Configuration ===")
     print(f"device={device}")
     print(f"dtype={dtype}")
-    print(f"mode={args.mode}")
-    print(f"hidden_states={tuple(hidden_states.shape)}")
+    print("modes=torch.compile,compile+gemm_rope")
+    print(f"cuda_graphs={device.type == 'cuda' and not args.no_cuda_graphs}")
     print(f"qkv_weight={tuple(model.qkv_weight.shape)}")
     print(
         f"q_size={model.q_size}, kv_size={model.kv_size}, "
@@ -454,42 +540,151 @@ def main() -> None:
         f"rope_truncate={args.rope_truncate}"
     )
     print(f"rope_module={type(model.rotary_emb).__name__}")
+    print(f"num_tokens={args.num_tokens}")
 
-    eager_outputs = None
-    if args.mode in {"eager", "both"}:
-        eager_ms, eager_checksum, eager_outputs = benchmark_fn(
-            fn=model,
-            positions=positions,
-            hidden_states=hidden_states,
+    for param in model.parameters():
+        param.requires_grad_(False)
+
+    use_cuda_graphs = device.type == "cuda" and not args.no_cuda_graphs
+
+    summary_rows: list[dict[str, float | int]] = []
+
+    for num_tokens in args.num_tokens:
+        positions, hidden_states = make_inputs(
+            num_tokens=num_tokens,
+            hidden_size=args.hidden_size,
+            max_position=args.max_position,
+            dtype=dtype,
             device=device,
-            warmup=args.warmup,
-            iters=args.iters,
         )
-        print("\n=== Eager ===")
-        print(f"avg_ms={eager_ms:.4f}")
-        print(f"checksum={eager_checksum:.6f}")
-        print(f"output_shapes={tuple(t.shape for t in eager_outputs)}")
 
-    if args.mode in {"compile", "both"}:
-        compiled_model = build_compiled(model, args)
-        compiled_ms, compiled_checksum, compiled_outputs = benchmark_fn(
-            fn=compiled_model,
-            positions=positions,
-            hidden_states=hidden_states,
-            device=device,
-            warmup=args.warmup,
-            iters=args.iters,
+        runners: list[
+            tuple[
+                str,
+                Callable[
+                    [torch.Tensor, torch.Tensor],
+                    Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+                ],
+            ],
+        ] = [
+            ("torch.compile", model),
+            (
+                "compile+gemm_rope",
+                build_compiled_runner(
+                    model,
+                    args,
+                    positions,
+                    hidden_states,
+                    gemm_rope_pass=True,
+                ),
+            ),
+        ]
+
+        results: list[dict[str, object]] = []
+        baseline_outputs = None
+        baseline_ms = None
+        nvtx_runners: list[
+            tuple[str, Callable[[], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]
+        ] = []
+
+        for name, runner in runners:
+            zero_arg_runner = make_zero_arg_runner(runner, positions, hidden_states)
+            bench_runner = (
+                make_cuda_graph_runner(zero_arg_runner, device)
+                if use_cuda_graphs
+                else zero_arg_runner
+            )
+            nvtx_runners.append((f"{name}_tokens_{num_tokens}", bench_runner))
+            avg_ms, checksum, outputs = benchmark_fn(
+                fn=bench_runner,
+                device=device,
+                warmup=args.warmup,
+                iters=args.iters,
+            )
+            outputs = clone_outputs(outputs)
+
+            if baseline_outputs is None:
+                baseline_outputs = outputs
+                baseline_ms = avg_ms
+
+            diff = (
+                0.0
+                if name == "torch.compile"
+                else max_abs_diff(baseline_outputs, outputs)
+            )
+            q_diff = (
+                0.0
+                if name == "torch.compile"
+                else (baseline_outputs[0].float() - outputs[0].float()).abs().max().item()
+            )
+            k_diff = (
+                0.0
+                if name == "torch.compile"
+                else (baseline_outputs[1].float() - outputs[1].float()).abs().max().item()
+            )
+            v_diff = (
+                0.0
+                if name == "torch.compile"
+                else (baseline_outputs[2].float() - outputs[2].float()).abs().max().item()
+            )
+            results.append(
+                {
+                    "name": name,
+                    "avg_ms": avg_ms,
+                    "checksum": checksum,
+                    "outputs": outputs,
+                    "max_abs_diff_vs_baseline": diff,
+                    "q_diff_vs_baseline": q_diff,
+                    "k_diff_vs_baseline": k_diff,
+                    "v_diff_vs_baseline": v_diff,
+                    "speedup_vs_baseline": (baseline_ms / avg_ms) if baseline_ms is not None else 1.0,
+                }
+            )
+
+        if baseline_ms is not None:
+            fused_result = next(
+                result for result in results if result["name"] == "compile+gemm_rope"
+            )
+            summary_rows.append(
+                {
+                    "num_tokens": num_tokens,
+                    "baseline_ms": float(baseline_ms),
+                    "fused_ms": float(fused_result["avg_ms"]),
+                    "speedup": float(fused_result["speedup_vs_baseline"]),
+                    "max_diff": float(fused_result["max_abs_diff_vs_baseline"]),
+                    "q_diff": float(fused_result["q_diff_vs_baseline"]),
+                    "k_diff": float(fused_result["k_diff_vs_baseline"]),
+                    "v_diff": float(fused_result["v_diff_vs_baseline"]),
+                }
+            )
+
+        if args.nvtx:
+            run_nvtx_trace(
+                nvtx_runners,
+                device,
+                use_cuda_graphs=use_cuda_graphs,
+            )
+
+    if summary_rows:
+        print("\n=== Final Summary ===")
+        header = (
+            f"{'num_tokens':>10} {'torch.compile':>14} {'gemm_rope':>12} "
+            f"{'speedup':>10} {'max_diff':>12} {'q_diff':>12} "
+            f"{'k_diff':>12} {'v_diff':>12}"
         )
-        print("\n=== torch.compile ===")
-        print(f"avg_ms={compiled_ms:.4f}")
-        print(f"checksum={compiled_checksum:.6f}")
-        print(f"output_shapes={tuple(t.shape for t in compiled_outputs)}")
-
-        if eager_outputs is None:
-            with torch.no_grad():
-                eager_outputs = model(positions, hidden_states)
-        diff = max_abs_diff(eager_outputs, compiled_outputs)
-        print(f"max_abs_diff_vs_eager={diff:.6e}")
+        print(header)
+        print("-" * len(header))
+        for row in summary_rows:
+            print(
+                f"{row['num_tokens']:>10d} "
+                f"{row['baseline_ms']:>14.4f} "
+                f"{row['fused_ms']:>12.4f} "
+                f"{row['speedup']:>10.4f} "
+                f"{row['max_diff']:>12.6e} "
+                f"{row['q_diff']:>12.6e} "
+                f"{row['k_diff']:>12.6e} "
+                f"{row['v_diff']:>12.6e}"
+            )
 
 
 if __name__ == "__main__":
