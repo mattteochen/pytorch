@@ -16,6 +16,7 @@ linear = torch._C._nn.linear
 
 GEMM_ROPE_PASS = PatternMatcherPass(pass_name="gemm_rope_pass")
 GEMM_ROPE_PLUGIN = "rope_neox"
+GEMM_ROPE_KV_CACHE_PLUGIN = "rope_neox_kv_cache"
 
 
 @dataclass
@@ -26,6 +27,14 @@ class RopeChainMatch:
     sin: torch.fx.Node
     head_dim: int
     rotary_dim: int
+
+
+@dataclass
+class KvCacheUpdateMatch:
+    cache_loc: torch.fx.Node
+    k_buffer: torch.fx.Node
+    v_buffer: torch.fx.Node
+    nodes: list[torch.fx.Node]
 
 
 def _is_call(node: torch.fx.Node, target) -> bool:
@@ -120,6 +129,128 @@ def _find_binary_user(lhs: torch.fx.Node, rhs: torch.fx.Node, *targets) -> Optio
         if user.args == (lhs, rhs):
             return user
     return None
+
+
+def _match_copy_user(
+    node: torch.fx.Node,
+    buffer: torch.fx.Node,
+) -> Optional[torch.fx.Node]:
+    matched = None
+    for user in node.users:
+        if _is_call(user, aten.copy_.default) and user.args == (buffer, node):
+            if matched is not None:
+                return None
+            matched = user
+            continue
+        return None
+    return matched
+
+
+def _match_single_index_put(
+    value_node: torch.fx.Node,
+) -> Optional[tuple[torch.fx.Node, torch.fx.Node, torch.fx.Node, list[torch.fx.Node]]]:
+    matched = None
+    for user in value_node.users:
+        if not _is_call_function_target(
+            user,
+            aten.index_put.default,
+            aten.index_put_.default,
+        ):
+            continue
+        if len(user.args) < 3 or user.args[2] is not value_node:
+            continue
+        indices = user.args[1]
+        if not isinstance(indices, list) or len(indices) != 1:
+            continue
+        index = indices[0]
+        if not isinstance(index, torch.fx.Node):
+            continue
+        accumulate = False if len(user.args) < 4 else user.args[3]
+        if accumulate not in (False, None):
+            continue
+        if matched is not None:
+            return None
+        buffer = user.args[0]
+        cleanup_nodes = [user]
+        copy_user = _match_copy_user(user, buffer)
+        if copy_user is not None:
+            cleanup_nodes.append(copy_user)
+        matched = (user, buffer, index, cleanup_nodes)
+    return matched
+
+
+def _match_kv_cache_index_put(
+    key_node: torch.fx.Node,
+    value_node: torch.fx.Node,
+) -> Optional[KvCacheUpdateMatch]:
+    k_match = _match_single_index_put(key_node)
+    v_match = _match_single_index_put(value_node)
+    if k_match is None or v_match is None:
+        return None
+
+    _, k_buffer, cache_loc, k_nodes = k_match
+    _, v_buffer, v_cache_loc, v_nodes = v_match
+    if cache_loc is not v_cache_loc:
+        return None
+
+    k_buffer_size = _node_size(k_buffer)
+    v_buffer_size = _node_size(v_buffer)
+    if k_buffer_size is None or v_buffer_size is None:
+        return None
+    if len(k_buffer_size) != 2 or len(v_buffer_size) != 2:
+        return None
+
+    return KvCacheUpdateMatch(
+        cache_loc=cache_loc,
+        k_buffer=k_buffer,
+        v_buffer=v_buffer,
+        nodes=[*k_nodes, *v_nodes],
+    )
+
+
+def _match_index_put_value(
+    value_node: torch.fx.Node,
+) -> Optional[tuple[torch.fx.Node, torch.fx.Node, torch.fx.Node, list[torch.fx.Node]]]:
+    direct_match = _match_single_index_put(value_node)
+    if direct_match is not None:
+        index_put, buffer, cache_loc, cleanup_nodes = direct_match
+        return index_put, buffer, cache_loc, cleanup_nodes
+
+    for user in value_node.users:
+        if not _is_call_function_target(
+            user,
+            aten.reshape.default,
+            aten.view.default,
+        ) and not _is_call_method(user, "reshape") and not _is_call_method(user, "view"):
+            continue
+        index_put_match = _match_single_index_put(user)
+        if index_put_match is None:
+            continue
+        index_put, buffer, cache_loc, cleanup_nodes = index_put_match
+        return index_put, buffer, cache_loc, [user, *cleanup_nodes]
+    return None
+
+
+def _match_kv_cache_update_from_outputs(
+    key_node: torch.fx.Node,
+    value_node: torch.fx.Node,
+) -> Optional[KvCacheUpdateMatch]:
+    k_match = _match_index_put_value(key_node)
+    v_match = _match_index_put_value(value_node)
+    if k_match is None or v_match is None:
+        return None
+
+    _, k_buffer, cache_loc, k_nodes = k_match
+    _, v_buffer, v_cache_loc, v_nodes = v_match
+    if cache_loc is not v_cache_loc:
+        return None
+
+    return KvCacheUpdateMatch(
+        cache_loc=cache_loc,
+        k_buffer=k_buffer,
+        v_buffer=v_buffer,
+        nodes=[*k_nodes, *v_nodes],
+    )
 
 
 def _match_cos_sin(node: torch.fx.Node):
@@ -387,6 +518,17 @@ def _try_fuse_gemm_rope(
     if weight_meta is None or not getattr(weight_meta, "is_cuda", False):
         return False
 
+    kv_cache_match = _match_kv_cache_index_put(k_match.final_node, getitems[2])
+    plugin_name = GEMM_ROPE_PLUGIN
+    replacement_args = (hidden_states, weight, bias, cos_sin_cache, positions)
+    if kv_cache_match is not None and has_gemm_plugin(GEMM_ROPE_KV_CACHE_PLUGIN):
+        plugin_name = GEMM_ROPE_KV_CACHE_PLUGIN
+        replacement_args = replacement_args + (
+            kv_cache_match.cache_loc,
+            kv_cache_match.k_buffer,
+            kv_cache_match.v_buffer,
+        )
+
     nodes_to_remove = [
         q_match.final_node,
         k_match.final_node,
@@ -398,6 +540,8 @@ def _try_fuse_gemm_rope(
         split,
         addmm,
     ]
+    if plugin_name == GEMM_ROPE_KV_CACHE_PLUGIN and kv_cache_match is not None:
+        nodes_to_remove.extend(kv_cache_match.nodes)
     if weight is not permuted_weight:
         nodes_to_remove.append(permuted_weight)
     seen = set()
@@ -408,9 +552,11 @@ def _try_fuse_gemm_rope(
             seen.add(node)
 
     counters["inductor"]["gemm_rope"] += 1
+    if plugin_name == GEMM_ROPE_KV_CACHE_PLUGIN:
+        counters["inductor"]["gemm_rope_kv_cache"] += 1
     with graph.inserting_before(addmm):
         function = make_gemm_plugin_lowering(
-            GEMM_ROPE_PLUGIN,
+            plugin_name,
             q_size,
             kv_size,
             q_match.head_dim,
@@ -418,7 +564,7 @@ def _try_fuse_gemm_rope(
         )
         replacement = graph.call_function(
             function,
-            (hidden_states, weight, bias, cos_sin_cache, positions),
+            replacement_args,
         )
         replacement.meta.update(addmm.meta)
         tuple_meta = (
@@ -441,9 +587,9 @@ def _try_fuse_gemm_rope(
         k_match.final_node.replace_all_uses_with(k_new)
         getitems[2].replace_all_uses_with(v_new)
 
-    erase_nodes = [node for node in graph.nodes if node in seen and not node.users]
-    for node in reversed(erase_nodes):
-        graph.erase_node(node)
+    for node in reversed(deduped_nodes):
+        if not node.users:
+            graph.erase_node(node)
     graph.lint()
     return True
 
@@ -476,3 +622,103 @@ def apply_gemm_rope_pass(graph: torch.fx.Graph) -> None:
         if all(isinstance(arg, torch.fx.Node) for arg in (bias, hidden_states, permuted_weight)):
             if _try_fuse_gemm_rope(graph, node, bias, hidden_states, permuted_weight):
                 break
+
+    if not has_gemm_plugin(GEMM_ROPE_KV_CACHE_PLUGIN):
+        return
+
+    for node in list(graph.nodes):
+        if node.op != "call_function":
+            continue
+        if len(node.args) != 5:
+            continue
+
+        getitems = {}
+        for user in node.users:
+            if _is_call(user, operator.getitem):
+                getitems[user.args[1]] = user
+        if set(getitems) != {0, 1, 2}:
+            continue
+
+        q_size_meta = _node_size(getitems[0])
+        kv_size_meta = _node_size(getitems[1])
+        cos_sin_cache = node.args[3]
+        if not isinstance(cos_sin_cache, torch.fx.Node):
+            continue
+        rotary_meta = _node_size(cos_sin_cache)
+        if q_size_meta is None or kv_size_meta is None or rotary_meta is None:
+            continue
+        if len(q_size_meta) != 2 or len(kv_size_meta) != 2 or len(rotary_meta) != 2:
+            continue
+
+        kv_cache_match = _match_kv_cache_update_from_outputs(getitems[1], getitems[2])
+        if kv_cache_match is None:
+            continue
+
+        q_size = int(q_size_meta[1])
+        kv_size = int(kv_size_meta[1])
+        rotary_dim = int(rotary_meta[1])
+        head_dim = rotary_dim
+        if q_size % head_dim != 0 or kv_size % head_dim != 0:
+            continue
+
+        counters["inductor"]["gemm_rope_kv_cache"] += 1
+        with graph.inserting_before(node):
+            function = make_gemm_plugin_lowering(
+                GEMM_ROPE_KV_CACHE_PLUGIN,
+                q_size,
+                kv_size,
+                head_dim,
+                rotary_dim,
+            )
+            replacement = graph.call_function(
+                function,
+                node.args
+                + (
+                    kv_cache_match.cache_loc,
+                    kv_cache_match.k_buffer,
+                    kv_cache_match.v_buffer,
+                ),
+            )
+            replacement.meta.update(node.meta)
+            tuple_meta = (
+                _node_meta_tensor(getitems[0]),
+                _node_meta_tensor(getitems[1]),
+                _node_meta_tensor(getitems[2]),
+            )
+            if all(x is not None for x in tuple_meta):
+                if "val" in replacement.meta:
+                    replacement.meta["val"] = tuple_meta
+                if "example_value" in replacement.meta:
+                    replacement.meta["example_value"] = tuple_meta
+
+            q_new = graph.call_function(operator.getitem, (replacement, 0))
+            k_new = graph.call_function(operator.getitem, (replacement, 1))
+            v_new = graph.call_function(operator.getitem, (replacement, 2))
+            q_new.meta.update(getitems[0].meta)
+            k_new.meta.update(getitems[1].meta)
+            v_new.meta.update(getitems[2].meta)
+            getitems[0].replace_all_uses_with(q_new)
+            getitems[1].replace_all_uses_with(k_new)
+            getitems[2].replace_all_uses_with(v_new)
+
+        nodes_to_remove = [
+            *kv_cache_match.nodes,
+            getitems[0],
+            getitems[1],
+            getitems[2],
+            node,
+        ]
+        seen = set()
+        deduped_nodes = []
+        for old_node in nodes_to_remove:
+            if old_node not in seen:
+                deduped_nodes.append(old_node)
+                seen.add(old_node)
+
+        for old_node in reversed(deduped_nodes):
+            if not old_node.users:
+                graph.erase_node(old_node)
+
+        graph.eliminate_dead_code()
+        graph.lint()
+        break

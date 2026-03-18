@@ -107,11 +107,44 @@ def _make_gemm_template(plugin: GemmTemplatePlugin) -> TritonTemplate:
     )
 
 
-rope_plugin = GemmTemplatePlugin(
-    name="gemm_rope",
-    extra_inputs=("BIAS", "COS_SIN", "POS", "K_BUF", "V_BUF"),
-    mutated_inputs=("K_BUF", "V_BUF"),
-    body="""
+def _make_rope_plugin_body(*, with_kv_cache: bool) -> str:
+    cache_decl = ""
+    cache_k_store = ""
+    cache_v_store = ""
+    if with_kv_cache:
+        cache_decl = """
+    stride_ckm = {{stride("K_CACHE", 0)}}
+    stride_ckn = {{stride("K_CACHE", 1)}}
+    stride_cvm = {{stride("V_CACHE", 0)}}
+    stride_cvn = {{stride("V_CACHE", 1)}}
+"""
+        cache_k_store = """
+            cache_rows = {{size("K_CACHE", 0)}}
+            cache_row = tl.load(CACHE_LOC + rm, mask=mask_m, other=0)
+            cache_row = tl.where(cache_row < 0, cache_row + cache_rows, cache_row)
+            cache_mask = mask_m & (cache_row >= 0) & (cache_row < cache_rows)
+            cache_row = tl.where(cache_mask, cache_row, 0)
+            tl.store(
+                K_CACHE + cache_row[:, None] * stride_ckm + rk[None, :] * stride_ckn,
+                acc,
+                mask=cache_mask[:, None] & (rk[None, :] < KV_SIZE),
+            )
+"""
+        cache_v_store = """
+        cache_rows = {{size("V_CACHE", 0)}}
+        cache_row = tl.load(CACHE_LOC + rm, mask=mask_m, other=0)
+        cache_row = tl.where(cache_row < 0, cache_row + cache_rows, cache_row)
+        cache_mask = mask_m & (cache_row >= 0) & (cache_row < cache_rows)
+        cache_row = tl.where(cache_mask, cache_row, 0)
+        tl.store(
+            V_CACHE + cache_row[:, None] * stride_cvm + rv[None, :] * stride_cvn,
+            acc,
+            mask=cache_mask[:, None] & (rv[None, :] < KV_SIZE),
+        )
+"""
+
+    return (
+        """
     stride_cs = {{stride("COS_SIN", 0)}}
     stride_qm = {{stride(None, 0)}}
     stride_qn = {{stride(None, 1)}}
@@ -119,6 +152,9 @@ rope_plugin = GemmTemplatePlugin(
     stride_kn = {{stride("K_BUF", 1)}}
     stride_vm = {{stride("V_BUF", 0)}}
     stride_vn = {{stride("V_BUF", 1)}}
+"""
+        + cache_decl
+        + """
 
     bias = tl.load(BIAS + rn, mask=mask_n, other=0.0).to(tl.float32)
     acc = acc + bias[None, :]
@@ -161,6 +197,9 @@ rope_plugin = GemmTemplatePlugin(
                 acc,
                 mask=mask_m[:, None] & (rk[None, :] < KV_SIZE),
             )
+"""
+        + cache_k_store
+        + """
     elif col_start >= (Q_SIZE + KV_SIZE):
         rv = rn - Q_SIZE - KV_SIZE
         tl.store(
@@ -168,11 +207,38 @@ rope_plugin = GemmTemplatePlugin(
             acc,
             mask=mask_m[:, None] & (rv[None, :] < KV_SIZE),
         )
-""",
+"""
+        + cache_v_store
+    )
+
+
+rope_plugin = GemmTemplatePlugin(
+    name="gemm_rope",
+    extra_inputs=("BIAS", "COS_SIN", "POS", "K_BUF", "V_BUF"),
+    mutated_inputs=("K_BUF", "V_BUF"),
+    body=_make_rope_plugin_body(with_kv_cache=False),
+)
+
+
+rope_kv_cache_plugin = GemmTemplatePlugin(
+    name="gemm_rope_kv_cache",
+    extra_inputs=(
+        "BIAS",
+        "COS_SIN",
+        "POS",
+        "K_BUF",
+        "V_BUF",
+        "CACHE_LOC",
+        "K_CACHE",
+        "V_CACHE",
+    ),
+    mutated_inputs=("K_BUF", "V_BUF", "K_CACHE", "V_CACHE"),
+    body=_make_rope_plugin_body(with_kv_cache=True),
 )
 
 
 gemm_rope_template = _make_gemm_template(rope_plugin)
+gemm_rope_kv_cache_template = _make_gemm_template(rope_kv_cache_plugin)
 
 
 def _fallback_rope(
@@ -231,6 +297,59 @@ def fallback_gemm_rope(
     )
 
 
+def fallback_gemm_rope_kv_cache(
+    q_size: int,
+    kv_size: int,
+    head_dim: int,
+    rotary_dim: int,
+    hidden: TensorBox,
+    weight: TensorBox,
+    bias: TensorBox,
+    cos_sin_cache: TensorBox,
+    positions: TensorBox,
+    cache_loc: TensorBox,
+    k_cache: TensorBox,
+    v_cache: TensorBox,
+):
+    q, k, v = fallback_gemm_rope(
+        q_size,
+        kv_size,
+        head_dim,
+        rotary_dim,
+        hidden,
+        weight,
+        bias,
+        cos_sin_cache,
+        positions,
+    )
+    lowerings[aten.index_put_.default](k_cache, [cache_loc], k)
+    lowerings[aten.index_put_.default](v_cache, [cache_loc], v)
+    return (q, k, v)
+
+
+def _allocate_rope_outputs(
+    q_size: int,
+    kv_size: int,
+    hidden: TensorBox,
+    *,
+    layout=None,
+):
+    m_size = hidden.get_size()[0]
+    device = hidden.get_device_or_error()
+    hidden_dtype = hidden.get_dtype()
+    total_n = q_size + 2 * kv_size
+    layout = layout or FixedLayout(device, hidden_dtype, [m_size, q_size])
+    k_buf = empty_strided([m_size, kv_size], None, dtype=hidden_dtype, device=device)
+    # Match the original split view stride so inference can return V directly.
+    v_buf = empty_strided(
+        [m_size, kv_size],
+        [total_n, 1],
+        dtype=hidden_dtype,
+        device=device,
+    )
+    return m_size, total_n, layout, k_buf, v_buf
+
+
 def tuned_fused_gemm_rope(
     q_size: int,
     kv_size: int,
@@ -263,18 +382,11 @@ def tuned_fused_gemm_rope(
     cos_sin_cache.realize()
     positions.realize()
 
-    m_size = hidden.get_size()[0]
-    device = hidden.get_device_or_error()
-    hidden_dtype = hidden.get_dtype()
-    total_n = q_size + 2 * kv_size
-    layout = layout or FixedLayout(device, hidden_dtype, [m_size, q_size])
-    k_buf = empty_strided([m_size, kv_size], None, dtype=hidden_dtype, device=device)
-    # Match the original split view stride so inference can return V directly.
-    v_buf = empty_strided(
-        [m_size, kv_size],
-        [total_n, 1],
-        dtype=hidden_dtype,
-        device=device,
+    m_size, total_n, layout, k_buf, v_buf = _allocate_rope_outputs(
+        q_size,
+        kv_size,
+        hidden,
+        layout=layout,
     )
     choices: list[TritonTemplateCaller] = []
     for config in gemm_rope_configs:
@@ -316,6 +428,118 @@ def tuned_fused_gemm_rope(
     return (q_out, k_buf, v_buf)
 
 
+def tuned_fused_gemm_rope_kv_cache(
+    q_size: int,
+    kv_size: int,
+    head_dim: int,
+    rotary_dim: int,
+    hidden: TensorBox,
+    weight: TensorBox,
+    bias: TensorBox,
+    cos_sin_cache: TensorBox,
+    positions: TensorBox,
+    cache_loc: TensorBox,
+    k_cache: TensorBox,
+    v_cache: TensorBox,
+    *,
+    layout=None,
+):
+    if rotary_dim != head_dim or rotary_dim % 2 != 0:
+        return fallback_gemm_rope_kv_cache(
+            q_size,
+            kv_size,
+            head_dim,
+            rotary_dim,
+            hidden,
+            weight,
+            bias,
+            cos_sin_cache,
+            positions,
+            cache_loc,
+            k_cache,
+            v_cache,
+        )
+
+    hidden.realize()
+    weight.realize()
+    bias.realize()
+    cos_sin_cache.realize()
+    positions.realize()
+    cache_loc.realize()
+    k_cache.realize()
+    v_cache.realize()
+
+    m_size, total_n, layout, k_buf, v_buf = _allocate_rope_outputs(
+        q_size,
+        kv_size,
+        hidden,
+        layout=layout,
+    )
+    choices: list[TritonTemplateCaller] = []
+    for config in gemm_rope_configs:
+        gemm_rope_kv_cache_template.maybe_append_choice(
+            choices,
+            input_nodes=(
+                hidden,
+                weight,
+                bias,
+                cos_sin_cache,
+                positions,
+                k_buf,
+                v_buf,
+                cache_loc,
+                k_cache,
+                v_cache,
+            ),
+            layout=layout,
+            mutated_inputs=[k_buf, v_buf, k_cache, v_cache],
+            call_sizes=(m_size, total_n),
+            BLOCK_N=head_dim,
+            Q_SIZE=q_size,
+            KV_SIZE=kv_size,
+            HALF_ROTARY=rotary_dim // 2,
+            GROUP_M=8,
+            ALLOW_TF32=True,
+            EVEN_K=hidden.get_size()[1] % config["BLOCK_K"] == 0,
+            **config,
+        )
+
+    if not choices:
+        return fallback_gemm_rope_kv_cache(
+            q_size,
+            kv_size,
+            head_dim,
+            rotary_dim,
+            hidden,
+            weight,
+            bias,
+            cos_sin_cache,
+            positions,
+            cache_loc,
+            k_cache,
+            v_cache,
+        )
+
+    q_out = autotune_select_algorithm(
+        "gemm_rope_kv_cache",
+        choices,
+        [
+            hidden,
+            weight,
+            bias,
+            cos_sin_cache,
+            positions,
+            k_buf,
+            v_buf,
+            cache_loc,
+            k_cache,
+            v_cache,
+        ],
+        layout,
+    )
+    return (q_out, k_buf, v_buf)
+
+
 def gemm_rope_lowering_factory(
     q_size: int,
     kv_size: int,
@@ -331,7 +555,27 @@ def gemm_rope_lowering_factory(
     )
 
 
+def gemm_rope_kv_cache_lowering_factory(
+    q_size: int,
+    kv_size: int,
+    head_dim: int,
+    rotary_dim: int,
+):
+    return functools.partial(
+        tuned_fused_gemm_rope_kv_cache,
+        q_size,
+        kv_size,
+        head_dim,
+        rotary_dim,
+    )
+
+
 register_gemm_plugin(
     "rope_neox",
     lowering_factory=gemm_rope_lowering_factory,
+)
+
+register_gemm_plugin(
+    "rope_neox_kv_cache",
+    lowering_factory=gemm_rope_kv_cache_lowering_factory,
 )
