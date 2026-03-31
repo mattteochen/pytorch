@@ -1610,6 +1610,17 @@ class SIMDScheduling(BaseScheduling):
         )
         self.codegen_node_schedule_with_kernel(node_schedule, kernel)
 
+        # Fold remainder epilogue nodes AND downstream scheduler nodes
+        # that are simple pointwise consumers of the grouped-reduction output.
+        # This handles op4-like scale epilogues that the scheduler couldn't
+        # fuse with the consumer due to numel mismatch.
+        folded_remainder = self._fold_remainder_into_kernel(
+            kernel, remainder, num_groups, numel
+        )
+        folded_downstream = self._fold_downstream_into_kernel(
+            kernel, node, num_groups, numel
+        )
+
         with V.set_kernel_handler(kernel):
             src_code = kernel.codegen_kernel()
         kernel_name = self.define_kernel(src_code, node_schedule, kernel)
@@ -1618,6 +1629,8 @@ class SIMDScheduling(BaseScheduling):
 
         with V.set_kernel_handler(kernel):
             for sched_node in kernel_features.scheduler_nodes():
+                sched_node.mark_run()
+            for sched_node in folded_remainder + folded_downstream:
                 sched_node.mark_run()
 
         self.codegen_comment(
@@ -1628,9 +1641,200 @@ class SIMDScheduling(BaseScheduling):
         V.graph.removed_buffers |= kernel.removed_buffers
         V.graph.inplaced_to_remove |= kernel.inplaced_to_remove
 
-        if remainder:
-            self._codegen_nodes(remainder)
+        leftover = [n for n in remainder if n not in folded_remainder]
+        if leftover:
+            self._codegen_nodes(leftover)
         self.free_buffers_in_scheduler()
+
+    def _fold_remainder_into_kernel(self, kernel, remainder, num_groups, numel):
+        """
+        Fold simple pointwise remainder nodes into the fused kernel by
+        replaying their ops on the compact [XBLOCK, num_groups] grouped-
+        reduction result, emitting code directly into the kernel body.
+        """
+        compact = getattr(kernel, "multi_phase_compact_result", None)
+        if compact is None or not remainder:
+            return []
+
+        from torch._inductor.codegen.triton import texpr
+
+        num_groups_s = (
+            texpr(num_groups) if hasattr(num_groups, "free_symbols") else str(num_groups)
+        )
+        dense_sizes = kernel.dense_size_list()
+        xblock_str = dense_sizes[0] if len(dense_sizes) > 1 else "1"
+        compact_shape = (xblock_str, num_groups_s)
+
+        folded = []
+        for node in remainder:
+            _, (nn, nr) = node.group
+            if nr != 1:
+                continue
+            if not V.graph.sizevars.statically_known_equals(nn, num_groups * numel):
+                continue
+
+            read_names = [
+                dep.name
+                for dep in node.read_writes.reads
+                if hasattr(dep, "name")
+            ]
+            if not read_names or not all(
+                n in kernel.cse.store_cache for n in read_names
+            ):
+                continue
+
+            write_names = [
+                dep.name
+                for dep in node.read_writes.writes
+                if hasattr(dep, "name")
+            ]
+            if len(write_names) != 1:
+                continue
+
+            out_name = write_names[0]
+            body = node._body
+
+            try:
+                result = self._replay_pointwise_on_compact(
+                    kernel, body, compact, compact_shape, out_name,
+                    num_groups_s,
+                )
+                if result:
+                    folded.append(node)
+            except Exception:
+                pass
+
+        return folded
+
+    def _replay_pointwise_on_compact(
+        self, kernel, body, compact, compact_shape, out_name, num_groups_s
+    ):
+        """
+        Walk a LoopBody's FX graph and replay its pointwise ops on the compact
+        grouped-reduction result.  Writes to a temp buffer first; only commits
+        to the kernel on success.  Returns True if successful.
+        """
+        from torch._inductor.utils import IndentedBuffer
+
+        tmp_compute = IndentedBuffer()
+        result = compact
+        fx_vals: dict = {}
+
+        def resolve(arg):
+            if arg in fx_vals:
+                return fx_vals[arg]
+            if isinstance(arg, (int, float)):
+                return arg
+            return compact
+
+        with V.set_kernel_handler(kernel):
+            for fx_node in body.root_block.graph.nodes:
+                if fx_node.op in ("placeholder", "output"):
+                    continue
+                if fx_node.op != "call_method":
+                    continue
+
+                target = fx_node.target
+                if target in ("load", "load_seed"):
+                    fx_vals[fx_node] = compact
+                elif target == "constant":
+                    fx_vals[fx_node] = fx_node.args[1]
+                elif target in ("maximum", "minimum"):
+                    fn = "triton_helpers.maximum" if target == "maximum" else "triton_helpers.minimum"
+                    lhs = resolve(fx_node.args[1])
+                    rhs = resolve(fx_node.args[2])
+                    result = kernel.cse.generate(
+                        tmp_compute, f"{fn}({lhs}, {rhs})",
+                        dtype=compact.dtype, shape=compact_shape,
+                    )
+                    fx_vals[fx_node] = result
+                elif target == "mul":
+                    lhs = resolve(fx_node.args[1])
+                    rhs = resolve(fx_node.args[2])
+                    result = kernel.cse.generate(
+                        tmp_compute, f"{lhs} * {rhs}",
+                        dtype=compact.dtype, shape=compact_shape,
+                    )
+                    fx_vals[fx_node] = result
+                elif target in ("store", "to_dtype"):
+                    if target == "to_dtype":
+                        fx_vals[fx_node] = resolve(fx_node.args[1])
+                else:
+                    raise NotImplementedError(f"fold: {target}")
+
+        # Success — commit to kernel
+        kernel.compute.splice(tmp_compute)
+        out_var = kernel.args.output(out_name)
+        x_prefix = kernel.range_trees[0].prefix
+        kernel.stores.writeline(
+            f"tl.store({out_var} + tl.arange(0, {num_groups_s})[None, :] + "
+            f"{num_groups_s} * {x_prefix}index, {result}, None)"
+        )
+        return True
+
+    def _fold_downstream_into_kernel(self, kernel, fused_node, num_groups, numel):
+        """
+        Look at scheduler nodes that follow the fused multi-phase node and
+        absorb simple pointwise epilogues whose only inputs are buffers
+        produced by the fused kernel.  The compact [XBLOCK, num_groups]
+        reduction result is used to emit the epilogue's computation and
+        store directly inside the fused kernel.
+        """
+        compact = getattr(kernel, "multi_phase_compact_result", None)
+        if compact is None or not self.scheduler:
+            return []
+
+        from torch._inductor.codegen.triton import texpr
+
+        num_groups_s = (
+            texpr(num_groups) if hasattr(num_groups, "free_symbols") else str(num_groups)
+        )
+        dense_sizes = kernel.dense_size_list()
+        xblock_str = dense_sizes[0] if len(dense_sizes) > 1 else "1"
+        compact_shape = (xblock_str, num_groups_s)
+
+        fused_buf_names = OrderedSet(
+            buf.get_name() for buf in fused_node.get_outputs()
+        )
+
+        folded = []
+        for sched_node in self.scheduler.nodes:
+            if not isinstance(sched_node, scheduler.SchedulerNode):
+                continue
+            if sched_node.is_reduction():
+                continue
+
+            _, (nn, nr) = sched_node.group
+            if nr != 1:
+                continue
+            if not V.graph.sizevars.statically_known_equals(nn, num_groups * numel):
+                continue
+
+            read_names = [
+                dep.name for dep in sched_node.read_writes.reads if hasattr(dep, "name")
+            ]
+            if not read_names or not all(n in fused_buf_names for n in read_names):
+                continue
+
+            write_names = [
+                dep.name for dep in sched_node.read_writes.writes if hasattr(dep, "name")
+            ]
+            if len(write_names) != 1:
+                continue
+
+            out_name = write_names[0]
+            try:
+                ok = self._replay_pointwise_on_compact(
+                    kernel, sched_node._body, compact, compact_shape,
+                    out_name, num_groups_s,
+                )
+                if ok:
+                    self.scheduler.removed_ops.add(sched_node.get_name())
+                    folded.append(sched_node)
+            except Exception:
+                pass
+
+        return folded
 
     def _generate_multi_phase_schedule(
         self, nodes, numel, rnumel, num_groups, group_size

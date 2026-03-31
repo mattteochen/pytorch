@@ -2569,6 +2569,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         # call emits a grouped reduction (tl.reshape + reduce over inner dim)
         # instead of reducing the full r0_ axis.  Value is (num_groups, group_size).
         self.multi_phase_sub_groups: Optional[tuple[sympy.Expr, sympy.Expr]] = None
+        # Compact [XBLOCK, num_groups] result from the grouped reduction,
+        # used to fold remainder epilogue nodes into the same kernel.
+        self.multi_phase_compact_result: Optional[Any] = None
 
         if self.inside_reduction:
             self.codegen_reduction_numels(self.body)
@@ -4518,6 +4521,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             dtype=dst_dtype,
             shape=shape_2d_groups,
         )
+        # Save compact [XBLOCK, num_groups] result so the codegen driver can
+        # emit remainder-node stores without a separate kernel launch.
+        self.multi_phase_compact_result = reduced
         expanded = self.cse.generate(
             self.compute,
             f"tl.broadcast_to({reduced}[:, :, None], [{xblock_str}, {num_groups_s}, {group_size_s}])",

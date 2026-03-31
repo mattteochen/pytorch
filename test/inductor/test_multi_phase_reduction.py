@@ -95,17 +95,13 @@ class TestMultiPhaseReduction(TestCase):
         compiled(x, res, w)
         torch.cuda.synchronize()
 
-        # With multi-phase fusion the two reductions (variance + amax) and
-        # the quantization epilogue are fused into one persistent kernel.
-        # A tiny 16-element pointwise kernel remains for the scale output
-        # (op4) because its numel=16 doesn't fit the fused kernel's x-grid=1.
-        # Without fusion there would be 2 kernels of equal weight; with
-        # fusion the heavy work is 1 kernel + 1 trivial 16-element kernel.
-        # TODO: fold op4 into the grouped reduction to reach 1 kernel.
-        self.assertLessEqual(
+        # With multi-phase fusion the two reductions (variance + amax),
+        # the quantization epilogue, and the scale computation are all
+        # fused into a single persistent kernel.
+        self.assertEqual(
             metrics.generated_kernel_count,
-            2,
-            f"Expected at most 2 kernels, got {metrics.generated_kernel_count}",
+            1,
+            f"Expected 1 kernel, got {metrics.generated_kernel_count}",
         )
 
 
