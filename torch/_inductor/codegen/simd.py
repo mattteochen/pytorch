@@ -1332,6 +1332,13 @@ class SIMDScheduling(BaseScheduling):
                 reduction_can_fuse = MixOrderReduction.can_fuse(node1, node2)
 
             if not reduction_can_fuse:
+                from torch._inductor.scheduler import PersistentMultiPhaseReduction
+
+                reduction_can_fuse = PersistentMultiPhaseReduction.can_fuse(
+                    node1, node2
+                )
+
+            if not reduction_can_fuse:
                 why(
                     "numel/rnumel mismatch (reduce) (%s, %s), (%s, %s)",
                     numel1,
@@ -1572,6 +1579,122 @@ class SIMDScheduling(BaseScheduling):
         )
 
         self._codegen_mix_order_reduction(node1, node2)
+
+    def codegen_multi_phase_reduction(self, node):
+        """
+        Generate a single persistent kernel for two reduction phases with
+        different reduction granularities operating on the same data.
+        """
+        producer, consumer = node.producer, node.consumer
+        _, (numel1, rnumel1) = producer.group
+        _, (numel2, rnumel2) = consumer.group
+
+        numel, rnumel = numel1, rnumel1
+        num_groups = V.graph.sizevars.simplify(rnumel1 // rnumel2)
+        group_size = rnumel2
+
+        all_nodes = list(producer.get_nodes()) + list(consumer.get_nodes())
+        node_schedule, remainder = self._generate_multi_phase_schedule(
+            all_nodes, numel, rnumel, num_groups, group_size
+        )
+        kernel_features = SIMDKernelFeatures(node_schedule, numel, rnumel)
+
+        tiling, tiling_score = self.get_tiling_and_scores(
+            node_schedule, numel, rnumel, None
+        )
+        kernel = self.kernel_type(
+            tiling,
+            features=kernel_features,
+            override_persistent_reduction=True,
+            tiling_scores=tiling_score,
+        )
+        self.codegen_node_schedule_with_kernel(node_schedule, kernel)
+
+        with V.set_kernel_handler(kernel):
+            src_code = kernel.codegen_kernel()
+        kernel_name = self.define_kernel(src_code, node_schedule, kernel)
+        kernel.kernel_name = kernel_name
+        kernel.code_hash = code_hash(src_code)
+
+        with V.set_kernel_handler(kernel):
+            for sched_node in kernel_features.scheduler_nodes():
+                sched_node.mark_run()
+
+        self.codegen_comment(
+            [n for n in node_schedule if isinstance(n, scheduler.BaseSchedulerNode)],
+            kernel.kernel_name,
+        )
+        kernel.call_kernel(kernel.kernel_name)
+        V.graph.removed_buffers |= kernel.removed_buffers
+        V.graph.inplaced_to_remove |= kernel.inplaced_to_remove
+
+        if remainder:
+            self._codegen_nodes(remainder)
+        self.free_buffers_in_scheduler()
+
+    def _generate_multi_phase_schedule(
+        self, nodes, numel, rnumel, num_groups, group_size
+    ):
+        node_schedule: list[Any] = []
+        remainder: list[Any] = []
+        done = OrderedSet[scheduler.BaseSchedulerNode]()
+        not_ready_yet_nodes: OrderedSet[str] = OrderedSet()
+        total_kernel = V.graph.sizevars.simplify(numel * rnumel)
+
+        def fits_in_main_body(n):
+            _, (nn, nr) = n.group
+            if nn == numel and nr == rnumel:
+                return True
+            if nn == numel * rnumel and nr == 1:
+                return True
+            tn = V.graph.sizevars.simplify(nn * nr)
+            return V.graph.sizevars.statically_known_equals(total_kernel, tn)
+
+        def fits_outside_reduction(n):
+            _, (nn, nr) = n.group
+            return nn == numel and nr == 1 and rnumel != 1
+
+        def schedule_node(n):
+            done.add(n)
+            _, (nn, nr) = n.group
+            if n.is_reduction() and not V.graph.sizevars.statically_known_equals(
+                nr, rnumel
+            ):
+                n._multi_phase_sub_groups = (num_groups, group_size)  # type: ignore[attr-defined]
+            node_schedule.append(n)
+            if (
+                n.is_reduction()
+                and isinstance(n, scheduler.SchedulerNode)
+                and isinstance(n.node, ir.ComputedBuffer)
+                and not isinstance(n.node.data, ir.Scan)
+            ):
+                not_ready_yet_nodes.add(n.get_name())
+
+        @contextlib.contextmanager
+        def end_current_reduction_loop():
+            if node_schedule and node_schedule[-1] is EnableReduction:
+                node_schedule.pop()
+            else:
+                node_schedule.append(DisableReduction)
+            yield
+            node_schedule.append(EnableReduction)
+            not_ready_yet_nodes.clear()
+
+        for n in nodes:
+            if n in done:
+                continue
+            done.add(n)
+            if fits_in_main_body(n):
+                if not_ready_yet_nodes & n.ancestors:
+                    with end_current_reduction_loop():
+                        pass
+                schedule_node(n)
+            elif fits_outside_reduction(n):
+                with end_current_reduction_loop():
+                    node_schedule.append(n)
+            else:
+                remainder.append(n)
+        return node_schedule, remainder
 
     def _split_mix_order_reduction_epilogue(self, node):
         # TODO: do more validation here
@@ -2020,8 +2143,13 @@ class SIMDScheduling(BaseScheduling):
                 else:
                     # TODO - use split ranges ?
                     indexing_dtype_strength_reduction(node._body)
+                    sub_groups = getattr(node, "_multi_phase_sub_groups", None)
+                    if hasattr(kernel, "multi_phase_sub_groups"):
+                        kernel.multi_phase_sub_groups = sub_groups
                     index_vars = kernel.split_and_set_ranges(node.get_ranges())
                     node.codegen(index_vars)
+                    if hasattr(kernel, "multi_phase_sub_groups"):
+                        kernel.multi_phase_sub_groups = None
 
     def _codegen_single_template(
         self,

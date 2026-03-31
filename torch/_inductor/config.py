@@ -1796,6 +1796,12 @@ class triton:
     # this could be helpful to avoid recompilations in some cases
     mix_order_reduction_non_strict_mode = False
 
+    # Fuse two persistent reductions on the same data with different reduction
+    # granularities into a single kernel (e.g. full-row variance + per-group amax).
+    multi_phase_persistent_reduction = (
+        os.environ.get("TORCHINDUCTOR_MULTI_PHASE_PERSISTENT_REDUCTION", "0") == "1"
+    )
+
     enable_tlx_templates: bool = (
         os.environ.get("TORCHINDUCTOR_ENABLE_TLX_TEMPLATES", "0") == "1"
     )

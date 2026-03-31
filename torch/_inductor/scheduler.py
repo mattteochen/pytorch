@@ -415,6 +415,86 @@ class MixOrderReduction:
         return True
 
 
+class PersistentMultiPhaseReduction:
+    """
+    Fuse two persistent reductions on the same data with different reduction
+    granularities into a single kernel. The canonical example is fusing a
+    full-row variance reduction (numel=M, rnumel=hidden) with a per-group
+    amax reduction (numel=M*groups, rnumel=group_size) where
+    hidden = groups * group_size.
+
+    Both reductions must be persistent (data fits in registers). The first
+    reduction's output feeds the second reduction's computation.
+    """
+
+    @classmethod
+    def can_fuse(
+        cls, node1: BaseSchedulerNode, node2: BaseSchedulerNode
+    ) -> bool:
+        if not config.triton.multi_phase_persistent_reduction:
+            return False
+
+        if V.graph.cpp_wrapper:
+            return False
+
+        if not node1.is_gpu() or not node2.is_gpu():
+            return False
+        device_type = node1.get_device().type  # type: ignore[union-attr]
+        if (
+            device_type not in ("cuda", "xpu")
+            or get_current_backend(device_type) != "triton"
+        ):
+            return False
+        if not node1.is_reduction() or not node2.is_reduction():
+            return False
+
+        _, (numel1, rnumel1) = node1.group
+        _, (numel2, rnumel2) = node2.group
+
+        if not (
+            node1.get_operation_names() & node2.ancestors
+            or node2.get_operation_names() & node1.ancestors
+        ):
+            return False
+
+        # Ensure node1 is the producer (first reduction)
+        if node2.get_operation_names() & node1.ancestors:
+            node1, node2 = node2, node1
+            numel1, rnumel1, numel2, rnumel2 = numel2, rnumel2, numel1, rnumel1
+
+        total1 = V.graph.sizevars.simplify(numel1 * rnumel1)
+        total2 = V.graph.sizevars.simplify(numel2 * rnumel2)
+        if not V.graph.sizevars.statically_known_equals(total1, total2):
+            return False
+
+        # The second reduction must subdivide the first's reduction dimension
+        # e.g. first reduces 2048->1 per row, second reduces 128->1 per group
+        if not V.graph.sizevars.statically_known_multiple_of(rnumel1, rnumel2):
+            return False
+
+        # Both must be persistent-friendly (small enough to fit in registers)
+        # Use a generous threshold since this fusion eliminates a kernel launch
+        # plus a global memory round-trip
+        persistent_threshold = 2048 * 16
+        if not V.graph.sizevars.statically_known_leq(rnumel1, persistent_threshold):
+            return False
+
+        # The first reduction should reduce over a larger domain
+        if V.graph.sizevars.statically_known_equals(rnumel1, rnumel2):
+            return False
+
+        return True
+
+    @classmethod
+    def get_ordered_nodes(
+        cls, node1: BaseSchedulerNode, node2: BaseSchedulerNode
+    ) -> tuple[BaseSchedulerNode, BaseSchedulerNode]:
+        """Return (producer, consumer) ordering."""
+        if node1.get_operation_names() & node2.ancestors:
+            return node1, node2
+        return node2, node1
+
+
 @dataclasses.dataclass
 class SchedulerBuffer:
     scheduler: Scheduler
@@ -2206,6 +2286,21 @@ class FusedMixOrderReductions(FusedSchedulerNode):
                 return FusedMixOrderReductions(self.node1, fused_node)
 
 
+class FusedMultiPhaseReductions(FusedSchedulerNode):
+    """Fused node for two persistent reductions with different granularities."""
+
+    def __init__(self, node1: BaseSchedulerNode, node2: BaseSchedulerNode) -> None:
+        producer, consumer = PersistentMultiPhaseReduction.get_ordered_nodes(
+            node1, node2
+        )
+        self.producer = producer
+        self.consumer = consumer
+        super().__init__(
+            producer.scheduler,
+            list(producer.get_nodes()) + list(consumer.get_nodes()),
+        )
+
+
 class ForeachKernelSchedulerNode(FusedSchedulerNode):
     """
     This is a schedular node that consists of a set of scheduler nodes that
@@ -2458,6 +2553,7 @@ class ForeachKernelSchedulerNode(FusedSchedulerNode):
                     ExternKernelSchedulerNode,
                     GroupedSchedulerNode,
                     FusedMixOrderReductions,
+                    FusedMultiPhaseReductions,
                 ),
             )
         ]
@@ -5426,8 +5522,10 @@ class Scheduler:
         if isinstance(node1, FusedMixOrderReductions):
             return node1.can_fuse_with(node2)
         if isinstance(node2, FusedMixOrderReductions):
-            # We don't fuse something before a FusedMixOrderReductions
-            # right now
+            return False
+        if isinstance(node1, FusedMultiPhaseReductions) or isinstance(
+            node2, FusedMultiPhaseReductions
+        ):
             return False
 
         why = WhyNoFuse(node1, node2)
@@ -6833,6 +6931,9 @@ class Scheduler:
             elif isinstance(node, FusedMixOrderReductions):
                 # pyrefly: ignore [unbound-name]
                 self.get_backend(device).codegen_mix_order_reduction(node)
+            elif isinstance(node, FusedMultiPhaseReductions):
+                # pyrefly: ignore [unbound-name]
+                self.get_backend(device).codegen_multi_phase_reduction(node)
             elif isinstance(node, (FusedSchedulerNode, SchedulerNode)):
                 # pyrefly: ignore [unbound-name]
                 self.get_backend(device).codegen_node(node)
@@ -7043,6 +7144,8 @@ class BaseScheduling:  # noqa: docstring_linter
             return FusedMixOrderReductions(node1, node2)
         elif isinstance(node1, FusedMixOrderReductions):
             return node1.fuse_with(node2)
+        elif PersistentMultiPhaseReduction.can_fuse(node1, node2):
+            return FusedMultiPhaseReductions(node1, node2)
         else:
             return FusedSchedulerNode.fuse(node1, node2)
 
@@ -7086,6 +7189,11 @@ class BaseScheduling:  # noqa: docstring_linter
         raise NotImplementedError
 
     def codegen_mix_order_reduction(self, node: FusedMixOrderReductions) -> None:
+        raise NotImplementedError
+
+    def codegen_multi_phase_reduction(
+        self, node: FusedMultiPhaseReductions
+    ) -> None:
         raise NotImplementedError
 
     def codegen_sync(self) -> None:

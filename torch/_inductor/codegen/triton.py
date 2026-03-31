@@ -2565,6 +2565,11 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         self.autotune_hints = OrderedSet[AutotuneHint]()
         self.triton_meta: Optional[dict[str, Any]] = None
 
+        # For multi-phase persistent reduction: when set, the next reduction
+        # call emits a grouped reduction (tl.reshape + reduce over inner dim)
+        # instead of reducing the full r0_ axis.  Value is (num_groups, group_size).
+        self.multi_phase_sub_groups: Optional[tuple[sympy.Expr, sympy.Expr]] = None
+
         if self.inside_reduction:
             self.codegen_reduction_numels(self.body)
 
@@ -4131,6 +4136,11 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 # All data is loaded to register anyway, no need to do
                 # online softmax
                 result_var = self.prepare_softmax_twopass_fallback(dtype, value)
+            elif self.multi_phase_sub_groups is not None:
+                assert isinstance(masked_value, CSEVariable)
+                result_var = self._grouped_persistent_reduction(
+                    masked_value, reduction_type, src_dtype, dtype, result_var, masks, cond
+                )
             else:
                 assert isinstance(masked_value, CSEVariable)
                 _result, _dtype, _shape = final_reduction(
@@ -4470,6 +4480,57 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             dim,
             dtype,
         )
+
+    def _grouped_persistent_reduction(
+        self, value, reduction_type, src_dtype, dst_dtype, result_var, masks, cond
+    ):
+        """
+        Emit a grouped persistent reduction for multi-phase fusion.
+
+        Instead of reducing the full r0_ axis, reshape data into
+        [XBLOCK, num_groups, group_size] and reduce over the group_size axis,
+        producing [XBLOCK, num_groups].  The result is then broadcast back to
+        [XBLOCK, R0_BLOCK] so subsequent element-wise ops see a compatible shape.
+        """
+        assert self.multi_phase_sub_groups is not None
+        num_groups, group_size = self.multi_phase_sub_groups
+        num_groups_s = texpr(num_groups) if isinstance(num_groups, sympy.Expr) else str(num_groups)
+        group_size_s = texpr(group_size) if isinstance(group_size, sympy.Expr) else str(group_size)
+
+        dense_sizes = self.dense_size_list()
+        xblock_str = dense_sizes[0] if len(dense_sizes) > 1 else "1"
+        rblock_str = dense_sizes[-1] if len(dense_sizes) > 1 else str(num_groups_s)
+
+        triton_fn = get_triton_reduction_function(reduction_type)
+
+        shape_3d = (xblock_str, num_groups_s, group_size_s)
+        shape_2d_groups = (xblock_str, num_groups_s)
+
+        reshaped = self.cse.generate(
+            self.compute,
+            f"tl.reshape({value}, [{xblock_str}, {num_groups_s}, {group_size_s}])",
+            dtype=value.dtype,
+            shape=shape_3d,
+        )
+        reduced = self.cse.generate(
+            self.compute,
+            f"{triton_fn}({reshaped}, 2)",
+            dtype=dst_dtype,
+            shape=shape_2d_groups,
+        )
+        expanded = self.cse.generate(
+            self.compute,
+            f"tl.broadcast_to({reduced}[:, :, None], [{xblock_str}, {num_groups_s}, {group_size_s}])",
+            dtype=dst_dtype,
+            shape=shape_3d,
+        )
+        result_var = self.cse.generate(
+            self.compute,
+            f"tl.reshape({expanded}, [{xblock_str}, {rblock_str}])",
+            dtype=dst_dtype,
+            shape=tuple(dense_sizes),
+        )
+        return result_var
 
     def welford_reduce_final_reduction(
         self,
