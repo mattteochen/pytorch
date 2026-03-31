@@ -438,6 +438,7 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
         # Info to enable multiple store_output calls for epilogue subtiling
         self.store_output_ctr = itertools.count()
         self.is_native_matmul = False
+        self.use_active_tensor_ndim = False
         if config.triton.native_matmul:
             for node in self.features.node_schedule:
                 if (
@@ -600,7 +601,12 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
         )
 
     def triton_tensor_ndim(self) -> int:
+        if self.use_active_tensor_ndim:
+            return self.active_triton_tensor_ndim()
         return sum(int(tree.tensor_dim is not None) for tree in self.range_trees)
+
+    def active_triton_tensor_ndim(self) -> int:
+        return sum(int(tree.tensor_dim is not None) for tree in self.active_range_trees())
 
     def indexing_size_str(self, i: int) -> str:
         sizes = ["None"] * self.triton_tensor_ndim()
@@ -1610,15 +1616,11 @@ class SIMDScheduling(BaseScheduling):
         )
         self.codegen_node_schedule_with_kernel(node_schedule, kernel)
 
-        # Fold remainder epilogue nodes AND downstream scheduler nodes
-        # that are simple pointwise consumers of the grouped-reduction output.
-        # This handles op4-like scale epilogues that the scheduler couldn't
-        # fuse with the consumer due to numel mismatch.
-        folded_remainder = self._fold_remainder_into_kernel(
+        # Codegen compact [XBLOCK, num_groups] epilogues using the regular
+        # node.codegen path on a temporary compact phase, instead of replaying
+        # FX graphs by hand.
+        folded_remainder, folded_downstream = self._codegen_compact_phase_into_kernel(
             kernel, remainder, num_groups, numel
-        )
-        folded_downstream = self._fold_downstream_into_kernel(
-            kernel, node, num_groups, numel
         )
 
         with V.set_kernel_handler(kernel):
@@ -1646,195 +1648,134 @@ class SIMDScheduling(BaseScheduling):
             self._codegen_nodes(leftover)
         self.free_buffers_in_scheduler()
 
-    def _fold_remainder_into_kernel(self, kernel, remainder, num_groups, numel):
-        """
-        Fold simple pointwise remainder nodes into the fused kernel by
-        replaying their ops on the compact [XBLOCK, num_groups] grouped-
-        reduction result, emitting code directly into the kernel body.
-        """
-        compact = getattr(kernel, "multi_phase_compact_result", None)
-        if compact is None or not remainder:
-            return []
+    def _codegen_compact_phase_into_kernel(self, kernel, remainder, num_groups, numel):
+        if not getattr(kernel, "multi_phase_compact_buffers", None):
+            return [], []
 
-        from torch._inductor.codegen.triton import texpr
+        if any(
+            not tree.is_reduction and tree.prefix != "x" for tree in kernel.range_trees
+        ):
+            return [], []
 
-        num_groups_s = (
-            texpr(num_groups) if hasattr(num_groups, "free_symbols") else str(num_groups)
-        )
-        dense_sizes = kernel.dense_size_list()
-        xblock_str = dense_sizes[0] if len(dense_sizes) > 1 else "1"
-        compact_shape = (xblock_str, num_groups_s)
-
-        folded = []
-        for node in remainder:
-            _, (nn, nr) = node.group
-            if nr != 1:
-                continue
-            if not V.graph.sizevars.statically_known_equals(nn, num_groups * numel):
-                continue
-
-            read_names = [
-                dep.name
-                for dep in node.read_writes.reads
-                if hasattr(dep, "name")
+        downstream_nodes: list[scheduler.SchedulerNode] = []
+        if self.scheduler:
+            downstream_nodes = [
+                sched_node
+                for sched_node in self.scheduler.nodes
+                if isinstance(sched_node, scheduler.SchedulerNode)
+                and not sched_node.is_reduction()
+                and sched_node.get_name() not in self.scheduler.removed_ops
             ]
-            if not read_names or not all(
-                n in kernel.cse.store_cache for n in read_names
-            ):
-                continue
 
-            write_names = [
-                dep.name
-                for dep in node.read_writes.writes
-                if hasattr(dep, "name")
-            ]
-            if len(write_names) != 1:
-                continue
+        folded_remainder: list[scheduler.BaseSchedulerNode] = []
+        folded_downstream: list[scheduler.SchedulerNode] = []
 
-            out_name = write_names[0]
-            body = node._body
-
-            try:
-                result = self._replay_pointwise_on_compact(
-                    kernel, body, compact, compact_shape, out_name,
-                    num_groups_s,
+        with kernel, self._multi_phase_compact_kernel_context(kernel, num_groups):
+            for node in remainder:
+                if not self._can_codegen_multi_phase_compact_node(
+                    kernel, node, num_groups, numel
+                ):
+                    continue
+                indexing_dtype_strength_reduction(node._body)
+                index_vars = kernel.split_and_set_ranges(node.get_ranges())
+                node.codegen(index_vars)
+                kernel.multi_phase_compact_buffers.update(
+                    self._get_multi_phase_compact_write_names(node)
                 )
-                if result:
-                    folded.append(node)
-            except Exception:
-                pass
+                folded_remainder.append(node)
 
-        return folded
-
-    def _replay_pointwise_on_compact(
-        self, kernel, body, compact, compact_shape, out_name, num_groups_s
-    ):
-        """
-        Walk a LoopBody's FX graph and replay its pointwise ops on the compact
-        grouped-reduction result.  Writes to a temp buffer first; only commits
-        to the kernel on success.  Returns True if successful.
-        """
-        from torch._inductor.utils import IndentedBuffer
-
-        tmp_compute = IndentedBuffer()
-        result = compact
-        fx_vals: dict = {}
-
-        def resolve(arg):
-            if arg in fx_vals:
-                return fx_vals[arg]
-            if isinstance(arg, (int, float)):
-                return arg
-            return compact
-
-        with V.set_kernel_handler(kernel):
-            for fx_node in body.root_block.graph.nodes:
-                if fx_node.op in ("placeholder", "output"):
+            for sched_node in downstream_nodes:
+                if not self._can_codegen_multi_phase_compact_node(
+                    kernel, sched_node, num_groups, numel
+                ):
                     continue
-                if fx_node.op != "call_method":
-                    continue
+                indexing_dtype_strength_reduction(sched_node._body)
+                index_vars = kernel.split_and_set_ranges(sched_node.get_ranges())
+                sched_node.codegen(index_vars)
+                kernel.multi_phase_compact_buffers.update(
+                    self._get_multi_phase_compact_write_names(sched_node)
+                )
+                self.scheduler.removed_ops.add(sched_node.get_name())
+                folded_downstream.append(sched_node)
 
-                target = fx_node.target
-                if target in ("load", "load_seed"):
-                    fx_vals[fx_node] = compact
-                elif target == "constant":
-                    fx_vals[fx_node] = fx_node.args[1]
-                elif target in ("maximum", "minimum"):
-                    fn = "triton_helpers.maximum" if target == "maximum" else "triton_helpers.minimum"
-                    lhs = resolve(fx_node.args[1])
-                    rhs = resolve(fx_node.args[2])
-                    result = kernel.cse.generate(
-                        tmp_compute, f"{fn}({lhs}, {rhs})",
-                        dtype=compact.dtype, shape=compact_shape,
-                    )
-                    fx_vals[fx_node] = result
-                elif target == "mul":
-                    lhs = resolve(fx_node.args[1])
-                    rhs = resolve(fx_node.args[2])
-                    result = kernel.cse.generate(
-                        tmp_compute, f"{lhs} * {rhs}",
-                        dtype=compact.dtype, shape=compact_shape,
-                    )
-                    fx_vals[fx_node] = result
-                elif target in ("store", "to_dtype"):
-                    if target == "to_dtype":
-                        fx_vals[fx_node] = resolve(fx_node.args[1])
+        return folded_remainder, folded_downstream
+
+    def _can_codegen_multi_phase_compact_node(
+        self, kernel, node, num_groups, numel
+    ) -> bool:
+        if not isinstance(node, scheduler.SchedulerNode):
+            return False
+        if node.is_reduction():
+            return False
+
+        _, (nn, nr) = node.group
+        if nr != 1:
+            return False
+        if not V.graph.sizevars.statically_known_equals(nn, num_groups * numel):
+            return False
+
+        read_names = [
+            dep.name for dep in node.read_writes.reads if hasattr(dep, "name")
+        ]
+        return all(name in kernel.multi_phase_compact_buffers for name in read_names)
+
+    def _get_multi_phase_compact_write_names(self, node) -> OrderedSet[str]:
+        return OrderedSet(
+            dep.name for dep in node.read_writes.writes if hasattr(dep, "name")
+        )
+
+    @contextlib.contextmanager
+    def _multi_phase_compact_kernel_context(self, kernel, num_groups):
+        y_tree = IterationRangesRoot(
+            "yindex",
+            num_groups,
+            "y",
+            1,
+            kernel,
+            is_loop=False,
+            tensor_dim=1,
+            grid_dim=None,
+            has_zdim="z" in kernel.numels,
+        )
+
+        reduction_start = next(
+            (i for i, tree in enumerate(kernel.range_trees) if tree.is_reduction),
+            len(kernel.range_trees),
+        )
+        original_range_trees = kernel.range_trees
+        original_numels = kernel.numels
+        compact_store_cache = getattr(kernel, "multi_phase_compact_store_cache", {})
+        original_compact_entries = {
+            name: kernel.cse.store_cache[name]
+            for name in compact_store_cache
+            if name in kernel.cse.store_cache
+        }
+        original_use_active_tensor_ndim = kernel.use_active_tensor_ndim
+
+        kernel.range_trees = list(kernel.range_trees)
+        kernel.range_trees.insert(reduction_start, y_tree)
+        kernel.numels = {tree.prefix: tree.numel for tree in kernel.range_trees}
+        kernel.cse.store_cache.update(compact_store_cache)
+        kernel.use_active_tensor_ndim = True
+
+        try:
+            with kernel.disable_reduction():
+                ynumel = kernel.index_to_str(num_groups)
+                kernel.body.writeline(f"ynumel = {ynumel}")
+                kernel.body.writeline(f"YBLOCK: tl.constexpr = {ynumel}")
+                kernel.iteration_ranges_codegen_header(y_tree, kernel.body)
+                yield
+        finally:
+            kernel.use_active_tensor_ndim = original_use_active_tensor_ndim
+            for name in compact_store_cache:
+                if name in original_compact_entries:
+                    kernel.cse.store_cache[name] = original_compact_entries[name]
                 else:
-                    raise NotImplementedError(f"fold: {target}")
-
-        # Success — commit to kernel
-        kernel.compute.splice(tmp_compute)
-        out_var = kernel.args.output(out_name)
-        x_prefix = kernel.range_trees[0].prefix
-        kernel.stores.writeline(
-            f"tl.store({out_var} + tl.arange(0, {num_groups_s})[None, :] + "
-            f"{num_groups_s} * {x_prefix}index, {result}, None)"
-        )
-        return True
-
-    def _fold_downstream_into_kernel(self, kernel, fused_node, num_groups, numel):
-        """
-        Look at scheduler nodes that follow the fused multi-phase node and
-        absorb simple pointwise epilogues whose only inputs are buffers
-        produced by the fused kernel.  The compact [XBLOCK, num_groups]
-        reduction result is used to emit the epilogue's computation and
-        store directly inside the fused kernel.
-        """
-        compact = getattr(kernel, "multi_phase_compact_result", None)
-        if compact is None or not self.scheduler:
-            return []
-
-        from torch._inductor.codegen.triton import texpr
-
-        num_groups_s = (
-            texpr(num_groups) if hasattr(num_groups, "free_symbols") else str(num_groups)
-        )
-        dense_sizes = kernel.dense_size_list()
-        xblock_str = dense_sizes[0] if len(dense_sizes) > 1 else "1"
-        compact_shape = (xblock_str, num_groups_s)
-
-        fused_buf_names = OrderedSet(
-            buf.get_name() for buf in fused_node.get_outputs()
-        )
-
-        folded = []
-        for sched_node in self.scheduler.nodes:
-            if not isinstance(sched_node, scheduler.SchedulerNode):
-                continue
-            if sched_node.is_reduction():
-                continue
-
-            _, (nn, nr) = sched_node.group
-            if nr != 1:
-                continue
-            if not V.graph.sizevars.statically_known_equals(nn, num_groups * numel):
-                continue
-
-            read_names = [
-                dep.name for dep in sched_node.read_writes.reads if hasattr(dep, "name")
-            ]
-            if not read_names or not all(n in fused_buf_names for n in read_names):
-                continue
-
-            write_names = [
-                dep.name for dep in sched_node.read_writes.writes if hasattr(dep, "name")
-            ]
-            if len(write_names) != 1:
-                continue
-
-            out_name = write_names[0]
-            try:
-                ok = self._replay_pointwise_on_compact(
-                    kernel, sched_node._body, compact, compact_shape,
-                    out_name, num_groups_s,
-                )
-                if ok:
-                    self.scheduler.removed_ops.add(sched_node.get_name())
-                    folded.append(sched_node)
-            except Exception:
-                pass
-
-        return folded
+                    kernel.cse.store_cache.pop(name, None)
+            for sym in list(y_tree.var_list):
+                kernel.range_tree_nodes.pop(sym, None)
+            kernel.range_trees = original_range_trees
+            kernel.numels = original_numels
 
     def _generate_multi_phase_schedule(
         self, nodes, numel, rnumel, num_groups, group_size
@@ -2352,6 +2293,21 @@ class SIMDScheduling(BaseScheduling):
                         kernel.multi_phase_sub_groups = sub_groups
                     index_vars = kernel.split_and_set_ranges(node.get_ranges())
                     node.codegen(index_vars)
+                    if (
+                        sub_groups is not None
+                        and hasattr(kernel, "multi_phase_compact_result")
+                        and kernel.multi_phase_compact_result is not None
+                        and hasattr(kernel, "multi_phase_compact_buffers")
+                    ):
+                        compact_write_names = OrderedSet(
+                            buf.get_name() for buf in node.get_outputs()
+                        )
+                        kernel.multi_phase_compact_buffers.update(compact_write_names)
+                        for name in compact_write_names:
+                            kernel.multi_phase_compact_store_cache[name] = (
+                                kernel.multi_phase_compact_result
+                            )
+                        kernel.multi_phase_compact_result = None
                     if hasattr(kernel, "multi_phase_sub_groups"):
                         kernel.multi_phase_sub_groups = None
 

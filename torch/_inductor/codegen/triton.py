@@ -2572,6 +2572,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         # Compact [XBLOCK, num_groups] result from the grouped reduction,
         # used to fold remainder epilogue nodes into the same kernel.
         self.multi_phase_compact_result: Optional[Any] = None
+        self.multi_phase_compact_buffers: OrderedSet[str] = OrderedSet()
+        self.multi_phase_compact_store_cache: dict[str, Any] = {}
 
         if self.inside_reduction:
             self.codegen_reduction_numels(self.body)

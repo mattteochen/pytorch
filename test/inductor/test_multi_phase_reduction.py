@@ -140,6 +140,50 @@ class TestMultiPhaseReduction(TestCase):
             "grouped argmax should fall back to separate kernels",
         )
 
+    @torch._inductor.config.patch(
+        {
+            "triton.persistent_reduction_inner_threshold": 4096,
+            "triton.multi_phase_persistent_reduction": True,
+        }
+    )
+    def test_compact_epilogue_stays_in_one_kernel(self):
+        """Compact epilogues should use the regular one-kernel compact phase."""
+        if not HAS_CUDA:
+            self.skipTest("requires CUDA")
+
+        def fn(x, residual, weight):
+            x = x + residual
+            x_float = x.float()
+            variance = x_float.pow(2).mean(dim=-1, keepdim=True)
+            x_normed = x_float * torch.rsqrt(variance + 1e-6)
+            x_normed = x_normed * (1.0 + weight.float())
+            m, k = x_normed.shape
+            x_grouped = x_normed.reshape(m, k // 128, 128)
+            amax = x_grouped.abs().amax(dim=-1, keepdim=True)
+            scale = (amax + 1e-4) / fp8_max
+            return scale.squeeze(-1)
+
+        from torch._inductor import metrics
+
+        torch.manual_seed(0)
+        x = torch.randn(8, 2048, dtype=torch.bfloat16, device="cuda")
+        residual = torch.randn(8, 2048, dtype=torch.bfloat16, device="cuda")
+        weight = torch.randn(2048, dtype=torch.bfloat16, device="cuda")
+
+        eager = fn(x, residual, weight)
+
+        metrics.reset()
+        compiled = torch.compile(fn, fullgraph=True)
+        actual = compiled(x, residual, weight)
+        torch.cuda.synchronize()
+
+        self.assertTrue(torch.allclose(eager, actual, rtol=1e-2, atol=1e-4))
+        self.assertEqual(
+            metrics.generated_kernel_count,
+            1,
+            f"Expected 1 kernel, got {metrics.generated_kernel_count}",
+        )
+
 
 if __name__ == "__main__":
     run_tests()
