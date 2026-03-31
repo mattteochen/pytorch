@@ -1796,6 +1796,10 @@ class triton:
     # this could be helpful to avoid recompilations in some cases
     mix_order_reduction_non_strict_mode = False
 
+    persistent_reduction_inner_threshold = int(
+        os.environ.get("TORCHINDUCTOR_PERSISTENT_REDUCTION_INNER_THRESHOLD", "1024")
+    )
+
     # Fuse two persistent reductions on the same data with different reduction
     # granularities into a single kernel (e.g. full-row variance + per-group amax).
     multi_phase_persistent_reduction = (

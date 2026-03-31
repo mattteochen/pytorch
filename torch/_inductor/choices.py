@@ -367,7 +367,7 @@ class InductorChoices:
         if not config.triton.persistent_reductions:
             return False
         threshold = {
-            ReductionHint.INNER: 4096,
+            ReductionHint.INNER: config.triton.persistent_reduction_inner_threshold,
         }.get(features.get_reduction_hint(), 64)
 
         if features.get_reduction_hint() not in (

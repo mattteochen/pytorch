@@ -36,6 +36,7 @@ def rmsnorm_fp8_quant(x, residual, weight, eps, group_size):
 class TestMultiPhaseReduction(TestCase):
     @torch._inductor.config.patch(
         {
+            "triton.persistent_reduction_inner_threshold": 4096,
             "triton.multi_phase_persistent_reduction": True,
         }
     )
@@ -69,6 +70,7 @@ class TestMultiPhaseReduction(TestCase):
 
     @torch._inductor.config.patch(
         {
+            "triton.persistent_reduction_inner_threshold": 4096,
             "triton.multi_phase_persistent_reduction": True,
         }
     )
@@ -87,7 +89,6 @@ class TestMultiPhaseReduction(TestCase):
         def fn(x, res, w):
             return rmsnorm_fp8_quant(x, res, w, eps, group_size)
 
-        from unittest.mock import patch
         from torch._inductor import metrics
 
         metrics.reset()
@@ -102,6 +103,41 @@ class TestMultiPhaseReduction(TestCase):
             metrics.generated_kernel_count,
             1,
             f"Expected 1 kernel, got {metrics.generated_kernel_count}",
+        )
+
+    @torch._inductor.config.patch(
+        {
+            "triton.persistent_reduction_inner_threshold": 4096,
+            "triton.multi_phase_persistent_reduction": True,
+        }
+    )
+    def test_grouped_argmax_falls_back(self):
+        """Unsupported grouped reductions should not take the multi-phase fast path."""
+        if not HAS_CUDA:
+            self.skipTest("requires CUDA")
+
+        def fn(x):
+            x = x.float()
+            mean = x.mean(dim=-1, keepdim=True)
+            y = x * torch.rsqrt(mean.abs() + 1e-6)
+            m, k = y.shape
+            return y.reshape(m, k // 128, 128).argmax(dim=-1)
+
+        from torch._inductor import metrics
+
+        x = torch.randn(8, 2048, dtype=torch.bfloat16, device="cuda")
+        eager = fn(x)
+
+        metrics.reset()
+        compiled = torch.compile(fn, fullgraph=True)
+        actual = compiled(x)
+        torch.cuda.synchronize()
+
+        self.assertTrue(torch.equal(eager, actual))
+        self.assertGreater(
+            metrics.generated_kernel_count,
+            1,
+            "grouped argmax should fall back to separate kernels",
         )
 
 

@@ -427,6 +427,20 @@ class PersistentMultiPhaseReduction:
     reduction's output feeds the second reduction's computation.
     """
 
+    SUPPORTED_GROUPED_REDUCTION_TYPES = frozenset({"any", "max", "min", "prod", "sum"})
+
+    @classmethod
+    def _reduction_types_are_supported(cls, node: BaseSchedulerNode) -> bool:
+        reduction_types = [
+            subnode.node.get_reduction_type()  # type: ignore[union-attr]
+            for subnode in node.get_nodes()
+            if subnode.is_reduction()
+        ]
+        return all(
+            reduction_type in cls.SUPPORTED_GROUPED_REDUCTION_TYPES
+            for reduction_type in reduction_types
+        )
+
     @classmethod
     def can_fuse(
         cls, node1: BaseSchedulerNode, node2: BaseSchedulerNode
@@ -481,6 +495,11 @@ class PersistentMultiPhaseReduction:
 
         # The first reduction should reduce over a larger domain
         if V.graph.sizevars.statically_known_equals(rnumel1, rnumel2):
+            return False
+
+        if not cls._reduction_types_are_supported(node1):
+            return False
+        if not cls._reduction_types_are_supported(node2):
             return False
 
         return True
