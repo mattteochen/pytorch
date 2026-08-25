@@ -46,7 +46,10 @@ from torch.testing._internal.inductor_utils import (
     is_big_gpu,
 )
 from torch.utils._sympy.symbol import SymT
-from torch.utils._triton import has_triton_tma_device
+from torch.utils._triton import (
+    has_datacenter_blackwell_tma_device,
+    has_triton_tma_device,
+)
 
 
 _PRIOR_FP32_MATMUL_PRECISION: str | None = None
@@ -1138,9 +1141,115 @@ class TestFP8Lowering(TestCase):
         torch.testing.assert_close(y_eager, y_compiled, rtol=1e-2, atol=0.05)
 
     @unittest.skipIf(not PLATFORM_SUPPORTS_FP8, f8_msg)
+    @skipIfRocm(msg="FP8 scaled_mm tensorwise eager path is not supported by hipBLAS")
+    @onlyCUDA
+    def test_scaled_mm_v2_aten_choice(self, device):
+        from torch._inductor.kernel.mm import aten__fp8_mm_v2
+
+        M = N = K = 128
+        torch.manual_seed(0)
+        a = torch.randint(-8, 9, (M, K), device=device).to(torch.float8_e4m3fn)
+        b = torch.randint(-8, 9, (N, K), device=device).to(torch.float8_e4m3fn).t()
+        scale_a = torch.tensor(0.25, device=device)
+        scale_b = torch.tensor(0.5, device=device)
+
+        def fn(a, b, scale_a, scale_b):
+            return scaled_mm(
+                a,
+                b,
+                scale_a,
+                ScalingType.TensorWise,
+                scale_b,
+                ScalingType.TensorWise,
+                output_dtype=torch.bfloat16,
+            )
+
+        expected = fn(a, b, scale_a, scale_b)
+        recipe = [ScalingType.TensorWise.value]
+        adapter_result = aten__fp8_mm_v2.to_callable()(
+            a,
+            b,
+            scale_a,
+            scale_b,
+            recipe_a=recipe,
+            swizzle_a=[],
+            recipe_b=recipe,
+            swizzle_b=[],
+            out_dtype=torch.bfloat16,
+        )
+
+        torch._dynamo.reset()
+        with config.patch(
+            {
+                "fx_graph_cache": False,
+                "max_autotune": True,
+                "max_autotune_gemm_backends": "ATEN",
+            }
+        ):
+            actual, code = run_and_get_code(
+                torch.compile(fn, backend="inductor", fullgraph=True),
+                a,
+                b,
+                scale_a,
+                scale_b,
+            )
+
+        self.assertEqual(adapter_result, expected, rtol=1e-2, atol=5e-2)
+        self.assertEqual(actual, expected, rtol=1e-2, atol=5e-2)
+        FileCheck().check("torch.ops.aten._scaled_mm_v2.default").run(code[0])
+
+    @unittest.skipIf(not PLATFORM_SUPPORTS_FP8, f8_msg)
     @unittest.skipIf(
-        not has_triton_tma_device(), "Need device-side TMA support in Triton"
+        not has_datacenter_blackwell_tma_device(),
+        "Need datacenter Blackwell",
     )
+    @onlyCUDA
+    def test_deepseek_blockwise_v2_zero_k_sm100(self, device):
+        M = N = 128
+        K = 0
+        tile_size = 128
+
+        a = torch.empty((M, K), device=device, dtype=torch.float8_e4m3fn)
+        b = torch.empty((N, K), device=device, dtype=torch.float8_e4m3fn).t()
+        scale_a = _prepare_blockwise_scale(
+            torch.empty((M, 0), device=device), 1, tile_size, transposed=False
+        )
+        scale_b = _prepare_blockwise_scale(
+            torch.empty((1, 0), device=device), tile_size, tile_size, transposed=False
+        )
+
+        def fn(a, b, scale_a, scale_b):
+            return scaled_mm(
+                a,
+                b,
+                scale_a,
+                ScalingType.BlockWise1x128,
+                scale_b,
+                ScalingType.BlockWise128x128,
+                output_dtype=torch.bfloat16,
+            )
+
+        expected = torch.zeros((M, N), device=device, dtype=torch.bfloat16)
+        torch._dynamo.reset()
+        with config.patch(
+            {
+                "fx_graph_cache": False,
+                "max_autotune": True,
+                "max_autotune_gemm_backends": "ATEN,TRITON",
+                "triton.enable_persistent_tma_matmul": True,
+            }
+        ):
+            actual, code = run_and_get_code(
+                torch.compile(fn, backend="inductor", fullgraph=True),
+                a,
+                b,
+                scale_a,
+                scale_b,
+            )
+
+        self.assertEqual(actual, expected)
+        FileCheck().check("torch.ops.aten._scaled_mm_v2.default").run(code[0])
+
     @unittest.skipIf(
         _get_torch_cuda_version() < (12, 9),
         "cuBLAS blockwise scaling added in CUDA 12.9",

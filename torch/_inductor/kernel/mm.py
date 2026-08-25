@@ -25,7 +25,7 @@ from ..codegen.cutlass.gemm_template import CUTLASS2xGemmTemplate, CUTLASS3xGemm
 from ..codegen.rocm.ck_tile_universal_gemm_template import CKTileGemmTemplate
 from ..codegen.rocm.ck_universal_gemm_template import CKGemmTemplate
 from ..codegen.subgraph import SubgraphChoiceCaller, SubgraphTemplate
-from ..ir import Buffer, ChoiceCaller, is_triton, Layout
+from ..ir import Buffer, ChoiceCaller, FallbackKernel, is_triton, Layout
 from ..kernel_inputs import MMKernelInputs
 from ..lowering import (
     fallback_handler,
@@ -163,6 +163,78 @@ aten__sparse_semi_structured_mm = ExternKernelChoice(
 
 aten__fp8_mm = ExternKernelChoice(
     torch._scaled_mm, "at::_scaled_mm_out", op_overload=aten._scaled_mm.out
+)
+
+
+def _scaled_mm_v2_single_scale(
+    mat_a,
+    mat_b,
+    scale_a,
+    scale_b,
+    bias=None,
+    *,
+    recipe_a,
+    swizzle_a,
+    recipe_b,
+    swizzle_b,
+    out_dtype=None,
+    contraction_dim=(),
+    use_fast_accum=False,
+):
+    return aten._scaled_mm_v2.default(
+        mat_a,
+        mat_b,
+        [scale_a],
+        recipe_a,
+        swizzle_a,
+        [scale_b],
+        recipe_b,
+        swizzle_b,
+        bias,
+        out_dtype,
+        contraction_dim,
+        use_fast_accum,
+    )
+
+
+def _create_scaled_mm_v2_single_scale(
+    mat_a,
+    mat_b,
+    scale_a,
+    scale_b,
+    bias=None,
+    *,
+    recipe_a,
+    swizzle_a,
+    recipe_b,
+    swizzle_b,
+    out_dtype=None,
+    contraction_dim=(),
+    use_fast_accum=False,
+):
+    return FallbackKernel.create(
+        aten._scaled_mm_v2.default,
+        mat_a,
+        mat_b,
+        [scale_a],
+        recipe_a,
+        swizzle_a,
+        [scale_b],
+        recipe_b,
+        swizzle_b,
+        bias,
+        out_dtype,
+        contraction_dim,
+        use_fast_accum,
+    )
+
+
+aten__fp8_mm_v2 = ExternKernelChoice(
+    _scaled_mm_v2_single_scale,
+    name="_scaled_mm_v2",
+    has_out_variant=False,
+    op_overload=aten._scaled_mm_v2.default,
+    kernel_creator=_create_scaled_mm_v2_single_scale,
 )
 
 
@@ -975,6 +1047,8 @@ def tuned_scaled_mm_v2(
     scaling via lists.
     """
 
+    contraction_dim = [] if contraction_dim is None else contraction_dim
+
     # Inductor only has Triton/extern lowerings for single-level, fp32-scaled,
     # non-swizzled _scaled_mm_v2 with the "supported" recipes (TensorWise,
     # RowWise, and DeepSeek BlockWise1x128/128x128). Everything else has no
@@ -984,8 +1058,6 @@ def tuned_scaled_mm_v2(
     #     expresses MX/NVFP4, with NO_SWIZZLE)
     #   - multi-level scales (two-level NVFP4)
     #   - any non-fp32 block scale
-    # The eager op is called directly so it keeps its native v2 scale_b
-    # convention, unlike the v1 aten__fp8_mm choice used on the supported path.
     def check_supported_recipe(recipe: list[int]) -> bool:
         disallowed = OrderedSet([ScalingType.BlockWise1x16, ScalingType.BlockWise1x32])
         return all(ScalingType(r) not in disallowed for r in recipe)
@@ -1001,9 +1073,6 @@ def tuned_scaled_mm_v2(
         or not is_single_level_scale
         or scale_a[0].dtype != torch.float32
     ):
-        # contraction_dim is a non-optional int[] in the schema (default []);
-        # this lowering defaults it to None, so coerce before the eager call.
-        fallback_contraction_dim = [] if contraction_dim is None else contraction_dim
         return scaled_mm_v2_fallback(
             mat_a,
             mat_b,
@@ -1015,7 +1084,7 @@ def tuned_scaled_mm_v2(
             swizzle_b,
             bias,
             out_dtype,
-            fallback_contraction_dim,
+            contraction_dim,
             use_fast_accum,
         )
     # TODO(coconutruben): integrate into MMKernelInputs when all callsites use that
@@ -1056,14 +1125,57 @@ def tuned_scaled_mm_v2(
     # Collect all templates for unified call
     templates_to_use: list[ExternKernelChoice | KernelTemplate] = []
     kwarg_overrides = {}
+    _, is_nonzero = _is_static_problem(layout)
+    has_zero_problem = not is_nonzero or V.graph.sizevars.statically_known_equals(k, 0)
 
-    if use_aten_gemm_kernels():
-        templates_to_use.append(aten__fp8_mm)
-        kwarg_overrides[aten__fp8_mm.uid] = dict(
-            out_dtype=out_dtype, use_fast_accum=use_fast_accum
+    # Note: No NVFP4 support at this point - can ignore swizzling, and take only the
+    #       first scale types passed.
+    scale_option_a, scale_option_b = (
+        ScalingType(recipe_a[0]),
+        ScalingType(recipe_b[0]),
+    )
+    is_deepseek_scaling = (
+        scale_option_a in main_loop_scaling_types
+        or scale_option_b in main_loop_scaling_types
+    )
+    cuda_deepseek_supported = False
+    if (
+        is_deepseek_scaling
+        and layout.device.type == "cuda"
+        and torch.version.hip is None
+    ):
+        from torch._inductor.codegen.cuda import compile_utils as cuda_compile_utils
+
+        cuda_arch = inductor_config.cuda.arch
+        if cuda_arch is None:
+            major, minor = torch.cuda.get_device_capability(layout.device)
+            cuda_arch = str(major * 10 + minor)
+        # Normalizes the cutlass compile suffix, so "90a"/"sm_90" parse like "90".
+        cuda_deepseek_supported = (
+            90 <= cuda_compile_utils._cuda_arch_number(str(cuda_arch)) < 100
+            and TorchVersion(torch.version.cuda or "0.0") >= "12.9"
         )
 
-    _, is_nonzero = _is_static_problem(layout)
+    # Native CUDA DeepSeek dispatch is SM90/CUDA 12.9+; XPU supports it, and
+    # zero problems return before recipe dispatch.
+    native_deepseek_supported = (
+        has_zero_problem
+        or not is_deepseek_scaling
+        or layout.device.type == "xpu"
+        or cuda_deepseek_supported
+    )
+
+    if use_aten_gemm_kernels() and native_deepseek_supported:
+        templates_to_use.append(aten__fp8_mm_v2)
+        kwarg_overrides[aten__fp8_mm_v2.uid] = dict(
+            recipe_a=recipe_a,
+            swizzle_a=swizzle_a,
+            recipe_b=recipe_b,
+            swizzle_b=swizzle_b,
+            out_dtype=out_dtype,
+            contraction_dim=contraction_dim,
+            use_fast_accum=use_fast_accum,
+        )
 
     if (
         # We don't have triton lowerings for the MX variants yet
@@ -1074,13 +1186,6 @@ def tuned_scaled_mm_v2(
         and use_triton_template(layout, enable_float8=True, check_max_autotune=False)
     ):
         overriders = dict(USE_FAST_ACCUM=use_fast_accum)
-
-        # Note: No NVFP4 support at this point - can ignore swizzling, and take only the
-        #       first scale types passed.
-        scale_option_a, scale_option_b = (
-            ScalingType(recipe_a[0]),
-            ScalingType(recipe_b[0]),
-        )
 
         # TODO (paulzhan): There is no template that exists for bias and TMA
         # Don't run tma template currently if bias exist
