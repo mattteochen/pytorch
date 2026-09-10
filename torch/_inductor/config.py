@@ -3142,6 +3142,10 @@ class lookup_table:
 class test_configs:
     force_extern_kernel_in_multi_template: bool = False
 
+    # Experimental K128 UE8M0 controls pending full-pipeline autotuning.
+    k128_scaled_mm_split_k: int = 1
+    k128_scaled_mm_template: Literal["software", "native"] | None = None
+
     # Force custom op autotuning choice selection:
     # - None: normal autotuning (default)
     # - True: force decomposition to win

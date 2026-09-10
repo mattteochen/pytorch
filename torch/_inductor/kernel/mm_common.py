@@ -45,6 +45,15 @@ def persistent_grouped_mm_grid(*args):
     return (meta["NUM_SMS"], 1, 1)
 
 
+@SymbolicGridFn
+def split_k_mm_grid(m, n, meta, *, cdiv, min):
+    split_k = meta["SPLIT_K"]
+    tiles = cdiv(m // split_k, meta["BLOCK_M"]) * cdiv(n, meta["BLOCK_N"])
+    if "NUM_SMS" in meta:
+        tiles = min(meta["NUM_SMS"], tiles)
+    return (tiles, split_k, 1)
+
+
 def acc_type(dtype):
     if dtype in (torch.float16, torch.bfloat16):
         return "tl.float32"

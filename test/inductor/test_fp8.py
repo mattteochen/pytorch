@@ -1319,6 +1319,93 @@ class TestFP8Lowering(TestCase):
         "Need datacenter Blackwell with device-side TMA support in Triton",
     )
     @onlyCUDA
+    @parametrize("path", ("software", "native"))
+    @parametrize("rows_a,rows_b", ((1, 1), (1, 128), (128, 1)))
+    @parametrize("host_side_tma", (False, True))
+    @parametrize(
+        "K,split_k,fractional",
+        ((64, 8, False), (128, 2, False), (400, 8, False), (4208, 4, True)),
+    )
+    def test_k128_ue8m0_split_k(
+        self, path, rows_a, rows_b, host_side_tma, K, split_k, fractional, device
+    ):
+        M, N = 65, 321
+        k_blocks = ceil_div(K, 128)
+        torch.manual_seed(0)
+        if fractional:
+            a = torch.randn((M, K), device=device).to(torch.float8_e4m3fn)
+            b = torch.randn((N, K), device=device).to(torch.float8_e4m3fn).t()
+        else:
+            a = torch.randint(-4, 5, (M, K), device=device).to(torch.float8_e4m3fn)
+            b = torch.randint(-4, 5, (N, K), device=device).to(torch.float8_e4m3fn).t()
+        ma, nb = ceil_div(M, rows_a), ceil_div(N, rows_b)
+        ca = (
+            torch.arange(ma * k_blocks, device=device).reshape(ma, k_blocks) % 7 + 124
+        ).to(torch.uint8)
+        cb = (
+            torch.arange(nb * k_blocks, device=device).reshape(nb, k_blocks) % 5 + 125
+        ).to(torch.uint8)
+        sa = ca.view(torch.float8_e8m0fnu)
+        sb = cb.view(torch.float8_e8m0fnu).t()
+        fa = sa.float().repeat_interleave(rows_a, 0)[:M]
+        fb = sb.t().float().repeat_interleave(rows_b, 0)[:N]
+        expected = torch.zeros((M, N), device=device, dtype=torch.float64)
+        for block in range(k_blocks):
+            start, end = block * 128, min((block + 1) * 128, K)
+            partial = a[:, start:end].double() @ b[start:end].double()
+            expected += partial * fa[:, block, None] * fb[:, block][None, :]
+        recipe_a = (
+            ScalingType.BlockWise1x128 if rows_a == 1 else ScalingType.BlockWise128x128
+        )
+        recipe_b = (
+            ScalingType.BlockWise1x128 if rows_b == 1 else ScalingType.BlockWise128x128
+        )
+
+        def fn(a, b, sa, sb):
+            return scaled_mm(
+                a,
+                b,
+                sa,
+                recipe_a,
+                sb,
+                recipe_b,
+                output_dtype=torch.bfloat16,
+                use_fast_accum=False,
+            )
+
+        if path == "software":
+            desc = f"BLOCK_K={min(K, 128)}, BLOCK_M=64, BLOCK_N=32,.*num_stages=3, num_warps=4"
+        else:
+            desc = "BLOCK_K=128, BLOCK_M=128, BLOCK_N=128,.*num_stages=4, num_warps=4"
+        with config.patch(
+            {
+                "max_autotune": True,
+                "max_autotune_gemm_backends": "TRITON",
+                "triton.enable_persistent_tma_matmul": True,
+                "triton.enable_host_side_tma": host_side_tma,
+                "test_configs.k128_scaled_mm_split_k": split_k,
+                "test_configs.k128_scaled_mm_template": path,
+                "test_configs.autotune_choice_desc_regex": desc,
+            }
+        ):
+            actual, (code,) = run_and_get_code(
+                torch.compile(fn, fullgraph=True), a, b, sa, sb
+            )
+        self.assertEqual(
+            actual,
+            expected.bfloat16(),
+            atol=1e-3 if fractional else 0,
+            rtol=0.008 if fractional else 0,
+        )
+        self.assertIn("split_id = tl.program_id(1)", code)
+        self.assertEqual("tl.dot_scaled(" in code, path == "native")
+
+    @unittest.skipIf(not PLATFORM_SUPPORTS_FP8, f8_msg)
+    @unittest.skipIf(
+        not has_datacenter_blackwell_tma_device(),
+        "Need datacenter Blackwell with device-side TMA support in Triton",
+    )
+    @onlyCUDA
     @parametrize("layout", ("logical", "noncontiguous"))
     def test_k128_ue8m0_blockwise_scaling_rejects_invalid_layout(self, layout, device):
         from torch._inductor.exc import InductorError

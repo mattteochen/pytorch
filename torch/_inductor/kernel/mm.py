@@ -31,7 +31,15 @@ from ..codegen.rocm.ck_tile_universal_gemm_template import CKTileGemmTemplate
 from ..codegen.rocm.ck_universal_gemm_template import CKGemmTemplate
 from ..codegen.subgraph import SubgraphChoiceCaller, SubgraphTemplate
 from ..codegen.wrapper import PythonWrapperCodegen
-from ..ir import Buffer, ChoiceCaller, IRNode, is_triton, is_unaligned, Layout
+from ..ir import (
+    Buffer,
+    ChoiceCaller,
+    FixedLayout,
+    IRNode,
+    is_triton,
+    is_unaligned,
+    Layout,
+)
 from ..kernel_inputs import MMKernelInputs
 from ..lowering import (
     fallback_handler,
@@ -77,6 +85,7 @@ from .mm_common import (
     mm_args,
     mm_grid,
     persistent_mm_grid,
+    split_k_mm_grid,
     use_native_matmul,
 )
 
@@ -153,7 +162,7 @@ flydsl_mm_template = FlyDSLTemplate(
 
 blackwell_ws_persistent_device_tma_k128_ue8m0_scaling_template = TritonTemplate(
     name="blackwell_ws_persistent_device_tma_k128_ue8m0_scaling",
-    grid=persistent_mm_grid,
+    grid=split_k_mm_grid,
     source=load_kernel_template(
         "triton_blackwell_ws_persistent_device_tma_k128_ue8m0_scaled_mm"
     ),
@@ -161,7 +170,7 @@ blackwell_ws_persistent_device_tma_k128_ue8m0_scaling_template = TritonTemplate(
 
 k128_ue8m0_sw_scaled_mm_template = TritonTemplate(
     name="k128_ue8m0_sw_scaled_mm",
-    grid=mm_grid,
+    grid=split_k_mm_grid,
     source=load_kernel_template("triton_k128_ue8m0_sw_scaled_mm"),
 )
 
@@ -1273,6 +1282,16 @@ def _is_k128_ue8m0_scaled_mm(
     )
 
 
+class _K128SplitKInputs(MMKernelInputs):
+    def __init__(self, input_nodes: list[Any], split_k: int):
+        super().__init__(input_nodes, mat1_idx=0, mat2_idx=1, out_dtype=torch.float32)
+        self.split_k = split_k
+
+    def output_layout(self, flexible: bool = True) -> Layout:
+        m, n, _ = self.mnk_symbolic()
+        return FixedLayout(self.device(), torch.float32, [self.split_k * m, n])
+
+
 def _tuned_k128_ue8m0_scaled_mm(
     mat_a,
     mat_b,
@@ -1344,7 +1363,13 @@ def _tuned_k128_ue8m0_scaled_mm(
     ) and V.graph.sizevars.guard_or_true(
         sympy.Ge(k_steps_per_cta * Min(m, 128), min_k_steps * 128)
     )
-    kwarg_overrides = {}
+    split_k = inductor_config.test_configs.k128_scaled_mm_split_k
+    if split_k < 1:
+        raise ValueError(f"k128_scaled_mm_split_k must be positive, got {split_k}")
+    forced_template = inductor_config.test_configs.k128_scaled_mm_template
+    if forced_template is not None:
+        use_native = forced_template == "native"
+    template_kwargs = {"SPLIT_K": split_k}
     if use_native:
         template = blackwell_ws_persistent_device_tma_k128_ue8m0_scaling_template
         input_nodes = [
@@ -1356,23 +1381,30 @@ def _tuned_k128_ue8m0_scaled_mm(
     else:
         template = k128_ue8m0_sw_scaled_mm_template
         input_nodes = [mat_a, mat_b, scale_a, scale_b]
-        kwarg_overrides[template.uid] = {
-            "SCALE_BLOCK_ROWS_A": block_rows_a,
-            "SCALE_BLOCK_ROWS_B": block_rows_b,
-        }
-    kernel_inputs = MMKernelInputs(
-        input_nodes, mat1_idx=0, mat2_idx=1, out_dtype=out_dtype
-    )
+        template_kwargs.update(
+            SCALE_BLOCK_ROWS_A=block_rows_a, SCALE_BLOCK_ROWS_B=block_rows_b
+        )
+    kernel_inputs: MMKernelInputs
+    if split_k > 1:
+        kernel_inputs = _K128SplitKInputs(input_nodes, split_k)
+        layout = kernel_inputs.output_layout(flexible=False)
+    else:
+        kernel_inputs = MMKernelInputs(
+            input_nodes, mat1_idx=0, mat2_idx=1, out_dtype=out_dtype
+        )
     choices: list[ChoiceCaller] = []
     choices.extend(
         V.choices.get_template_configs(
             kernel_inputs,
             [template],
             name,
-            kwarg_overrides=kwarg_overrides,
+            kwarg_overrides={template.uid: template_kwargs},
         )
     )
     node, _ = autotune_select_algorithm(name, choices, kernel_inputs.nodes(), layout)
+    if split_k > 1:
+        partials = L.view(node, [split_k, m, n])
+        node = L.to_dtype(L.sum_(partials, [0], dtype=torch.float32), out_dtype)
     return node
 
 

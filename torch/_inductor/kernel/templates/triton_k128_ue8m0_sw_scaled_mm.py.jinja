@@ -49,7 +49,16 @@
     scale_a_mask = (M % BLOCK_M == 0) | (rm < M)
     scale_b_mask = (N % BLOCK_N == 0) | (rn < N)
 
-    for k_idx in range(0, tl.cdiv(K, BLOCK_K)):
+    {% if SPLIT_K > 1 %}
+    split_id = tl.program_id(1).to(INDEX_DTYPE)
+    blocks_per_split = tl.cdiv(tl.cdiv(K, 128), SPLIT_K)
+    k_start = split_id * blocks_per_split * (128 // BLOCK_K)
+    k_end = tl.minimum(k_start + blocks_per_split * (128 // BLOCK_K), tl.cdiv(K, BLOCK_K))
+    {% else %}
+    k_start = 0
+    k_end = tl.cdiv(K, BLOCK_K)
+    {% endif %}
+    for k_idx in range(k_start, k_end):
         {% if not EVEN_K %}
         a_mask = offs_k[None, :] < (K - k_idx * BLOCK_K)
         b_mask = offs_k[:, None] < (K - k_idx * BLOCK_K)
@@ -97,6 +106,9 @@
     idx_n = rn[None, :]
     mask = (idx_m < M) & (idx_n < N)
 
+    {% if SPLIT_K > 1 %}
+    idx_m += split_id * M
+    {% endif %}
     # inductor generates a suffix
     {{store_output(("idx_m", "idx_n"), "acc", "mask", val_shape=("BLOCK_M", "BLOCK_N"))}}
 
