@@ -1277,6 +1277,7 @@ class TestFP8Lowering(TestCase):
                     "max_autotune_gemm_backends": "TRITON",
                     "triton.enable_persistent_tma_matmul": True,
                     "triton.enable_host_side_tma": host_side_tma,
+                    "triton.autotune_k128_scaled_mm": False,
                     "test_configs.autotune_choice_name_regex": None,
                     "test_configs.autotune_choice_desc_regex": None,
                 }
@@ -1399,6 +1400,111 @@ class TestFP8Lowering(TestCase):
         )
         self.assertIn("split_id = tl.program_id(1)", code)
         self.assertEqual("tl.dot_scaled(" in code, path == "native")
+
+    @unittest.skipIf(not PLATFORM_SUPPORTS_FP8, f8_msg)
+    @unittest.skipIf(
+        not has_datacenter_blackwell_tma_device(),
+        "Need datacenter Blackwell with device-side TMA support in Triton",
+    )
+    @onlyCUDA
+    @parametrize(
+        "path,split_k", (("software", 1), ("native", 1), ("software", 4), ("native", 2))
+    )
+    @parametrize("host_side_tma", (False, True))
+    def test_k128_ue8m0_pipeline_autotune(self, path, split_k, host_side_tma, device):
+        from torch._inductor.codegen.subgraph import SubgraphChoiceCaller
+        from torch._inductor.select_algorithm import (
+            add_preprocessing_fn,
+            clear_preprocessing_fns,
+        )
+
+        M, N, K = 65, 321, 1280
+        kb, nb = ceil_div(K, 128), ceil_div(N, 128)
+        torch.manual_seed(0)
+        a = torch.randint(-4, 5, (M, K), device=device).to(torch.float8_e4m3fn)
+        b = torch.randint(-4, 5, (N, K), device=device).to(torch.float8_e4m3fn).t()
+        ca = torch.arange(M * kb, device=device).reshape(M, kb)
+        cb = torch.arange(nb * kb, device=device).reshape(nb, kb)
+        ca, cb = (ca % 7 + 124).byte(), (cb % 5 + 125).byte()
+        sa, sb = ca.view(torch.float8_e8m0fnu), cb.view(torch.float8_e8m0fnu).t()
+        af = a.float() * sa.float().repeat_interleave(128, 1)
+        fb = sb.t().float().repeat_interleave(128, 0)[:N]
+        bf = b.t().float() * fb.repeat_interleave(128, 1)
+        expected = (af @ bf.t()).bfloat16()
+
+        def fn(a, b, sa, sb):
+            return scaled_mm(
+                a,
+                b,
+                sa,
+                ScalingType.BlockWise1x128,
+                sb,
+                ScalingType.BlockWise128x128,
+                output_dtype=torch.bfloat16,
+                use_fast_accum=False,
+            )
+
+        seen = set()
+        benchmark = SubgraphChoiceCaller.benchmark
+
+        def force_winner(choice, *args, **kwargs):
+            family = choice.config_patches["test_configs.k128_scaled_mm_template"]
+            split = choice.config_patches["test_configs.k128_scaled_mm_split_k"]
+            seen.add((family, split))
+            # Exercise complete pipeline benchmarking, then make selection deterministic.
+            benchmark(choice, *args, **kwargs)
+            return 1.0 if (family, split) == (path, split_k) else 2.0
+
+        def small_tile_set(choices):
+            if isinstance(choices[0], SubgraphChoiceCaller):
+                return choices
+            fields = (
+                ("BLOCK_K=128, BLOCK_M=128, BLOCK_N=128", "num_stages=4, num_warps=4")
+                if "blackwell" in choices[0].name
+                else (
+                    "BLOCK_K=128, BLOCK_M=64, BLOCK_N=32",
+                    "num_stages=3, num_warps=4",
+                )
+            )
+            matching = [c for c in choices if all(f in c.description for f in fields)]
+            self.assertEqual(len(matching), 1)
+            return matching
+
+        add_preprocessing_fn(small_tile_set)
+        try:
+            with (
+                config.patch(
+                    {
+                        "fx_graph_cache": False,
+                        "autotune_local_cache": False,
+                        "max_autotune": True,
+                        "max_autotune_gemm_backends": "TRITON",
+                        "pipeline_max_autotune_gemm": False,
+                        "triton.autotune_k128_scaled_mm": True,
+                        "triton.enable_persistent_tma_matmul": True,
+                        "triton.enable_host_side_tma": host_side_tma,
+                    }
+                ),
+                mock.patch.object(SubgraphChoiceCaller, "benchmark", force_winner),
+            ):
+                actual, sources = run_and_get_code(
+                    torch.compile(fn, fullgraph=True), a, b, sa, sb
+                )
+        finally:
+            clear_preprocessing_fns(clear_defaults=False)
+        self.assertEqual(
+            seen,
+            {
+                (family, split)
+                for family in ("software", "native")
+                for split in (1, 2, 4)
+            },
+        )
+        self.assertEqual(actual, expected)
+        code = sources[-1]
+        self.assertIn(f"subgraph: k128_scaled_mm_{path}_s{split_k}_", code)
+        self.assertEqual("tl.dot_scaled(" in code, path == "native")
+        self.assertEqual("split_id = tl.program_id(1)" in code, split_k > 1)
 
     @unittest.skipIf(not PLATFORM_SUPPORTS_FP8, f8_msg)
     @unittest.skipIf(

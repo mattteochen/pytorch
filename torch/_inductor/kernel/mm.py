@@ -180,6 +180,8 @@ blackwell_ws_persistent_tma_mm_template = TritonTemplate(
     source=load_kernel_template("triton_blackwell_ws_persistent_tma_mm"),
 )
 
+k128_scaled_mm_subgraph_template = SubgraphTemplate(name="k128_scaled_mm_pipeline")
+
 
 # prevent duplication registration of extern functions
 @functools.cache
@@ -1345,6 +1347,63 @@ def _tuned_k128_ue8m0_scaled_mm(
             "as [ceil(K / 128), ceil(N / rows)] with strides (1, ceil(K / 128))"
         ),
     )
+    if (
+        inductor_config.triton.autotune_k128_scaled_mm
+        and (inductor_config.max_autotune or inductor_config.max_autotune_gemm)
+        and inductor_config.test_configs.k128_scaled_mm_template is None
+        and inductor_config.test_configs.k128_scaled_mm_split_k == 1
+        and all(isinstance(dim, sympy.Integer) for dim in (m, n, k))
+        # Some single-K-iteration native configurations fail at runtime.
+        and k >= 512
+    ):
+        from torch._dispatch.python import enable_python_dispatcher
+
+        def fn(a, b, sa, sb):
+            return aten._scaled_mm_v2.default(
+                a,
+                b,
+                [sa],
+                [recipe_a.value],
+                [],
+                [sb],
+                [recipe_b.value],
+                [],
+                bias=None,
+                out_dtype=layout.dtype,
+            )
+
+        split_choices = [1]
+        native_tiles = ceildiv(m, 128) * ceildiv(n, 128)
+        if k >= 1024 and (m <= 128 or native_tiles < get_num_sms()):
+            split_choices += [s for s in (2, 4) if s * m * n * 4 <= 64 * 1024 * 1024]
+        pipelines = []
+        with enable_python_dispatcher():
+            for family in ("software", "native"):
+                for split in split_choices:
+                    pipelines.append(
+                        k128_scaled_mm_subgraph_template.generate(
+                            name=f"k128_scaled_mm_{family}_s{split}",
+                            input_nodes=[mat_a, mat_b, scale_a, scale_b],
+                            layout=layout,
+                            make_fx_graph=make_fx(fn),
+                            description=f"{family=}, {split=}",
+                            config_patches={
+                                "max_autotune": True,
+                                "max_autotune_gemm_backends": "TRITON",
+                                "pipeline_max_autotune_gemm": False,
+                                "triton.autotune_k128_scaled_mm": False,
+                                "test_configs.k128_scaled_mm_template": family,
+                                "test_configs.k128_scaled_mm_split_k": split,
+                            },
+                        )
+                    )
+        node, _ = autotune_select_algorithm(
+            "k128_scaled_mm_pipeline",
+            pipelines,
+            [mat_a, mat_b, scale_a, scale_b],
+            layout,
+        )
+        return node
     # The native template scales in the tensor core (tcgen05 block-scaled MMA)
     # but pays a fixed cost per launch: 128-row tiles (rows past M are wasted
     # MMA work), a prologue that re-lays out the scales for tcgen05.cp, and
@@ -1352,8 +1411,7 @@ def _tuned_k128_ue8m0_scaled_mm(
     # software template pays per K step instead, rescaling the partial product
     # in registers, and needs no prologue. So native wins only when the 128x128
     # output grid fills the SMs and every CTA runs enough useful K steps to
-    # amortize the setup. The two are exclusive because autotuning times only
-    # the GEMM kernel and cannot see the prologue.
+    # amortize the setup. Keep this heuristic when pipeline autotuning is off.
     num_sms = get_num_sms()
     native_tiles = ceildiv(m, 128) * ceildiv(n, 128)
     k_steps_per_cta = ceildiv(native_tiles, num_sms) * ceildiv(k, 128)

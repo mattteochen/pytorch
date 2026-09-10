@@ -71,6 +71,7 @@ class SubgraphChoiceCaller(ir.ChoiceCaller):
         description: str,
         make_fx_graph: Callable[..., Any],
         input_gen_fns: dict[int, Callable[[Any], torch.Tensor]] | None = None,
+        config_patches: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(name, input_nodes, layout, description)
 
@@ -116,7 +117,7 @@ class SubgraphChoiceCaller(ir.ChoiceCaller):
         self.decomposition: Callable[..., Any] | None = None
         self.decomposition_kwargs: dict[str, Any] = {}
         # Config patches to apply during kernel codegen (e.g., coordinate_descent_tuning)
-        self.config_patches: dict[str, Any] = {}
+        self.config_patches: dict[str, Any] = dict(config_patches or {})
         # Cache compiled module to avoid recompiling on every benchmark call
         self._compiled_module: Any = None
         # Cache benchmark request for async autotuning
@@ -355,6 +356,7 @@ class SubgraphTemplate(KernelTemplate):
         make_fx_graph: Callable[..., Any],
         description: str = "",
         input_gen_fns: dict[int, Callable[[Any], torch.Tensor]] | None = None,
+        config_patches: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> SubgraphChoiceCaller:
         """
@@ -367,6 +369,7 @@ class SubgraphTemplate(KernelTemplate):
             make_fx_graph: Callable that creates the FX graph for this subgraph
             description: Optional description of this choice
             input_gen_fns: Optional dict mapping input indices to tensor generators
+            config_patches: Config overrides for benchmarking and the selected graph
             **kwargs: Additional keyword arguments
 
         Returns:
@@ -380,6 +383,7 @@ class SubgraphTemplate(KernelTemplate):
             description=description,
             make_fx_graph=make_fx_graph,
             input_gen_fns=input_gen_fns,
+            config_patches=config_patches,
         )
 
     def generate_custom_op_choices(

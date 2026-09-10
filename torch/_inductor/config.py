@@ -2298,6 +2298,9 @@ class triton:
     # Note: it may also need to be used with config.compile_threads = 1
     disallow_failing_autotune_kernels_TESTING_ONLY = False
 
+    # Compare complete K128 UE8M0 pipelines, including packing and reduction.
+    autotune_k128_scaled_mm = True
+
     # specify number of splits to autotune on for decompose_k. 0 disables decompose_k
     # Disabled on ROCm by default pending performance validation.
     num_decompose_k_splits = int(
