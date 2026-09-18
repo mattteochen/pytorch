@@ -8,11 +8,17 @@
 #include <ATen/cuda/CUDADataType.h>
 #include <ATen/cuda/tunable/Tunable.h>
 #include <ATen/cuda/tunable/TunableGemm.h>
+#include <c10/cuda/CUDAFunctions.h>
 #include <c10/macros/Export.h>
+#include <c10/util/hash.h>
 #include <c10/util/irange.h>
 
 #include <ATen/cuda/detail/BLASConstants.h>
 #include <ATen/cuda/detail/CublasLtUtils.h>
+
+#include <memory>
+#include <tuple>
+#include <unordered_map>
 
 #ifdef USE_ROCM
 #include <c10/cuda/CUDAStream.h>
@@ -1891,6 +1897,260 @@ template bool gemm_and_bias(
 using at::blas::ScalingType;
 using at::blas::SwizzleType;
 
+#if !defined(USE_ROCM) && defined(CUDA_VERSION) && CUDA_VERSION >= 12080
+namespace {
+
+struct Nvfp4CuBlasLtPlanKey {
+  int device = 0;
+  char transa = 'n';
+  char transb = 'n';
+  int64_t m = 0;
+  int64_t n = 0;
+  int64_t k = 0;
+  int64_t mat1_ld = 0;
+  int64_t mat2_ld = 0;
+  int64_t result_ld = 0;
+  ScalarType c_dtype = ScalarType::Undefined;
+  ScalarType result_dtype = ScalarType::Undefined;
+  ScalarType bias_dtype = ScalarType::Undefined;
+  int a_scale_mode = 0;
+  int b_scale_mode = 0;
+  int32_t sm_count_target = -1;
+  size_t workspace_size = 0;
+  uint32_t bias_alignment = 0;
+  uint32_t c_alignment = 0;
+  uint32_t d_alignment = 0;
+  bool has_bias = false;
+  bool has_result_scale = false;
+  bool has_c = false;
+  [[maybe_unused]] bool device_pointer_mode = false;
+  bool use_fast_accum = false;
+
+  auto values() const {
+    return std::make_tuple(
+        device,
+        transa,
+        transb,
+        m,
+        n,
+        k,
+        mat1_ld,
+        mat2_ld,
+        result_ld,
+        c_dtype,
+        result_dtype,
+        bias_dtype,
+        a_scale_mode,
+        b_scale_mode,
+        sm_count_target,
+        workspace_size,
+        bias_alignment,
+        c_alignment,
+        d_alignment,
+        has_bias,
+        has_result_scale,
+        has_c,
+        device_pointer_mode,
+        use_fast_accum);
+  }
+
+  bool operator==(const Nvfp4CuBlasLtPlanKey& other) const {
+    return values() == other.values();
+  }
+};
+
+struct Nvfp4CuBlasLtPlanKeyHash {
+  size_t operator()(const Nvfp4CuBlasLtPlanKey& key) const {
+    return c10::hash<decltype(key.values())>{}(key.values());
+  }
+};
+
+class Nvfp4CuBlasLtPlan {
+ public:
+  Nvfp4CuBlasLtPlan(
+      const Nvfp4CuBlasLtPlanKey& key,
+      const void* mat1_scale_ptr,
+      const void* mat2_scale_ptr,
+      const void* bias_ptr,
+      const void* result_scale_ptr,
+      cublasLtHandle_t lt_handle)
+      : compute_desc_(CUBLAS_COMPUTE_32F, CUDA_R_32F),
+        a_desc_(CUDA_R_4F_E2M1, key.m, key.k, key.mat1_ld, key.transa == 't'),
+        b_desc_(CUDA_R_4F_E2M1, key.k, key.n, key.mat2_ld, key.transb == 't'),
+        c_desc_(
+            ScalarTypeToCudaDataType(key.c_dtype),
+            key.m,
+            key.n,
+            key.result_ld),
+        d_desc_(
+            ScalarTypeToCudaDataType(key.result_dtype),
+            key.m,
+            key.n,
+            key.result_ld),
+        mat1_scale_ptr_(mat1_scale_ptr),
+        mat2_scale_ptr_(mat2_scale_ptr),
+        bias_ptr_(bias_ptr),
+        result_scale_ptr_(result_scale_ptr) {
+    compute_desc_.setAttribute(
+        CUBLASLT_MATMUL_DESC_TRANSA, detail::cublasOpFromChar(key.transa));
+    compute_desc_.setAttribute(
+        CUBLASLT_MATMUL_DESC_TRANSB, detail::cublasOpFromChar(key.transb));
+    compute_desc_.setAttribute(
+        CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, mat1_scale_ptr);
+    compute_desc_.setAttribute(
+        CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, mat2_scale_ptr);
+    compute_desc_.setAttribute(
+        CUBLASLT_MATMUL_DESC_A_SCALE_MODE, key.a_scale_mode);
+    compute_desc_.setAttribute(
+        CUBLASLT_MATMUL_DESC_B_SCALE_MODE, key.b_scale_mode);
+    if (key.has_result_scale) {
+      compute_desc_.setAttribute(
+          CUBLASLT_MATMUL_DESC_D_SCALE_POINTER, result_scale_ptr);
+    }
+    if (key.sm_count_target >= 0) {
+      compute_desc_.setAttribute(
+          CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET, key.sm_count_target);
+    }
+    const int8_t fast_accum_mode = key.use_fast_accum ? 1 : 0;
+    compute_desc_.setAttribute(
+        CUBLASLT_MATMUL_DESC_FAST_ACCUM, fast_accum_mode);
+    if (key.device_pointer_mode) {
+      compute_desc_.setAttribute(
+          CUBLASLT_MATMUL_DESC_POINTER_MODE, CUBLASLT_POINTER_MODE_DEVICE);
+    }
+    if (key.has_bias) {
+      compute_desc_.setAttribute(
+          CUBLASLT_MATMUL_DESC_BIAS_POINTER, bias_ptr);
+      compute_desc_.setAttribute(
+          CUBLASLT_MATMUL_DESC_EPILOGUE, CUBLASLT_EPILOGUE_BIAS);
+      compute_desc_.setAttribute(
+          CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE,
+          ScalarTypeToCudaDataType(key.bias_dtype));
+    }
+
+    CuBlasLtMatmulPreference preference;
+    preference.setAttribute(
+        CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, key.workspace_size);
+    if (key.has_c) {
+      preference.setAttribute(
+          CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_C_BYTES, key.c_alignment);
+    }
+    preference.setAttribute(
+        CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_D_BYTES, key.d_alignment);
+
+    int returned_result = 0;
+    TORCH_CUDABLAS_CHECK(cublasLtMatmulAlgoGetHeuristic(
+        lt_handle,
+        compute_desc_.descriptor(),
+        a_desc_.descriptor(),
+        b_desc_.descriptor(),
+        c_desc_.descriptor(),
+        d_desc_.descriptor(),
+        preference.descriptor(),
+        1,
+        &heuristic_result_,
+        &returned_result));
+    if (returned_result == 0) {
+      TORCH_CUDABLAS_CHECK(CUBLAS_STATUS_NOT_SUPPORTED);
+    }
+  }
+
+  void updatePointers(
+      const void* mat1_scale_ptr,
+      const void* mat2_scale_ptr,
+      const void* bias_ptr,
+      const void* result_scale_ptr) {
+    if (mat1_scale_ptr != mat1_scale_ptr_) {
+      compute_desc_.setAttribute(
+          CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, mat1_scale_ptr);
+      mat1_scale_ptr_ = mat1_scale_ptr;
+    }
+    if (mat2_scale_ptr != mat2_scale_ptr_) {
+      compute_desc_.setAttribute(
+          CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, mat2_scale_ptr);
+      mat2_scale_ptr_ = mat2_scale_ptr;
+    }
+    if (bias_ptr != bias_ptr_) {
+      compute_desc_.setAttribute(
+          CUBLASLT_MATMUL_DESC_BIAS_POINTER, bias_ptr);
+      bias_ptr_ = bias_ptr;
+    }
+    if (result_scale_ptr != result_scale_ptr_) {
+      compute_desc_.setAttribute(
+          CUBLASLT_MATMUL_DESC_D_SCALE_POINTER, result_scale_ptr);
+      result_scale_ptr_ = result_scale_ptr;
+    }
+  }
+
+  cublasLtMatmulDesc_t computeDesc() const {
+    return compute_desc_.descriptor();
+  }
+  cublasLtMatrixLayout_t aDesc() const {
+    return a_desc_.descriptor();
+  }
+  cublasLtMatrixLayout_t bDesc() const {
+    return b_desc_.descriptor();
+  }
+  cublasLtMatrixLayout_t cDesc() const {
+    return c_desc_.descriptor();
+  }
+  cublasLtMatrixLayout_t dDesc() const {
+    return d_desc_.descriptor();
+  }
+  const cublasLtMatmulHeuristicResult_t& heuristicResult() const {
+    return heuristic_result_;
+  }
+
+ private:
+  CuBlasLtMatmulDescriptor compute_desc_;
+  CuBlasLtMatrixLayout a_desc_;
+  CuBlasLtMatrixLayout b_desc_;
+  CuBlasLtMatrixLayout c_desc_;
+  CuBlasLtMatrixLayout d_desc_;
+  cublasLtMatmulHeuristicResult_t heuristic_result_{};
+  const void* mat1_scale_ptr_;
+  const void* mat2_scale_ptr_;
+  const void* bias_ptr_;
+  const void* result_scale_ptr_;
+};
+
+Nvfp4CuBlasLtPlan& getNvfp4CuBlasLtPlan(
+    const Nvfp4CuBlasLtPlanKey& key,
+    const void* mat1_scale_ptr,
+    const void* mat2_scale_ptr,
+    const void* bias_ptr,
+    const void* result_scale_ptr,
+    cublasLtHandle_t lt_handle) {
+  constexpr size_t max_cache_size = 64;
+  using Cache = std::unordered_map<
+      Nvfp4CuBlasLtPlanKey,
+      std::unique_ptr<Nvfp4CuBlasLtPlan>,
+      Nvfp4CuBlasLtPlanKeyHash>;
+  static thread_local Cache cache;
+
+  auto it = cache.find(key);
+  if (it == cache.end()) {
+    if (cache.size() == max_cache_size) {
+      cache.erase(cache.begin());
+    }
+    auto plan = std::make_unique<Nvfp4CuBlasLtPlan>(
+        key,
+        mat1_scale_ptr,
+        mat2_scale_ptr,
+        bias_ptr,
+        result_scale_ptr,
+        lt_handle);
+    it = cache.emplace(key, std::move(plan)).first;
+  } else {
+    it->second->updatePointers(
+        mat1_scale_ptr, mat2_scale_ptr, bias_ptr, result_scale_ptr);
+  }
+  return *it->second;
+}
+
+} // anonymous namespace
+#endif
+
 void scaled_gemm(
     char transa,
     char transb,
@@ -1934,9 +2194,25 @@ void scaled_gemm(
   // Note: unused, but cublasLtMatmul requires a C pointer that is not result_ptr or nullptr
   const void* dummy_C_ptr = mat1_ptr;
 #endif // ifndef USE_ROCM
-  CuBlasLtMatmulDescriptor computeDesc(computeType, scaleType);
-  computeDesc.setAttribute(CUBLASLT_MATMUL_DESC_TRANSA, detail::cublasOpFromChar(transa));
-  computeDesc.setAttribute(CUBLASLT_MATMUL_DESC_TRANSB, detail::cublasOpFromChar(transb));
+#if !defined(USE_ROCM) && defined(CUDA_VERSION) && CUDA_VERSION >= 12080
+  const bool use_nvfp4_plan_cache =
+      mat1_dtype == ScalarType::Float4_e2m1fn_x2 &&
+      mat2_dtype == ScalarType::Float4_e2m1fn_x2 &&
+      mat1_scale_dtype == ScalarType::Float8_e4m3fn &&
+      mat2_scale_dtype == ScalarType::Float8_e4m3fn &&
+      mat1_scaling_type == ScalingType::BlockWise1x16 &&
+      mat2_scaling_type == ScalingType::BlockWise1x16;
+#else
+  constexpr bool use_nvfp4_plan_cache = false;
+#endif
+  std::optional<CuBlasLtMatmulDescriptor> computeDesc;
+  if (!use_nvfp4_plan_cache) {
+    computeDesc.emplace(computeType, scaleType);
+    computeDesc->setAttribute(
+        CUBLASLT_MATMUL_DESC_TRANSA, detail::cublasOpFromChar(transa));
+    computeDesc->setAttribute(
+        CUBLASLT_MATMUL_DESC_TRANSB, detail::cublasOpFromChar(transb));
+  }
   cublasLtMatmulDescAttributes_t matmulDescA = CUBLASLT_MATMUL_DESC_A_SCALE_POINTER;
   cublasLtMatmulDescAttributes_t matmulDescB = CUBLASLT_MATMUL_DESC_B_SCALE_POINTER;
 #if defined(USE_ROCM) && !defined(HIPBLASLT_OUTER_VEC) && defined(HIPBLASLT_VEC_EXT)
@@ -1970,18 +2246,25 @@ void scaled_gemm(
   // rowwise isn't supported using older cublaslt or older hipblaslt
   TORCH_INTERNAL_ASSERT(use_rowwise == false, "rowwise scaled_gemm not supported with blaslt");
 #endif  // if defined(USE_ROCM) && !defined(HIPBLASLT_OUTER_VEC) && defined(HIPBLASLT_VEC_EXT)
-  computeDesc.setAttribute(matmulDescA, mat1_scale_ptr);
-  computeDesc.setAttribute(matmulDescB, mat2_scale_ptr);
-  if (result_scale_ptr != nullptr) {
-    computeDesc.setAttribute(CUBLASLT_MATMUL_DESC_D_SCALE_POINTER, result_scale_ptr);
+  if (!use_nvfp4_plan_cache) {
+    computeDesc->setAttribute(matmulDescA, mat1_scale_ptr);
+    computeDesc->setAttribute(matmulDescB, mat2_scale_ptr);
+    if (result_scale_ptr != nullptr) {
+      computeDesc->setAttribute(
+          CUBLASLT_MATMUL_DESC_D_SCALE_POINTER, result_scale_ptr);
+    }
   }
   auto stream = at::cuda::getCurrentCUDAStream();
 #ifndef USE_ROCM
+  int32_t sm_count_target = -1;
   if (at::globalContext()._SMCarveout_EXPERIMENTAL().has_value()) {
-    computeDesc.setAttribute<int32_t>(
-        CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET,
+    sm_count_target =
         at::cuda::getCurrentDeviceProperties()->multiProcessorCount -
-            at::globalContext()._SMCarveout_EXPERIMENTAL().value());
+        at::globalContext()._SMCarveout_EXPERIMENTAL().value();
+    if (!use_nvfp4_plan_cache) {
+      computeDesc->setAttribute<int32_t>(
+          CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET, sm_count_target);
+    }
   }
 #else
   if (at::globalContext()._SMCarveout_EXPERIMENTAL().has_value()) {
@@ -1992,10 +2275,10 @@ void scaled_gemm(
 #endif // ifndef USE_ROCM
 #ifndef USE_ROCM
   const int8_t fastAccuMode = use_fast_accum ? 1 : 0;
-  computeDesc.setAttribute(CUBLASLT_MATMUL_DESC_FAST_ACCUM, fastAccuMode);
+  if (!use_nvfp4_plan_cache) {
+    computeDesc->setAttribute(CUBLASLT_MATMUL_DESC_FAST_ACCUM, fastAccuMode);
+  }
 #endif // ifndef USE_ROCM
-  CuBlasLtMatrixLayout Adesc(ScalarTypeToCudaDataType(mat1_dtype), m, k, mat1_ld, transa == 't');
-  CuBlasLtMatrixLayout Bdesc(ScalarTypeToCudaDataType(mat2_dtype), k, n, mat2_ld, transb == 't');
   TORCH_INTERNAL_ASSERT(c_ptr != nullptr || beta_val == 0.0f);
   TORCH_INTERNAL_ASSERT(c_ptr == nullptr || bias_ptr == nullptr);
 #ifdef USE_ROCM
@@ -2007,18 +2290,42 @@ void scaled_gemm(
   // bias epilogue. With a C operand it must describe C itself.
   const auto c_desc_dtype = c_ptr == nullptr ? bias_dtype : result_dtype;
 #endif
-  CuBlasLtMatrixLayout Cdesc(
-      ScalarTypeToCudaDataType(c_desc_dtype), m, n, result_ld);
-  CuBlasLtMatrixLayout Ddesc(ScalarTypeToCudaDataType(result_dtype), m, n, result_ld);
-  if (bias_ptr) {
-    computeDesc.setAttribute(CUBLASLT_MATMUL_DESC_BIAS_POINTER, bias_ptr);
-    computeDesc.setAttribute(CUBLASLT_MATMUL_DESC_EPILOGUE, CUBLASLT_EPILOGUE_BIAS);
-    computeDesc.setAttribute(CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, ScalarTypeToCudaDataType(bias_dtype));
+  std::optional<CuBlasLtMatrixLayout> Adesc;
+  std::optional<CuBlasLtMatrixLayout> Bdesc;
+  std::optional<CuBlasLtMatrixLayout> Cdesc;
+  std::optional<CuBlasLtMatrixLayout> Ddesc;
+  if (!use_nvfp4_plan_cache) {
+    Adesc.emplace(
+        ScalarTypeToCudaDataType(mat1_dtype),
+        m,
+        k,
+        mat1_ld,
+        transa == 't');
+    Bdesc.emplace(
+        ScalarTypeToCudaDataType(mat2_dtype),
+        k,
+        n,
+        mat2_ld,
+        transb == 't');
+    Cdesc.emplace(
+        ScalarTypeToCudaDataType(c_desc_dtype), m, n, result_ld);
+    Ddesc.emplace(
+        ScalarTypeToCudaDataType(result_dtype), m, n, result_ld);
+  }
+  if (bias_ptr && !use_nvfp4_plan_cache) {
+    computeDesc->setAttribute(
+        CUBLASLT_MATMUL_DESC_BIAS_POINTER, bias_ptr);
+    computeDesc->setAttribute(
+        CUBLASLT_MATMUL_DESC_EPILOGUE, CUBLASLT_EPILOGUE_BIAS);
+    computeDesc->setAttribute(
+        CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE,
+        ScalarTypeToCudaDataType(bias_dtype));
   }
 
   // Handle user-passed alpha and its optional device-side beta.
   const float* alpha_ptr = &alpha_val;
   const float* beta_ptr = &beta_val;
+  bool device_pointer_mode = false;
   TORCH_INTERNAL_ASSERT(device_beta == nullptr || alpha.has_value());
 
   if (alpha.has_value()) {
@@ -2028,8 +2335,12 @@ void scaled_gemm(
     if (a.is_cuda()) {
       TORCH_INTERNAL_ASSERT(alpha_multiplier == 1.0f);
       // Tell cublasLt we're using device-side pointers for alpha/beta
-      auto pointer_mode = CUBLASLT_POINTER_MODE_DEVICE;
-      computeDesc.setAttribute(CUBLASLT_MATMUL_DESC_POINTER_MODE, pointer_mode);
+      device_pointer_mode = true;
+      if (!use_nvfp4_plan_cache) {
+        computeDesc->setAttribute(
+            CUBLASLT_MATMUL_DESC_POINTER_MODE,
+            CUBLASLT_POINTER_MODE_DEVICE);
+      }
       alpha_ptr = a.const_data_ptr<float>();
       if (device_beta != nullptr) {
         TORCH_INTERNAL_ASSERT(
@@ -2052,38 +2363,111 @@ void scaled_gemm(
     [[maybe_unused]] int a_scale_mode = detail::cublasLtMatmulScaleMode(mat1_scaling_type, mat1_swizzle_type, mat1_scale_dtype, use_fast_accum);
     [[maybe_unused]] int b_scale_mode = detail::cublasLtMatmulScaleMode(mat2_scaling_type, mat2_swizzle_type, mat2_scale_dtype, use_fast_accum);
 #if CUDA_VERSION >= 12080 || (defined(USE_ROCM) && ROCM_VERSION >= 70000 && defined(HIPBLASLT_OUTER_VEC))
-    computeDesc.setAttribute(CUBLASLT_MATMUL_DESC_A_SCALE_MODE, a_scale_mode);
-    computeDesc.setAttribute(CUBLASLT_MATMUL_DESC_B_SCALE_MODE, b_scale_mode);
+    if (!use_nvfp4_plan_cache) {
+      computeDesc->setAttribute(
+          CUBLASLT_MATMUL_DESC_A_SCALE_MODE, a_scale_mode);
+      computeDesc->setAttribute(
+          CUBLASLT_MATMUL_DESC_B_SCALE_MODE, b_scale_mode);
+    }
 #endif // if CUDA_VERSION >= 12080 || (defined(USE_ROCM) && ROCM_VERSION >= 70000 && defined(HIPBLASLT_OUTER_VEC))
 
-  CuBlasLtMatmulPreference preference;
+  std::optional<CuBlasLtMatmulPreference> preference;
   auto ltworkspace = CublasLtWorkspace();
-  preference.setAttribute(CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, ltworkspace.size);
+  if (!use_nvfp4_plan_cache) {
+    preference.emplace();
+    preference->setAttribute(
+        CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, ltworkspace.size);
+  }
 #ifndef USE_ROCM
-  if (c_ptr != nullptr) {
-    preference.setAttribute(
+  if (c_ptr != nullptr && !use_nvfp4_plan_cache) {
+    preference->setAttribute(
         CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_C_BYTES,
         detail::getAlignment(reinterpret_cast<uintptr_t>(c_ptr)));
   }
-  preference.setAttribute(
-      CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_D_BYTES,
-      detail::getAlignment(reinterpret_cast<uintptr_t>(result_ptr)));
+  if (!use_nvfp4_plan_cache) {
+    preference->setAttribute(
+        CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_D_BYTES,
+        detail::getAlignment(reinterpret_cast<uintptr_t>(result_ptr)));
+  }
 #endif
   cublasLtMatmulHeuristicResult_t heuristicResult = {};
   int returnedResult = 0;
   cublasLtHandle_t ltHandle = at::cuda::getCurrentCUDABlasLtHandle();
+  cublasLtMatmulDesc_t compute_desc = nullptr;
+  cublasLtMatrixLayout_t a_desc = nullptr;
+  cublasLtMatrixLayout_t b_desc = nullptr;
+  cublasLtMatrixLayout_t c_desc = nullptr;
+  cublasLtMatrixLayout_t d_desc = nullptr;
 
-  TORCH_CUDABLAS_CHECK(cublasLtMatmulAlgoGetHeuristic(
-      ltHandle,
-      computeDesc.descriptor(),
-      Adesc.descriptor(),
-      Bdesc.descriptor(),
-      Cdesc.descriptor(),
-      Ddesc.descriptor(),
-      preference.descriptor(),
-      1,
-      &heuristicResult,
-      &returnedResult));
+#if !defined(USE_ROCM) && defined(CUDA_VERSION) && CUDA_VERSION >= 12080
+  if (use_nvfp4_plan_cache) {
+    const auto alignment = [](const void* ptr) -> uint32_t {
+      return ptr == nullptr
+          ? 0
+          : detail::getAlignment(reinterpret_cast<uintptr_t>(ptr));
+    };
+    Nvfp4CuBlasLtPlanKey key;
+    key.device = c10::cuda::current_device();
+    key.transa = transa;
+    key.transb = transb;
+    key.m = m;
+    key.n = n;
+    key.k = k;
+    key.mat1_ld = mat1_ld;
+    key.mat2_ld = mat2_ld;
+    key.result_ld = result_ld;
+    key.c_dtype = c_desc_dtype;
+    key.result_dtype = result_dtype;
+    key.bias_dtype = bias_dtype;
+    key.a_scale_mode = a_scale_mode;
+    key.b_scale_mode = b_scale_mode;
+    key.sm_count_target = sm_count_target;
+    key.workspace_size = ltworkspace.size;
+    key.bias_alignment = alignment(bias_ptr);
+    key.c_alignment = alignment(c_ptr);
+    key.d_alignment = alignment(result_ptr);
+    key.has_bias = bias_ptr != nullptr;
+    key.has_result_scale = result_scale_ptr != nullptr;
+    key.has_c = c_ptr != nullptr;
+    key.device_pointer_mode = device_pointer_mode;
+    key.use_fast_accum = use_fast_accum;
+
+    auto& plan = getNvfp4CuBlasLtPlan(
+        key,
+        mat1_scale_ptr,
+        mat2_scale_ptr,
+        bias_ptr,
+        result_scale_ptr,
+        ltHandle);
+    compute_desc = plan.computeDesc();
+    a_desc = plan.aDesc();
+    b_desc = plan.bDesc();
+    c_desc = plan.cDesc();
+    d_desc = plan.dDesc();
+    heuristicResult = plan.heuristicResult();
+    returnedResult = 1;
+  }
+#endif
+  if (!use_nvfp4_plan_cache) {
+    TORCH_INTERNAL_ASSERT(
+        computeDesc && Adesc && Bdesc && Cdesc && Ddesc && preference);
+    compute_desc = computeDesc->descriptor();
+    a_desc = Adesc->descriptor();
+    b_desc = Bdesc->descriptor();
+    c_desc = Cdesc->descriptor();
+    d_desc = Ddesc->descriptor();
+    TORCH_CUDABLAS_CHECK(cublasLtMatmulAlgoGetHeuristic(
+        ltHandle,
+        compute_desc,
+        a_desc,
+        b_desc,
+        c_desc,
+        d_desc,
+        preference->descriptor(),
+        1,
+        &heuristicResult,
+        &returnedResult));
+  }
   if (returnedResult == 0) {
 #ifndef USE_ROCM
     TORCH_CUDABLAS_CHECK(CUBLAS_STATUS_NOT_SUPPORTED);
@@ -2112,13 +2496,13 @@ void scaled_gemm(
         size_t ret_workspace_size = 0;
         auto is_valid_status = hipblaslt_ext::matmulIsAlgoSupported(
                 ltHandle,
-                computeDesc.descriptor(),
+                compute_desc,
                 alpha_ptr,
-                Adesc.descriptor(),
-                Bdesc.descriptor(),
+                a_desc,
+                b_desc,
                 beta_ptr,
-                Cdesc.descriptor(),
-                Ddesc.descriptor(),
+                c_desc,
+                d_desc,
                 all_algos[i].algo,
                 ret_workspace_size);
         if (is_valid_status == HIPBLAS_STATUS_SUCCESS) {
@@ -2134,21 +2518,21 @@ void scaled_gemm(
   }
   cublasStatus_t cublasStatus = cublasLtMatmul(
       ltHandle,
-      computeDesc.descriptor(),
+      compute_desc,
       alpha_ptr,
       mat1_ptr,
-      Adesc.descriptor(),
+      a_desc,
       mat2_ptr,
-      Bdesc.descriptor(),
+      b_desc,
       beta_ptr,
 #ifdef USE_ROCM
       c_ptr == nullptr ? result_ptr : c_ptr,
 #else
       c_ptr == nullptr ? dummy_C_ptr : c_ptr,
 #endif // ifdef USE_ROCM
-      Cdesc.descriptor(),
+      c_desc,
       result_ptr,
-      Ddesc.descriptor(),
+      d_desc,
       &heuristicResult.algo,
       ltworkspace.ptr,
       ltworkspace.size,
