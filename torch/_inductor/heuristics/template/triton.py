@@ -33,6 +33,7 @@ from ...kernel.mm import (
 from ...kernel.mm_plus_mm import mm_plus_mm_template
 from ...kernel_inputs import KernelInputs, MMKernelInputs
 from ...runtime.hints import DeviceProperties
+from ...runtime.runtime_utils import next_power_of_2
 from ...utils import (
     _rocm_version_tuple,
     _TDM_DIRECT_PATH_RELATIVE_POLICY_BYTES,
@@ -2443,6 +2444,30 @@ def mm_allow_tf32(m: Any, n: Any, k: Any, device_type: str | None) -> bool:
     return allow_tf32
 
 
+def _mma_m_tile(kernel_inputs: MMKernelInputs) -> int | None:
+    """
+    BLOCK_M at which Triton lowers tl.dot to the full-height tensor-core MMA
+    (wgmma M=64 on sm90, tcgen05 M=128 on sm100), or None if it never does.
+    """
+    device = kernel_inputs.device()
+    if device.type != "cuda" or torch.version.hip is not None:
+        return None
+    dtype = kernel_inputs.dtype()
+    if dtype == torch.float32 and not mm_allow_tf32(
+        *kernel_inputs.mnk_symbolic(), device.type
+    ):
+        return None
+    major, minor = torch.cuda.get_device_capability(device)
+    if major == 9:
+        return 64
+    if major in (10, 11):
+        # Triton only has int8 tcgen05 on sm_100
+        if dtype == torch.int8 and (major, minor) != (10, 0):
+            return None
+        return 128
+    return None
+
+
 class MMTemplateConfigMixin(GemmMaxAutotuneTemplateConfigHeuristics):
     """
     Mixin class that converts config lists to template kwargs.
@@ -2497,6 +2522,35 @@ class MMTemplateConfigMixin(GemmMaxAutotuneTemplateConfigHeuristics):
 
     def _valid(self, kernel_inputs: KernelInputs) -> bool:
         return True
+
+    # Whether every template this heuristic serves renders SWAP_AB: compute
+    # C^T = B^T @ A^T, with BLOCK_M tiling N and BLOCK_N tiling M, into C.
+    supports_swap_ab: bool = False
+
+    def _swap_ab_min_block_m(self, kernel_inputs: MMKernelInputs) -> int | None:
+        """
+        Smallest BLOCK_M of the SWAP_AB configs to add, or None to add none.
+
+        Native configs clamp BLOCK_M to next_power_of_2(M). Triton lowers tl.dot
+        to wgmma / tcgen05 only for BLOCK_M >= 64 (mma.sync below), and sm100
+        only issues the full-height tcgen05 for BLOCK_M >= 128. Swapping the
+        operands puts N on the MMA M side instead; swapped tiles shorter than 64
+        rows would be back on mma.sync, so they are skipped.
+        """
+        mode = config.triton.gemm_swap_ab
+        if mode not in ("off", "auto", "always"):
+            raise ValueError(f"invalid triton.gemm_swap_ab: {mode!r}")
+        if not self.supports_swap_ab or mode == "off":
+            return None
+        if mode == "always":
+            return 16
+        mma_m = _mma_m_tile(kernel_inputs)
+        if mma_m is None:
+            return None
+        m, _, _ = kernel_inputs.mnk_symbolic()
+        if next_power_of_2(V.graph.sizevars.optimization_hint(m)) >= mma_m:
+            return None
+        return 64
 
     def _get_config_generator(
         self,
@@ -2798,6 +2852,27 @@ class MMTemplateConfigMixin(GemmMaxAutotuneTemplateConfigHeuristics):
                     kernel_inputs.out_dtype(),
                 )
                 yield template_kwargs
+
+            # Yielded last: the lookup table merges over the first config's kwargs.
+            swap_min_block_m = self._swap_ab_min_block_m(kernel_inputs)
+            if swap_min_block_m is not None:
+                # SWAP_AB configs tile the transposed (N, M, K) problem
+                for c in configs(
+                    n, m, k, dtype_size=dtype.itemsize, op_name=op_name, **kwargs
+                ):
+                    # BLOCK_N tiles M here, so epilogue subtiles can get very narrow.
+                    # 2-CTA's operand split and swizzle checks assume the native orientation.
+                    subtile = c.kwargs.get("EPILOGUE_SUBTILE", 1)
+                    if (
+                        c.kwargs["BLOCK_M"] < swap_min_block_m
+                        or c.kwargs["BLOCK_N"] // subtile < 8
+                        or c.kwargs.get("TWO_CTAS", False)
+                    ):
+                        continue
+                    template_kwargs = self._convert_config_to_template_kwargs(
+                        c, n, m, k, kernel_inputs.out_dtype()
+                    )
+                    yield {**template_kwargs, "SWAP_AB": True}
 
     def _convert_config_to_template_kwargs(
         self,
@@ -3441,6 +3516,8 @@ class ScaledBlackwellTMAConfigMixin(
 class CUDAMMTemplateConfigHeuristic(MMTemplateConfigMixin, CUDAConfigHeuristic):
     """Standard MM template heuristic for CUDA"""
 
+    supports_swap_ab = True
+
 
 @register_template_heuristic(
     mm_template.uid, "cuda", register=torch.version.hip is None, op_name="addmm"
@@ -3478,6 +3555,8 @@ class CUDAPersistentTMATemplateConfigHeuristic(
     TMATemplateConfigMixin, CUDAConfigHeuristic
 ):
     """Persistent TMA template heuristic for CUDA"""
+
+    supports_swap_ab = True
 
     def __init__(self) -> None:
         super().__init__()
@@ -3607,6 +3686,8 @@ class CUDABlackwellPersistentTMATemplateConfigHeuristic(
     BlackwellTMATemplateConfigMixin, CUDAConfigHeuristic
 ):
     """Blackwell Persistent TMA template"""
+
+    supports_swap_ab = True
 
     def __init__(self) -> None:
         super().__init__()
@@ -3747,6 +3828,8 @@ class CUDABlackwellAddmmPersistentTMATemplateConfigHeuristic(
 class CUDAScaledMMTemplateConfigHeuristic(ScaledMMConfigMixin, CUDAConfigHeuristic):
     """Scaled MM template heuristic for CUDA"""
 
+    supports_swap_ab = True
+
     def __init__(self) -> None:
         super().__init__()
         # Override mm_configs to use scaled_mm_configs
@@ -3768,6 +3851,8 @@ class CUDAScaledTMAEpilogueScalingTemplateConfigHeuristic(
     ScaledTMAConfigMixin, CUDAConfigHeuristic
 ):
     """Scaled TMA template heuristic for CUDA: epilogue scaling variants (TensorWise, RowWise)"""
+
+    supports_swap_ab = True
 
     def __init__(self) -> None:
         super().__init__()
@@ -3853,6 +3938,8 @@ class CUDAScaledBlackwellTMATemplateConfigHeuristic(
 ):
     """Scaled Blackwell TMA template heuristic for CUDA"""
 
+    supports_swap_ab = True
+
     def __init__(self) -> None:
         super().__init__()
         self.mm_configs = self.blackwell_scaled_persistent_mm_configs
@@ -3887,6 +3974,8 @@ class CUDAMMPlusMMTemplateConfigHeuristic(
 )
 class CUDAInt8MMTemplateConfigHeuristic(INT8MMTemplateConfigMixin, CUDAConfigHeuristic):
     """Int8 MM template heuristic for CUDA"""
+
+    supports_swap_ab = True
 
     def __init__(self) -> None:
         super().__init__()

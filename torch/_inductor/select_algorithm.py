@@ -3523,6 +3523,7 @@ class TritonTemplate(KernelTemplate):
                 "waves_per_eu": kwargs.get("waves_per_eu", 0),
                 "kpack": kwargs.get("kpack", 2),
                 "epilogue_subtile": kwargs.get("EPILOGUE_SUBTILE", 0),
+                **({"swap_ab": True} if kwargs.get("SWAP_AB") else {}),
                 **{
                     k: kwargs[k]
                     for k in AlgorithmSelectorCache.FLEX_ATTENTION_TUNABLE_KEYS
@@ -3780,7 +3781,8 @@ class TritonTemplateCaller(ir.TritonTemplateCallerBase):
         BLOCK_N = tile_vals[2]
         num_stages = info["num_stages"]
         num_warps = info["num_warps"]
-        return f"type={type_name}_BLOCK-M={BLOCK_M}_BLOCK-K={BLOCK_K}_BLOCK-N={BLOCK_N}_numstages={num_stages}_numwarps={num_warps}"
+        swap_ab = "_swapab" if info.get("swap_ab") else ""
+        return f"type={type_name}_BLOCK-M={BLOCK_M}_BLOCK-K={BLOCK_K}_BLOCK-N={BLOCK_N}_numstages={num_stages}_numwarps={num_warps}{swap_ab}"
 
 
 class ExternKernelCaller(ChoiceCaller):

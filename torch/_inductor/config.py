@@ -2502,6 +2502,14 @@ class triton:
     enable_persistent_tma_matmul = (
         os.environ.get("ENABLE_PERSISTENT_TMA_MATMUL", "0") == "1"
     )
+    # Also autotune GEMM template configs that swap the operands: the kernel computes
+    # C^T = B^T @ A^T and stores it straight into C, so a large N fills the MMA M
+    # side when M is small. "auto" adds them only for shapes the heuristic expects
+    # to benefit, "always" adds them for every shape, "off" never adds them.
+    # pyrefly: ignore [bad-assignment]
+    gemm_swap_ab: Literal["off", "auto", "always"] = os.environ.get(
+        "TORCHINDUCTOR_TRITON_GEMM_SWAP_AB", "off"
+    )  # type: ignore[assignment]
     # Should TMA store be enable from templates. TODO: Remove once we
     # can autotune over the result.
     enable_template_tma_store = os.environ.get("ENABLE_TEMPLATE_TMA_STORE", "0") == "1"

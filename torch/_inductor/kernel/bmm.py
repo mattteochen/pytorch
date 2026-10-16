@@ -50,6 +50,8 @@ aten = torch.ops.aten
 
 @SymbolicGridFn
 def bmm_grid(b, m, n, meta, *, cdiv, max):
+    if meta.get("SWAP_AB", False):
+        m, n = n, m
     tiles = cdiv(m, meta["BLOCK_M"]) * cdiv(n, meta["BLOCK_N"])
     # Split batch across grid_y and grid_z to avoid exceeding CUDA grid_y limit.
     # When b <= max_y_grid, grid_z = 1 and behavior is identical to the original.

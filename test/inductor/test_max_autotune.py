@@ -82,7 +82,10 @@ from torch._inductor.select_algorithm import (
     TritonTemplateCaller,
 )
 from torch.testing._internal.common_cuda import PLATFORM_SUPPORTS_FP8, SM90OrLater
-from torch.testing._internal.common_device_type import largeTensorTest
+from torch.testing._internal.common_device_type import (
+    instantiate_device_type_tests,
+    largeTensorTest,
+)
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
     IS_WINDOWS,
@@ -8022,6 +8025,230 @@ class TestTDMEndToEnd(TestCase):
         # output stays legal, so requiring none anywhere would over-constrain.
         self.assertNotIn("tl.make_tensor_descriptor(in_ptr", "\n".join(code))
         torch.testing.assert_close(result, fn(strided), atol=1e-3, rtol=1e-3)
+
+
+@unittest.skipIf(TEST_WITH_ROCM, "SWAP_AB is CUDA-only")
+class TestTritonGemmSwapAB(TestCase):
+    """SWAP_AB configs compute C^T = B^T @ A^T and store the result straight into C."""
+
+    def _persistent_template(self):
+        if has_datacenter_blackwell_tma_device():
+            return "blackwell_ws_persistent_tma"
+        if not has_triton_cuda_tma_device():
+            self.skipTest("needs a TMA device")
+        return "mm_persistent_tma"
+
+    def _check_swapped(
+        self,
+        fn,
+        inputs,
+        template,
+        atol=1e-2,
+        rtol=1e-2,
+        other_inputs=(),
+        desc_regex="SWAP_AB=True",
+        extra_config=None,
+        expected=None,
+    ):
+        if template == "persistent":
+            template = self._persistent_template()
+        persistent = template not in ("mm", "bmm")
+        torch._dynamo.reset()
+        with config.patch(
+            {
+                "max_autotune_gemm_backends": "TRITON",
+                "triton.gemm_swap_ab": "always",
+                "triton.enable_persistent_tma_matmul": persistent,
+                "test_configs.max_mm_configs": 4,
+                "test_configs.autotune_choice_name_regex": rf"^triton_{template}_\d+$",
+                "test_configs.autotune_choice_desc_regex": desc_regex,
+                **(extra_config or {}),
+            }
+        ):
+            compiled = torch.compile(fn, mode="max-autotune-no-cudagraphs")
+            out, code = run_and_get_code(compiled, *inputs)
+            FileCheck().check("SWAP_AB : tl.constexpr = True").run(code[0])
+            if expected is None:
+                expected = fn(*inputs)
+            torch.testing.assert_close(out, expected, atol=atol, rtol=rtol)
+            with torch._dynamo.config.patch(error_on_recompile=True):
+                for other in other_inputs:
+                    torch.testing.assert_close(
+                        compiled(*other), fn(*other), atol=atol, rtol=rtol
+                    )
+
+    @parametrize("template", ("mm", "persistent"))
+    @parametrize("a_k_major", (True, False))
+    @parametrize("b_k_major", (True, False))
+    @parametrize(
+        "mnk", ((2, 1024, 512), (24, 1000, 520), (100, 2048, 256), (129, 257, 256))
+    )
+    def test_mm(self, device, template, a_k_major, b_k_major, mnk):
+        m, n, k = mnk
+        if template == "persistent" and (
+            (not a_k_major and m % 8) or (not b_k_major and n % 8)
+        ):
+            self.skipTest("TMA needs 16-byte aligned strides")
+        if a_k_major:
+            a = torch.randn(m, k, device=device, dtype=torch.bfloat16)
+        else:
+            a = torch.randn(k, m, device=device, dtype=torch.bfloat16).t()
+        if b_k_major:
+            b = torch.randn(n, k, device=device, dtype=torch.bfloat16).t()
+        else:
+            b = torch.randn(k, n, device=device, dtype=torch.bfloat16)
+        # cuBLAS takes a lower-precision path for some of these layouts
+        expected = (a.float() @ b.float()).to(a.dtype)
+        self._check_swapped(torch.mm, (a, b), template, expected=expected)
+
+    def test_mm_tma_store(self, device):
+        a = torch.randn(24, 512, device=device, dtype=torch.bfloat16)
+        b = torch.randn(1024, 512, device=device, dtype=torch.bfloat16).t()
+        self._check_swapped(
+            torch.mm,
+            (a, b),
+            "persistent",
+            extra_config={"triton.enable_template_tma_store": True},
+        )
+
+    @unittest.skipIf(
+        not has_datacenter_blackwell_tma_device(), "needs Blackwell device TMA"
+    )
+    def test_mm_epilogue_subtile(self, device):
+        a = torch.randn(96, 512, device=device, dtype=torch.bfloat16)
+        b = torch.randn(1024, 512, device=device, dtype=torch.bfloat16).t()
+        self._check_swapped(
+            lambda a, b: torch.relu(a @ b),
+            (a, b),
+            "blackwell_ws_persistent_tma",
+            desc_regex="EPILOGUE_SUBTILE=[24].*SWAP_AB=True",
+        )
+
+    def test_mm_dynamic_m(self, device):
+        b = torch.randn(1000, 520, device=device, dtype=torch.bfloat16).t()
+        a = torch.randn(24, 520, device=device, dtype=torch.bfloat16)
+        torch._dynamo.mark_dynamic(a, 0)
+        others = [
+            (torch.randn(m, 520, device=device, dtype=torch.bfloat16), b)
+            for m in (3, 64, 300)
+        ]
+        self._check_swapped(torch.mm, (a, b), "mm", other_inputs=others)
+
+    @parametrize("template", ("mm", "persistent"))
+    @parametrize("epilogue", ("relu", "add_n", "mul_m", "to_fp32"))
+    def test_epilogue_fusion(self, device, template, epilogue):
+        m, n, k = 24, 1536, 512
+        row = torch.randn(n, device=device, dtype=torch.bfloat16)
+        col = torch.randn(m, 1, device=device, dtype=torch.bfloat16)
+        epilogues = {
+            "relu": torch.relu,
+            "add_n": lambda c: c + row,
+            "mul_m": lambda c: c * col,
+            "to_fp32": lambda c: c.float() * 2.0,
+        }
+
+        def fn(a, b):
+            return epilogues[epilogue](a @ b)
+
+        a = torch.randn(m, k, device=device, dtype=torch.bfloat16)
+        b = torch.randn(n, k, device=device, dtype=torch.bfloat16).t()
+        self._check_swapped(fn, (a, b), template)
+
+    def test_prologue_fusion(self, device):
+        def fn(a, b):
+            return a.to(torch.bfloat16) @ b
+
+        a = torch.randn(24, 512, device=device)
+        b = torch.randn(1536, 512, device=device, dtype=torch.bfloat16).t()
+        self._check_swapped(fn, (a, b), "mm")
+
+    @parametrize("template", ("mm", "persistent"))
+    @parametrize("bias_shape", ("n", "mn"))
+    def test_addmm(self, device, template, bias_shape):
+        m, n, k = 24, 1536, 512
+        bias = torch.randn(
+            (n,) if bias_shape == "n" else (m, n), device=device, dtype=torch.bfloat16
+        )
+
+        def fn(a, b):
+            return torch.addmm(bias, a, b, beta=0.5, alpha=2.0)
+
+        a = torch.randn(m, k, device=device, dtype=torch.bfloat16)
+        b = torch.randn(n, k, device=device, dtype=torch.bfloat16).t()
+        self._check_swapped(fn, (a, b), template)
+
+    @parametrize("op", ("bmm", "baddbmm"))
+    def test_bmm(self, device, op):
+        c = torch.randn(3, 20, 1000, device=device, dtype=torch.bfloat16)
+
+        def fn(a, b):
+            return torch.bmm(a, b) if op == "bmm" else torch.baddbmm(c, a, b)
+
+        a = torch.randn(3, 20, 512, device=device, dtype=torch.bfloat16)
+        b = torch.randn(3, 512, 1000, device=device, dtype=torch.bfloat16)
+        self._check_swapped(fn, (a, b), "bmm")
+
+    def test_int_mm(self, device):
+        a = torch.randint(-8, 8, (32, 512), device=device, dtype=torch.int8)
+        b = torch.randint(-8, 8, (1024, 512), device=device, dtype=torch.int8).t()
+        self._check_swapped(torch._int_mm, (a, b), "mm", atol=0, rtol=0)
+
+    @unittest.skipIf(not PLATFORM_SUPPORTS_FP8, "FP8 is not supported")
+    @parametrize(
+        "template", ("mm", "scaled_mm_device_tma_epilogue_scaling", "persistent")
+    )
+    @parametrize("rowwise", (False, True))
+    def test_scaled_mm(self, device, template, rowwise):
+        if template != "mm" and not has_triton_cuda_tma_device():
+            self.skipTest("needs a TMA device")
+        if template == "persistent" and not has_datacenter_blackwell_tma_device():
+            self.skipTest("scaled_mm uses the persistent template only on Blackwell")
+        m, n, k = 100, 1536, 1024
+        a = torch.randn(m, k, device=device).to(torch.float8_e4m3fn)
+        b = torch.randn(n, k, device=device).to(torch.float8_e4m3fn).t()
+        if rowwise:
+            scale_a = torch.rand(m, 1, device=device) + 0.5
+            scale_b = torch.rand(1, n, device=device) + 0.5
+        else:
+            scale_a = torch.tensor(0.7, device=device)
+            scale_b = torch.tensor(1.3, device=device)
+
+        def fn(a, b, scale_a, scale_b):
+            return torch._scaled_mm(a, b, scale_a, scale_b, out_dtype=torch.bfloat16)
+
+        self._check_swapped(fn, (a, b, scale_a, scale_b), template)
+
+    @parametrize("mode", ("off", "auto", "always"))
+    @parametrize("m", (16, 4096))
+    def test_swap_ab_policy(self, device, mode, m):
+        if torch.cuda.get_device_capability()[0] not in (9, 10, 11):
+            self.skipTest("needs wgmma or tcgen05")
+        descriptions = []
+
+        def record(choices):
+            descriptions.extend(c.description for c in choices)
+            # Only the offered configs matter, so skip compiling the rest
+            return choices[:1]
+
+        a = torch.randn(m, 4096, device=device, dtype=torch.bfloat16)
+        b = torch.randn(4096, 4096, device=device, dtype=torch.bfloat16)
+        torch._dynamo.reset()
+        add_preprocessing_fn(record)
+        try:
+            with config.patch(
+                {
+                    "max_autotune_gemm_backends": "TRITON",
+                    "triton.gemm_swap_ab": mode,
+                }
+            ):
+                torch.compile(torch.mm, mode="max-autotune-no-cudagraphs")(a, b)
+        finally:
+            clear_preprocessing_fns()
+        expect_swap = mode == "always" or (mode == "auto" and m == 16)
+        self.assertEqual(any("SWAP_AB=True" in d for d in descriptions), expect_swap)
+
+
+instantiate_device_type_tests(TestTritonGemmSwapAB, globals(), only_for="cuda")
 
 
 if __name__ == "__main__":

@@ -26,12 +26,16 @@ def mm_grid(m, n, meta, *, cdiv):
     """
     The CUDA grid size for matmul triton templates.
     """
+    if meta.get("SWAP_AB", False):
+        m, n = n, m
     return (cdiv(m, meta["BLOCK_M"]) * cdiv(n, meta["BLOCK_N"]), 1, 1)
 
 
 @SymbolicGridFn
 def persistent_mm_grid(M: int, N: int, meta: dict[str, Any], *, cdiv, min):
     """Defines the grid for persistent kernels."""
+    if meta.get("SWAP_AB", False):
+        M, N = N, M
     return (
         min(meta["NUM_SMS"], cdiv(M, meta["BLOCK_M"]) * cdiv(N, meta["BLOCK_N"])),
         1,
@@ -46,6 +50,8 @@ def blackwell_persistent_mm_grid(M: int, N: int, meta: dict[str, Any], *, cdiv, 
     The heuristic also rounds ``NUM_SMS`` down to even because the template uses
     it as the persistent-loop stride.
     """
+    if meta.get("SWAP_AB", False):
+        M, N = N, M
     num_pid_m = cdiv(M, meta["BLOCK_M"])
     if meta.get("TWO_CTAS", False):
         num_pid_m = (num_pid_m + 1) // 2 * 2

@@ -6,21 +6,29 @@
         # early exit due to zero-size input(s)
         return
     start_pid = tl.program_id(0)
+{%- set SWAP = SWAP_AB|default(false) %}
+{%- set BLOCK_A, BLOCK_B = (BLOCK_N, BLOCK_M) if SWAP else (BLOCK_M, BLOCK_N) %}
+{%- if SWAP %}
+    # SWAP_AB computes C^T = B^T @ A^T: BLOCK_M tiles N and BLOCK_N tiles M
+    grid_m = tl.cdiv(N, BLOCK_M)
+    grid_n = tl.cdiv(M, BLOCK_N)
+{%- else %}
     grid_m = tl.cdiv(M, BLOCK_M)
     {%- if TWO_CTAS %}
     # even M-tile count so CTAs pair into clusters; must match blackwell_persistent_mm_grid
     grid_m = (grid_m + 1) // 2 * 2
     {%- endif %}
     grid_n = tl.cdiv(N, BLOCK_N)
+{%- endif %}
     k_tiles = tl.cdiv(K, BLOCK_K)
     num_tiles = grid_m * grid_n
 
     {{tma_descriptor("a_desc", "A",
-        [BLOCK_M, BLOCK_K] if A_ROW_MAJOR else [BLOCK_K, BLOCK_M],
+        [BLOCK_A, BLOCK_K] if A_ROW_MAJOR else [BLOCK_K, BLOCK_A],
         [0, 1] if A_ROW_MAJOR else [1, 0]
     )}}
     {{tma_descriptor("b_desc", "B",
-        [BLOCK_K, BLOCK_N] if B_ROW_MAJOR else [BLOCK_N, BLOCK_K],
+        [BLOCK_K, BLOCK_B] if B_ROW_MAJOR else [BLOCK_B, BLOCK_K],
         [0, 1] if B_ROW_MAJOR else [1, 0]
     )}}
 
@@ -47,8 +55,8 @@
         pid_m, pid_n = _compute_pid(
             tile_id, num_pid_in_group, grid_m, GROUP_M
         )
-        offs_am = pid_m * BLOCK_M
-        offs_bn = pid_n * BLOCK_N
+        offs_am = {{"pid_n * BLOCK_N" if SWAP else "pid_m * BLOCK_M"}}
+        offs_bn = {{"pid_m * BLOCK_M" if SWAP else "pid_n * BLOCK_N"}}
         offs_am_desc = offs_am.to(tl.int32)
         offs_bn_desc = offs_bn.to(tl.int32)
 
@@ -66,25 +74,48 @@
                 if B_ROW_MAJOR
                 else [offs_bn_desc, offs_k_desc],
             )
-            {%- if TWO_CTAS %}
+{%- if SWAP %}
+            accumulator += tl.dot(
+                b.T if B_ROW_MAJOR else b,
+                a.T if A_ROW_MAJOR else a,
+                allow_tf32=ALLOW_TF32,
+            )
+{%- elif TWO_CTAS %}
             accumulator += tl.dot(
                 a if A_ROW_MAJOR else a.T,
                 b if B_ROW_MAJOR else b.T,
                 allow_tf32=ALLOW_TF32,
                 two_ctas=True,
             )
-            {%- else %}
+{%- else %}
             accumulator += tl.dot(
                 a if A_ROW_MAJOR else a.T,
                 b if B_ROW_MAJOR else b.T,
                 allow_tf32=ALLOW_TF32,
             )
-            {%- endif %}
+{%- endif %}
 
         tile_id_c += NUM_SMS
         pid_m, pid_n = _compute_pid(
             tile_id_c, num_pid_in_group, grid_m, GROUP_M
         )
+{%- if SWAP %}
+        # The accumulator holds C^T: split it along its columns (C's rows) and
+        # transpose each subtile back to C's orientation for the store
+        offs_cm = pid_n * BLOCK_N
+        offs_cn = pid_m * BLOCK_M
+        subtiles = _subtile_accumulator(accumulator, BLOCK_M, BLOCK_N, EPILOGUE_SUBTILE)
+        for i in tl.static_range(EPILOGUE_SUBTILE):
+            subtile = tl.trans(subtiles[i])
+            offs_cm_i = offs_cm + i * (BLOCK_N // EPILOGUE_SUBTILE)
+            {{store_output(
+                ("offs_cm_i", "offs_cn"),
+                "subtile",
+                indent_width=12,
+                val_shape=("BLOCK_N // EPILOGUE_SUBTILE", "BLOCK_M"),
+                block_indexing=True
+            )}}
+{%- else %}
         offs_cm = pid_m * BLOCK_M
         offs_cn = pid_n * BLOCK_N
         subtiles = _subtile_accumulator(accumulator, BLOCK_M, BLOCK_N, EPILOGUE_SUBTILE)
@@ -98,3 +129,4 @@
                 val_shape=("BLOCK_M", "BLOCK_N // EPILOGUE_SUBTILE"),
                 block_indexing=True
             )}}
+{%- endif %}

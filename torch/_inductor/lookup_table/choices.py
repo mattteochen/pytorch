@@ -406,7 +406,10 @@ class LookupTableChoices(InductorChoices):
             # For each lookup config, create a KTC with the override kwargs
             # Start from base params (which include derived options like OUT_DTYPE)
             # and let the lookup config override them
-            base_kwargs = base_ktc.params.to_kwargs()
+            # Lookup entries only record SWAP_AB when set, so don't inherit it
+            base_kwargs = {
+                k: v for k, v in base_ktc.params.to_kwargs().items() if k != "SWAP_AB"
+            }
             for c in configs:
                 merged = {**base_kwargs, **c}
                 lookup_ktc = KernelTemplateChoice(

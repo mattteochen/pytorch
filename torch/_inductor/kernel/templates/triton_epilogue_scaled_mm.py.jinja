@@ -22,8 +22,16 @@
         stride_b_scale_n = 0
 
     start_pid = tl.program_id(axis=0).to(INDEX_DTYPE)
+{%- set SWAP = SWAP_AB|default(false) %}
+{%- set BLOCK_A, BLOCK_B = ("BLOCK_N", "BLOCK_M") if SWAP else ("BLOCK_M", "BLOCK_N") %}
+{%- if SWAP %}
+    # SWAP_AB computes C^T = B^T @ A^T: BLOCK_M tiles N and BLOCK_N tiles M
+    num_pid_m = tl.cdiv(N, BLOCK_M)
+    num_pid_n = tl.cdiv(M, BLOCK_N)
+{%- else %}
     num_pid_m = tl.cdiv(M, BLOCK_M)
     num_pid_n = tl.cdiv(N, BLOCK_N)
+{%- endif %}
     k_tiles = tl.cdiv(K, BLOCK_K)
     num_tiles = num_pid_m * num_pid_n
 
@@ -35,14 +43,14 @@
     triton.language.extra.cuda.experimental_device_tensormap_create2d(
         desc_ptr=a_desc_ptr,
         global_address=A,
-        load_size=[BLOCK_M, BLOCK_K],
+        load_size=[{{BLOCK_A}}, BLOCK_K],
         global_size=[M, K],
         element_ty=A.dtype.element_ty,
     )
     triton.language.extra.cuda.experimental_device_tensormap_create2d(
         desc_ptr=b_desc_ptr,
         global_address=B,
-        load_size=[BLOCK_N, BLOCK_K],
+        load_size=[{{BLOCK_B}}, BLOCK_K],
         global_size=[N, K],
         element_ty=B.dtype.element_ty,
     )
@@ -57,13 +65,13 @@
         base=A,
         shape=[M, K],
         strides=[stride_am, 1],
-        block_shape=[BLOCK_M, BLOCK_K],
+        block_shape=[{{BLOCK_A}}, BLOCK_K],
     )
     b_desc = triton.language.make_tensor_descriptor(
         base=B,
         shape=[N, K],
         strides=[stride_bn, 1],
-        block_shape=[BLOCK_N, BLOCK_K],
+        block_shape=[{{BLOCK_B}}, BLOCK_K],
     )
     {%- endif %}
 
@@ -94,8 +102,8 @@
             pid_m = first_pid_m + (tile_id % group_size_m)
             pid_n = (tile_id % num_pid_in_group) // group_size_m
 
-            offs_am = pid_m * BLOCK_M
-            offs_bn = pid_n * BLOCK_N
+            offs_am = {{"pid_n * BLOCK_N" if SWAP else "pid_m * BLOCK_M"}}
+            offs_bn = {{"pid_m * BLOCK_M" if SWAP else "pid_n * BLOCK_N"}}
 
         offs_k = ki * BLOCK_K
         offs_am_desc = offs_am.to(tl.int32)
@@ -106,19 +114,60 @@
         a = tl._experimental_descriptor_load(
             a_desc_ptr,
             [offs_am_desc, offs_k_desc],
-            [BLOCK_M, BLOCK_K],
+            [{{BLOCK_A}}, BLOCK_K],
             A.dtype.element_ty,
         )
         b = tl._experimental_descriptor_load(
             b_desc_ptr,
             [offs_bn_desc, offs_k_desc],
-            [BLOCK_N, BLOCK_K],
+            [{{BLOCK_B}}, BLOCK_K],
             B.dtype.element_ty,
         )
         {%- else %}
         a = tl.load_tensor_descriptor(a_desc, [offs_am_desc, offs_k_desc])
         b = tl.load_tensor_descriptor(b_desc, [offs_bn_desc, offs_k_desc])
         {%- endif %}
+{%- if SWAP %}
+        if USE_FAST_ACCUM:
+            accumulator = tl.dot(b, a.T, accumulator)
+        else:
+            accumulator += tl.dot(b, a.T)
+
+        if ki == k_tiles - 1:
+            # Apply inverse scaling; the accumulator rows index N and its columns M
+            offs_cm = offs_am + tl.arange(0, BLOCK_N)
+            offs_cn = offs_bn + tl.arange(0, BLOCK_M)
+            accumulator = apply_scaling(
+                accumulator,
+                b_scale,
+                a_scale,
+                SCALE_RECIPE_B,
+                SCALE_RECIPE_A,
+                offs_cn,
+                offs_cm,
+                N,
+                M,
+                stride_b_scale_n,
+                stride_a_scale_m,
+            )
+
+            # inductor generates a suffix
+            {%- if TMA_EXPERIMENTAL_API %}
+            idx_m = offs_cm[None, :]
+            idx_n = offs_cn[:, None]
+            mask = (idx_m < M) & (idx_n < N)
+            {{store_output(("idx_m", "idx_n"), "accumulator", "mask", indent_width=12, val_shape=("BLOCK_M", "BLOCK_N"))}}
+            {%- else %}
+            accumulator_t = tl.trans(accumulator)
+            {{store_output(
+                ("offs_am", "offs_bn"),
+                "accumulator_t",
+                indent_width=12,
+                val_shape=("BLOCK_N", "BLOCK_M"),
+                block_indexing=True,
+            )}}
+            {%- endif %}
+{%- else %}
         if USE_FAST_ACCUM:
             accumulator = tl.dot(a, b.T, accumulator)
         else:
@@ -158,6 +207,7 @@
                 block_indexing=True,
             )}}
             {%- endif %}
+{%- endif %}
             accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
 
